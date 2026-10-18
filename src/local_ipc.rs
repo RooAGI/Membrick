@@ -15,10 +15,209 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
 #[derive(Clone, Copy)]
 pub(crate) struct LocalIpcRequest;
+
+/// A crash-safe lease held for the lifetime of a provider MCP process or one
+/// short-lived request. The resident stays up while any client owns a lease.
+pub(crate) struct ProviderSessionLease {
+    file: Option<fs::File>,
+    path: PathBuf,
+}
+
+impl ProviderSessionLease {
+    fn acquire(root: &Path, provider: &str) -> Result<Self> {
+        static NEXT_LEASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let lifecycle_gate = open_lifecycle_gate(root)?;
+        lifecycle_gate
+            .lock()
+            .context("could not acquire project provider lifecycle lock")?;
+        let directory = runtime_dir(root)?.join("provider-leases");
+        fs::create_dir_all(&directory)?;
+        let nonce = NEXT_LEASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stem = format!(
+            "{}-{}-{nonce}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        let starting = directory.join(format!("{stem}.starting"));
+        let path = directory.join(format!("{stem}.lease"));
+        let marker = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&starting)?;
+        let registration = (|| -> Result<fs::File> {
+            marker
+                .try_lock()
+                .with_context(|| format!("could not lock provider lease {}", starting.display()))?;
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.try_lock()
+                .with_context(|| format!("could not lock provider lease {}", path.display()))?;
+            writeln!(file, "provider={provider}")?;
+            Ok(file)
+        })();
+        let file = match registration {
+            Ok(file) => file,
+            Err(error) => {
+                drop(marker);
+                let _ = fs::remove_file(&starting);
+                return Err(error);
+            }
+        };
+        // The locked lease now protects the client while we release and remove
+        // the temporary marker. This also avoids deleting an open file on
+        // platforms that restrict that operation.
+        drop(marker);
+        fs::remove_file(&starting)?;
+        drop(lifecycle_gate);
+        Ok(Self {
+            file: Some(file),
+            path,
+        })
+    }
+}
+
+impl Drop for ProviderSessionLease {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Start or reuse the resident and hold its lifetime open until this provider
+/// MCP process exits. Short-lived hook requests use their own temporary lease.
+pub(crate) fn start_provider_session(root: &Path, provider: &str) -> Result<ProviderSessionLease> {
+    if cfg!(test) {
+        return Ok(ProviderSessionLease {
+            file: None,
+            path: PathBuf::new(),
+        });
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let lease = ProviderSessionLease::acquire(&root, provider)?;
+    let startup_root = root.clone();
+    std::thread::Builder::new()
+        .name("membrick-resident-startup".into())
+        .spawn(move || {
+            if let Err(error) = post_json_with_transport(&startup_root, "/health", &Value::Null) {
+                eprintln!("provider resident startup failed: {error:#}");
+            }
+        })?;
+    Ok(lease)
+}
+
+/// Wait until every provider MCP process and in-flight request has released
+/// its lease. Crashed clients release the OS lock; leftover lease files are
+/// removed here.
+pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) -> fs::File {
+    let directory = root.join(".membrick/runtime/provider-leases");
+    let mut empty_since = None;
+    loop {
+        match provider_session_is_active(&directory) {
+            Ok(true) => empty_since = None,
+            Ok(false) => {
+                let since = empty_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= grace {
+                    match open_lifecycle_gate(root) {
+                        Ok(gate) => match gate.try_lock() {
+                            Ok(()) => match provider_session_is_active(&directory) {
+                                Ok(false) => return gate,
+                                Ok(true) => empty_since = None,
+                                Err(error) => {
+                                    eprintln!("provider lease recheck failed; keeping resident alive: {error:#}");
+                                    empty_since = None;
+                                }
+                            },
+                            Err(fs::TryLockError::WouldBlock) => empty_since = None,
+                            Err(fs::TryLockError::Error(error)) => {
+                                eprintln!("provider lifecycle lock failed; keeping resident alive: {error}");
+                                empty_since = None;
+                            }
+                        },
+                        Err(error) => {
+                            eprintln!("provider lifecycle lock unavailable; keeping resident alive: {error:#}");
+                            empty_since = None;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                // A scan error must never stop a resident while a provider
+                // may still be connected.
+                eprintln!("provider lease scan failed; keeping resident alive: {error:#}");
+                empty_since = None;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn open_lifecycle_gate(root: &Path) -> Result<fs::File> {
+    let path = runtime_dir(root)?.join("provider-lifecycle.lock");
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("could not open provider lifecycle lock {}", path.display()))
+}
+
+fn provider_session_is_active(directory: &Path) -> Result<bool> {
+    if !directory.exists() {
+        return Ok(false);
+    }
+    let paths = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut has_starting = false;
+    for path in paths.iter().filter(|path| {
+        path.extension().and_then(|extension| extension.to_str()) == Some("starting")
+    }) {
+        let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => has_starting = true,
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            Ok(()) => {
+                drop(file);
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    // Do not inspect possibly-unlocked lease files while another client is
+    // still publishing its kernel-locked lease.
+    if has_starting {
+        return Ok(true);
+    }
+
+    let mut active = false;
+    for path in paths
+        .iter()
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("lease"))
+    {
+        let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+        match file.try_lock() {
+            Ok(()) => {
+                drop(file);
+                let _ = fs::remove_file(path);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => active = true,
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    Ok(active)
+}
 
 fn runtime_dir(root: &Path) -> Result<PathBuf> {
     let runtime = root.join(".membrick").join("runtime");
@@ -117,6 +316,14 @@ pub(crate) fn post_json_with_transport(
     path: &str,
     payload: &Value,
 ) -> Result<(StatusCode, Value, &'static str)> {
+    // Hooks and other one-shot clients also keep a resident alive for the
+    // duration of their request. Long-lived MCP adapters hold an additional
+    // provider-session lease.
+    let _request_lease = if cfg!(test) {
+        None
+    } else {
+        Some(ProviderSessionLease::acquire(root, "request")?)
+    };
     let body = serde_json::to_vec(payload)?;
     let path = path.to_owned();
     let root = root.to_owned();
@@ -486,11 +693,24 @@ fn wait_for_startup<T>(
         if let Some(response) = try_request() {
             return Ok(Some(response));
         }
-        if let Some(owner) = startup_owner.as_mut() {
-            if let Some(status) = owner.child.try_wait()? {
-                remove_startup_marker_if_owned(&owner.marker, &owner.token);
+        let child_status = startup_owner.as_mut().map(|owner| owner.child.try_wait());
+        match child_status {
+            Some(Ok(Some(status))) => {
+                if let Some(owner) = startup_owner.as_ref() {
+                    remove_startup_marker_if_owned(&owner.marker, &owner.token);
+                }
                 return Err(startup_exit_error(status));
             }
+            Some(Err(error)) => {
+                // A wait-status error does not prove that the child exited.
+                // Keep its startup lock owned until a monitor can establish
+                // that it became ready or terminated.
+                if let Some(owner) = startup_owner.take() {
+                    retain_startup_owner(owner);
+                }
+                return Err(error).context("could not check resident startup child status");
+            }
+            Some(Ok(None)) | None => {}
         }
         // The startup owner removes the marker after binding, or removes its
         // own marker if launch fails. If it vanished while the endpoint is
@@ -499,8 +719,76 @@ fn wait_for_startup<T>(
             return Ok(None);
         }
     }
+    // A timed-out client must not release its startup lock while the child it
+    // launched is still opening the workspace. Otherwise another caller can
+    // replace the marker and launch a competing resident.
+    if let Some(owner) = startup_owner.take() {
+        retain_startup_owner(owner);
+    }
     // A timed-out waiter must leave another starter's marker untouched.
     Ok(None)
+}
+
+fn retain_startup_owner(owner: StartupOwner) {
+    let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(owner)));
+    let monitor_owner = owner.clone();
+    let monitor = std::thread::Builder::new()
+        .name("membrick-resident-startup-monitor".into())
+        .spawn(move || {
+            let owner = monitor_owner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(owner) = owner {
+                monitor_startup_owner(owner);
+            }
+        });
+    if let Err(error) = monitor {
+        eprintln!("could not start resident startup monitor; retaining startup ownership until ready: {error}");
+        // Thread creation failure is rare, but releasing the lock here would
+        // reintroduce the duplicate-start race. Wait fail-closed.
+        let owner = owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(owner) = owner {
+            monitor_startup_owner(owner);
+        }
+    }
+}
+
+fn monitor_startup_owner(mut owner: StartupOwner) {
+    loop {
+        if !owner.marker.exists() {
+            return;
+        }
+        match owner.child.try_wait() {
+            Ok(Some(_status)) => {
+                remove_startup_marker_if_owned(&owner.marker, &owner.token);
+                return;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(error) => {
+                eprintln!("could not monitor resident startup child: {error}");
+                // Keep the startup lock while the child remains alive. If it
+                // has exited, clean up its marker before releasing ownership.
+                loop {
+                    match owner.child.try_wait() {
+                        Ok(Some(_)) => {
+                            remove_startup_marker_if_owned(&owner.marker, &owner.token);
+                            return;
+                        }
+                        Ok(None) | Err(_) => {
+                            if !owner.marker.exists() {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct StartupOwner {
@@ -532,6 +820,7 @@ fn start_server(root: &Path) -> Result<Option<StartupOwner>> {
             .open(log_path)?;
         std::process::Command::new(executable)
             .arg("--resident-server")
+            .arg("--managed-resident")
             .current_dir(root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -751,11 +1040,11 @@ async fn process_claimed_request(router: Router, claim: PathBuf, responses: Path
 pub(crate) async fn serve(
     router: Router,
     root: &Path,
-    shutdown: impl std::future::Future<Output = ()>,
+    shutdown: impl std::future::Future<Output = Option<fs::File>>,
     http_bind: Option<&str>,
     auto_http_port: bool,
     settings_path: Option<&Path>,
-) -> Result<()> {
+) -> Result<Option<fs::File>> {
     tokio::pin!(shutdown);
     let cleanup_root = root.to_owned();
     match tokio::task::spawn_blocking(move || {
@@ -858,7 +1147,7 @@ pub(crate) async fn serve(
             tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60),
             std::time::Duration::from_secs(15 * 60),
         );
-        let result = loop {
+        let shutdown_gate = loop {
             tokio::select! {
                 accepted = async {
                     match listener.as_ref() {
@@ -903,7 +1192,7 @@ pub(crate) async fn serve(
                         Err(error) => eprintln!("file-queue cleanup worker failed: {error}"),
                     }
                 }
-                () = &mut shutdown => break Ok(()),
+                gate = &mut shutdown => break gate,
             }
         };
         drop(listener);
@@ -914,7 +1203,7 @@ pub(crate) async fn serve(
             let _ = std::fs::remove_file(&endpoint);
         }
         eprintln!("Membrick resident stopped on {}", endpoint.display());
-        result
+        Ok(shutdown_gate)
     }
     #[cfg(windows)]
     {
@@ -931,7 +1220,7 @@ pub(crate) async fn serve(
             tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60),
             std::time::Duration::from_secs(15 * 60),
         );
-        loop {
+        let shutdown_gate = loop {
             let server = ServerOptions::new().create(&endpoint)?;
             let _ = std::fs::remove_file(starting_path(root)?);
             tokio::select! {
@@ -971,9 +1260,10 @@ pub(crate) async fn serve(
                         Err(error) => eprintln!("file-queue cleanup worker failed: {error}"),
                     }
                 }
-                () = &mut shutdown => return Ok(()),
+                gate = &mut shutdown => break gate,
             }
-        }
+        };
+        Ok(shutdown_gate)
     }
 }
 

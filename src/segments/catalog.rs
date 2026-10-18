@@ -8,17 +8,22 @@ use crate::tier1::BEHOOD_NP_ENTITY_SOURCE;
 use crate::tokenizer::{self, TokenizerMode};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::diagnostics::*;
 use super::model::*;
 use super::routing::*;
 
-const SEGMENT_CATALOG_CACHE_VERSION: u32 = 1;
+/// Version 2 stores one fingerprint per segment so a reopened store rebuilds
+/// only the segments whose documents changed.
+const SEGMENT_CATALOG_CACHE_VERSION: u32 = 2;
+pub(crate) const SEGMENT_CATALOG_CACHE_DIR: &str = "segment-catalog";
+const SEGMENT_CATALOG_CACHE_FILE: &str = "catalog.bin";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct SegmentRoutingSummary {
@@ -53,11 +58,95 @@ pub(crate) struct SegmentConnectionProfile {
     pub(crate) objects: HashSet<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct PersistedSegmentCatalog {
     version: u32,
-    fingerprint: String,
+    segment_fingerprints: HashMap<String, String>,
     catalog: SegmentCatalog,
+}
+
+#[derive(Serialize)]
+struct PersistedSegmentCatalogRef<'a> {
+    version: u32,
+    segment_fingerprints: &'a HashMap<String, String>,
+    catalog: &'a SegmentCatalog,
+}
+
+/// Cache file for the store whose files live under `store_root`.
+pub(crate) fn segment_catalog_cache_path(store_root: &Path) -> PathBuf {
+    store_root
+        .join(SEGMENT_CATALOG_CACHE_DIR)
+        .join(SEGMENT_CATALOG_CACHE_FILE)
+}
+
+/// Identifies the inputs to one segment's routing summary and connection
+/// profile: its id, its documents in order, and each document's content hash
+/// and semantic tags.
+pub(crate) fn segment_catalog_fingerprint(segment: &MemoryIndexSegment) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"membrick-segment-catalog-segment");
+    hasher.update(segment.segment_id.as_bytes());
+    hasher.update([0]);
+    for doc_id in &segment.doc_ids {
+        hasher.update(doc_id.as_bytes());
+        hasher.update([0]);
+        if let Some(record) = segment.index.docs.get(doc_id) {
+            if record.content_hash.is_empty() {
+                // Legacy records carry no content hash; hash the derived
+                // fields the summary is built from instead.
+                hasher.update(serde_json::to_vec(record).unwrap_or_default());
+                hasher.update(record.content.as_bytes());
+            } else {
+                hasher.update(record.content_hash.as_bytes());
+            }
+            hasher.update([0]);
+            for tag in &record.semantic_tags {
+                hasher.update(tag.as_bytes());
+                hasher.update([0]);
+            }
+        }
+        hasher.update([1]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn segment_catalog_fingerprints(
+    segments: &[MemoryIndexSegment],
+) -> HashMap<String, String> {
+    segments
+        .iter()
+        .map(|segment| {
+            (
+                segment.segment_id.clone(),
+                segment_catalog_fingerprint(segment),
+            )
+        })
+        .collect()
+}
+
+/// Write `bytes` as the store's catalog cache and remove every other file in
+/// the cache directory: older versions keyed each file by a corpus hash and
+/// never removed superseded ones.
+pub(crate) fn write_segment_catalog_cache(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("catalog cache path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, bytes)?;
+    fs::rename(&temporary, path)?;
+    for entry in fs::read_dir(parent)? {
+        let stale = entry?.path();
+        if stale != path && stale.is_file() {
+            if let Err(error) = fs::remove_file(&stale) {
+                eprintln!(
+                    "warning: could not remove stale segment catalog cache {}: {error}",
+                    stale.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -861,56 +950,96 @@ impl SegmentRoutingSummary {
 }
 
 impl SegmentCatalog {
+    /// Serialize this catalog as a cache for `segments`, the segments it was
+    /// built from.
+    pub(crate) fn encode_cache(&self, segments: &[MemoryIndexSegment]) -> anyhow::Result<Vec<u8>> {
+        let segment_fingerprints = segment_catalog_fingerprints(segments);
+        Ok(oxicode::serde::encode_to_vec(
+            &PersistedSegmentCatalogRef {
+                version: SEGMENT_CATALOG_CACHE_VERSION,
+                segment_fingerprints: &segment_fingerprints,
+                catalog: self,
+            },
+            oxicode::config::standard(),
+        )?)
+    }
+
+    fn load_cache(path: &Path) -> Option<PersistedSegmentCatalog> {
+        let bytes = fs::read(path).ok()?;
+        let (cached, _): (PersistedSegmentCatalog, _) =
+            oxicode::serde::decode_from_slice(&bytes, oxicode::config::standard()).ok()?;
+        let complete = cached.segment_fingerprints.len() == cached.catalog.summaries.len()
+            && cached.segment_fingerprints.keys().all(|segment_id| {
+                cached.catalog.summaries.contains_key(segment_id)
+                    && cached.catalog.connection_profiles.contains_key(segment_id)
+            });
+        (cached.version == SEGMENT_CATALOG_CACHE_VERSION && complete).then_some(cached)
+    }
+
+    /// Build the catalog, reusing the cached summary and connection profile of
+    /// every segment whose fingerprint is unchanged. Changed, added, and removed
+    /// segments go through the same delta path a running store uses after a
+    /// write, which produces the maps a full build would.
     pub(crate) fn load_or_build(
         segments: &[MemoryIndexSegment],
         generation: u64,
         cache_path: Option<&Path>,
-        fingerprint: &str,
     ) -> Self {
-        if let Some(path) = cache_path {
-            if let Ok(bytes) = fs::read(path) {
-                if let Ok((cached, _)) = oxicode::serde::decode_from_slice::<
-                    PersistedSegmentCatalog,
-                    _,
-                >(&bytes, oxicode::config::standard())
-                {
-                    let mut ids = segments
-                        .iter()
-                        .map(|segment| segment.segment_id.clone())
-                        .collect::<Vec<_>>();
-                    ids.sort();
-                    if cached.version == SEGMENT_CATALOG_CACHE_VERSION
-                        && cached.fingerprint == fingerprint
-                        && cached.catalog.ordered_segment_ids == ids
-                        && cached.catalog.summaries.len() == segments.len()
-                        && cached.catalog.connection_profiles.len() == segments.len()
-                    {
-                        let mut catalog = cached.catalog;
-                        catalog.generation = generation;
-                        return catalog;
+        let Some(path) = cache_path else {
+            return Self::from_segments(segments, generation);
+        };
+        let fingerprints = segment_catalog_fingerprints(segments);
+        let cached = Self::load_cache(path);
+        let (catalog, changed) = match cached {
+            Some(cached) => {
+                let mut summaries = HashMap::with_capacity(segments.len());
+                let mut connection_profiles = HashMap::with_capacity(segments.len());
+                let mut changed_segment_ids = HashSet::new();
+                for segment in segments {
+                    let id = &segment.segment_id;
+                    if cached.segment_fingerprints.get(id) == fingerprints.get(id) {
+                        summaries.insert(id.clone(), Arc::clone(&cached.catalog.summaries[id]));
+                        connection_profiles.insert(
+                            id.clone(),
+                            Arc::clone(&cached.catalog.connection_profiles[id]),
+                        );
+                    } else {
+                        changed_segment_ids.insert(id.clone());
+                        summaries.insert(
+                            id.clone(),
+                            Arc::new(SegmentRoutingSummary::from_index(&segment.index)),
+                        );
+                        connection_profiles.insert(
+                            id.clone(),
+                            Arc::new(segment_connection_profile(
+                                segment,
+                                TemporalQueryContext::default(),
+                            )),
+                        );
                     }
                 }
+                for segment_id in cached.segment_fingerprints.keys() {
+                    if !fingerprints.contains_key(segment_id) {
+                        changed_segment_ids.insert(segment_id.clone());
+                    }
+                }
+                let changed = !changed_segment_ids.is_empty();
+                let catalog = Self::from_parts_incremental(
+                    &cached.catalog,
+                    segments,
+                    summaries,
+                    connection_profiles,
+                    &changed_segment_ids,
+                    generation,
+                );
+                (catalog, changed)
             }
-        }
-
-        let catalog = Self::from_segments(segments, generation);
-        if let Some(path) = cache_path {
-            let persisted = PersistedSegmentCatalog {
-                version: SEGMENT_CATALOG_CACHE_VERSION,
-                fingerprint: fingerprint.to_string(),
-                catalog: catalog.clone(),
-            };
-            let write = (|| -> anyhow::Result<()> {
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("catalog cache path has no parent"))?;
-                fs::create_dir_all(parent)?;
-                let bytes = oxicode::serde::encode_to_vec(&persisted, oxicode::config::standard())?;
-                let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-                fs::write(&temporary, bytes)?;
-                fs::rename(temporary, path)?;
-                Ok(())
-            })();
+            None => (Self::from_segments(segments, generation), true),
+        };
+        if changed {
+            let write = catalog
+                .encode_cache(segments)
+                .and_then(|bytes| write_segment_catalog_cache(path, &bytes));
             if let Err(error) = write {
                 eprintln!("warning: failed to persist segment catalog cache: {error:#}");
             }

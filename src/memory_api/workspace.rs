@@ -21,8 +21,6 @@ const STORE_INIT_LOCK_RETRY: Duration = Duration::from_millis(100);
 /// provider stores. Kept by the resident runtime while it serves requests.
 pub(crate) struct WorkspaceOwnerLock {
     _file: File,
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
 }
 
 impl WorkspaceOwnerLock {
@@ -36,30 +34,16 @@ impl WorkspaceOwnerLock {
             STORE_INIT_LOCK_RETRY,
             "workspace resident owner",
         )?;
-        Ok(Self {
-            _file: file,
-            #[cfg(not(unix))]
-            path,
-        })
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for WorkspaceOwnerLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        Ok(Self { _file: file })
     }
 }
 
 /// Kernel-released file-lock primitive shared by both guards below.
 ///
-/// On Unix this is an advisory exclusive lock via `File::try_lock` (std):
-/// the kernel releases the lock when the holding process dies for any
-/// reason — including SIGKILL — so a crashed writer can never wedge the
-/// store with an orphaned lock file. The lock file itself is never deleted;
-/// only the lock state matters. Holding the returned `File` open holds the
-/// lock; dropping it releases.
-#[cfg(unix)]
+/// `File::try_lock` uses an OS lock on Unix and Windows. The OS releases the
+/// lock when the holding process exits or crashes, so a leftover lock file is
+/// harmless and never blocks recovery. Holding the returned `File` open holds
+/// the lock; dropping it releases.
 fn acquire_file_lock(path: &Path, wait: Duration, retry: Duration, what: &str) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -87,37 +71,8 @@ fn acquire_file_lock(path: &Path, wait: Duration, retry: Duration, what: &str) -
     }
 }
 
-/// Non-Unix fallback: the create_new + remove-on-Drop scheme. Keeps the
-/// crate building on targets without `flock`; carries the old crash caveat
-/// (an orphaned file wedges later writers until manually removed).
-#[cfg(not(unix))]
-fn acquire_file_lock(path: &Path, wait: Duration, retry: Duration, what: &str) -> Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let started = std::time::Instant::now();
-    loop {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(file) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if started.elapsed() >= wait {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for {what} at {}",
-                        path.display()
-                    ));
-                }
-                thread::sleep(retry);
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
 struct StoreInitLock {
     _file: File,
-    // Only the non-Unix fallback deletes the lock file on release.
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
 }
 
 impl StoreInitLock {
@@ -130,18 +85,7 @@ impl StoreInitLock {
             STORE_INIT_LOCK_RETRY,
             "persistent store initialization lock",
         )?;
-        Ok(Self {
-            _file: file,
-            #[cfg(not(unix))]
-            path,
-        })
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for StoreInitLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        Ok(Self { _file: file })
     }
 }
 

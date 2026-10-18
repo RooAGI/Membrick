@@ -2,13 +2,13 @@ use super::{
     ChunkLifecycleMeta, IndexLocation, MemoryIndexLayout, MemoryIndexSegmentInspection,
     MemoryIndexSnapshot, MemoryIndexSnapshotInspection, PersistedDocRecord,
     PersistedSemanticRecords, PipelineOptions, StoreMetadata, StorePaths, CHUNK_LIFECYCLE_FILE,
-    SEGMENT_MANIFEST_FILE, SEMANTIC_CORE_FILE, SEMANTIC_RECORDS_FILE, STORE_LAYOUT_VERSION,
-    STORE_SCHEMA_VERSION,
+    SEGMENT_MANIFEST_FILE, SEMANTIC_CORE_FILE, SEMANTIC_RECORDS_FILE, SEMANTIC_RELATIONS_FILE,
+    STORE_LAYOUT_VERSION, STORE_SCHEMA_VERSION,
 };
 use crate::index::{DocRecord, MemoryIndex, QueryDiagnostics, QueryTimings, SearchResult};
 use crate::query_plan::PreparedQuery;
 use crate::segments::SegmentManifest;
-use crate::semantic_relations::SemanticRelationStore;
+use crate::semantic_relations::{SemanticRelationStore, SupersessionOptions};
 use crate::source::SourceDocument;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -565,17 +565,21 @@ pub(crate) fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Records do not store `concept`; a reopened store derives it this way.
+fn reconstructed_concept(record: &DocRecord) -> &str {
+    record
+        .headings
+        .first()
+        .or(record.probable_topic.as_ref())
+        .unwrap_or(&record.doc_id)
+}
+
 pub(crate) fn source_document_from_record(record: &DocRecord) -> SourceDocument {
     SourceDocument {
         doc_id: record.doc_id.clone(),
         source: record.source.clone(),
         content: record.content.clone(),
-        concept: record
-            .headings
-            .first()
-            .cloned()
-            .or_else(|| record.probable_topic.clone())
-            .unwrap_or_else(|| record.doc_id.clone()),
+        concept: reconstructed_concept(record).to_string(),
         group_id: record.group_id.clone(),
         filters: record.filters.clone(),
         headings: record.headings.clone(),
@@ -590,6 +594,196 @@ pub(crate) fn source_document_from_record(record: &DocRecord) -> SourceDocument 
         key_phrases: record.key_phrases.clone(),
         key_phrase_extraction_hash: record.key_phrase_extraction_hash.clone(),
     }
+}
+
+/// Whether `doc` equals what [`source_document_from_record`] rebuilds from
+/// `record`, for every field relation extraction reads. Keep this in step with
+/// that function. Key phrases are restored too but never read by relations.
+fn matches_reconstruction(doc: &SourceDocument, record: &DocRecord) -> bool {
+    doc.doc_id == record.doc_id
+        && doc.source == record.source
+        && doc.content == record.content
+        && doc.concept == reconstructed_concept(record)
+        && doc.group_id == record.group_id
+        && doc.filters == record.filters
+        && doc.headings == record.headings
+        && doc.links == record.doc_links
+        && doc.timestamp == record.timestamp
+        && doc.doc_length == record.doc_length
+        && doc.author_agent == record.author_agent
+}
+
+/// Bump when claim extraction or relation detection changes, so caches
+/// written by older code are rebuilt instead of reused.
+const SEMANTIC_RELATIONS_CACHE_VERSION: u32 = 1;
+
+#[derive(serde::Deserialize)]
+struct PersistedSemanticRelations {
+    version: u32,
+    fingerprint: String,
+    store: SemanticRelationStore,
+}
+
+#[derive(serde::Serialize)]
+struct PersistedSemanticRelationsRef<'a> {
+    version: u32,
+    fingerprint: &'a str,
+    store: &'a SemanticRelationStore,
+}
+
+fn semantic_relations_path(store_paths: &StorePaths) -> Option<PathBuf> {
+    store_paths
+        .semantic_dir
+        .as_ref()
+        .map(|dir| dir.join(SEMANTIC_RELATIONS_FILE))
+}
+
+/// Identifies the documents a restart would rebuild relations from. It covers
+/// every record field [`source_document_from_record`] copies. Content enters
+/// through the record content hash, which is derived from it.
+fn semantic_relations_fingerprint(
+    records: &HashMap<String, Arc<DocRecord>>,
+    options: SupersessionOptions,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    fn optional(hasher: &mut Sha256, value: &Option<String>) {
+        hasher.update([u8::from(value.is_some())]);
+        if let Some(value) = value {
+            field(hasher, value.as_bytes());
+        }
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, b"membrick-semantic-relations-cache");
+    hasher.update(SEMANTIC_RELATIONS_CACHE_VERSION.to_le_bytes());
+    field(&mut hasher, &serde_json::to_vec(&options)?);
+    let mut ordered = records.values().map(AsRef::as_ref).collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+    for record in ordered {
+        field(&mut hasher, record.doc_id.as_bytes());
+        if record.content_hash.is_empty() {
+            field(&mut hasher, b"content");
+            field(&mut hasher, record.content.as_bytes());
+        } else {
+            field(&mut hasher, b"hash");
+            field(&mut hasher, record.content_hash.as_bytes());
+        }
+        field(&mut hasher, record.source.as_bytes());
+        optional(&mut hasher, &record.group_id);
+        hasher.update((record.filters.len() as u64).to_le_bytes());
+        for (key, value) in &record.filters {
+            field(&mut hasher, key.as_bytes());
+            field(&mut hasher, value.as_bytes());
+        }
+        hasher.update((record.headings.len() as u64).to_le_bytes());
+        for heading in &record.headings {
+            field(&mut hasher, heading.as_bytes());
+        }
+        optional(&mut hasher, &record.probable_topic);
+        hasher.update((record.doc_links.len() as u64).to_le_bytes());
+        for link in &record.doc_links {
+            field(&mut hasher, link.as_bytes());
+        }
+        optional(&mut hasher, &record.timestamp);
+        hasher.update((record.doc_length as u64).to_le_bytes());
+        optional(&mut hasher, &record.author_agent);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Serialize `relations` as the cache a restart would load, or `None` when the
+/// live documents cannot be matched to `records`. Live documents that differ
+/// from their reconstruction (for example in `concept`) are replaced by the
+/// reconstruction through the incremental update, so the cached store equals
+/// a full rebuild from `records`.
+pub(crate) fn prepare_semantic_relations(
+    relations: &SemanticRelationStore,
+    source_docs: &HashMap<String, Arc<SourceDocument>>,
+    records: &HashMap<String, Arc<DocRecord>>,
+    options: SupersessionOptions,
+) -> Result<Option<Vec<u8>>> {
+    if source_docs.len() != records.len() {
+        return Ok(None);
+    }
+    let mut reconstructed = Vec::new();
+    for (doc_id, record) in records {
+        let Some(doc) = source_docs.get(doc_id) else {
+            return Ok(None);
+        };
+        if !matches_reconstruction(doc, record) {
+            reconstructed.push(Arc::new(source_document_from_record(record)));
+        }
+    }
+    let rebased;
+    let relations = if reconstructed.is_empty() {
+        relations
+    } else {
+        let mut all_docs = source_docs.clone();
+        for doc in &reconstructed {
+            all_docs.insert(doc.doc_id.clone(), doc.clone());
+        }
+        let changed = reconstructed.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+        let mut store = relations.clone();
+        store.update_documents_borrowed(&all_docs, &changed, &[], options)?;
+        rebased = store;
+        &rebased
+    };
+    let fingerprint = semantic_relations_fingerprint(records, options)?;
+    let payload = PersistedSemanticRelationsRef {
+        version: SEMANTIC_RELATIONS_CACHE_VERSION,
+        fingerprint: &fingerprint,
+        store: relations,
+    };
+    Ok(Some(oxicode::serde::encode_to_vec(
+        &payload,
+        oxicode::config::standard(),
+    )?))
+}
+
+pub(crate) fn persist_semantic_relations(paths: &StorePaths, bytes: &[u8]) -> Result<()> {
+    let Some(path) = semantic_relations_path(paths) else {
+        return Ok(());
+    };
+    write_bytes_file_atomic(&path, bytes)
+}
+
+/// Prepare and write the relation cache. A cache that cannot be written only
+/// costs the next start a rebuild, so failures are reported, not returned.
+pub(crate) fn persist_semantic_relations_best_effort(
+    paths: &StorePaths,
+    relations: &SemanticRelationStore,
+    source_docs: &HashMap<String, Arc<SourceDocument>>,
+    records: &HashMap<String, Arc<DocRecord>>,
+    options: SupersessionOptions,
+) {
+    if paths.semantic_dir.is_none() {
+        return;
+    }
+    let result = prepare_semantic_relations(relations, source_docs, records, options)
+        .and_then(|bytes| bytes.map_or(Ok(()), |bytes| persist_semantic_relations(paths, &bytes)));
+    if let Err(error) = result {
+        eprintln!("warning: could not write semantic relation cache: {error:#}");
+    }
+}
+
+/// The cached relation store, when it was built from exactly these records
+/// with these options by this version of the relation code.
+pub(crate) fn load_semantic_relations(
+    paths: &StorePaths,
+    records: &HashMap<String, Arc<DocRecord>>,
+    options: SupersessionOptions,
+) -> Option<SemanticRelationStore> {
+    let bytes = fs::read(semantic_relations_path(paths)?).ok()?;
+    let (cached, _): (PersistedSemanticRelations, _) =
+        oxicode::serde::decode_from_slice(&bytes, oxicode::config::standard()).ok()?;
+    if cached.version != SEMANTIC_RELATIONS_CACHE_VERSION {
+        return None;
+    }
+    let fingerprint = semantic_relations_fingerprint(records, options).ok()?;
+    (cached.fingerprint == fingerprint).then_some(cached.store)
 }
 
 type SemanticState = (

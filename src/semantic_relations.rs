@@ -84,7 +84,7 @@ pub struct SemanticRelation {
     pub scope: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DocumentSemanticState {
     pub status: Option<SemanticStatus>,
     pub superseded_by: Option<String>,
@@ -92,7 +92,9 @@ pub struct DocumentSemanticState {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Serializable so a store can cache it across restarts; see
+/// `pipeline::persistence::load_semantic_relations`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SemanticRelationStore {
     claims: Vec<SemanticClaim>,
     relations: Vec<SemanticRelation>,
@@ -215,10 +217,11 @@ impl SemanticRelationStore {
         }
 
         let mut chain_relations = HashMap::<RelationKey, Vec<SemanticRelation>>::new();
+        let mut cues = DocCueCache::new();
         for (key, chain) in &chains {
             chain_relations.insert(
                 key.clone(),
-                build_chain_relations(chain, &claim_by_id, &docs_by_id),
+                build_chain_relations(chain, &claim_by_id, &docs_by_id, &mut cues),
             );
         }
 
@@ -474,6 +477,7 @@ impl SemanticRelationStore {
         let mut affected_keys: Vec<RelationKey> = affected_keys.into_iter().collect();
         affected_keys.sort();
         let mut fresh_chain = Vec::<SemanticRelation>::new();
+        let mut cues = DocCueCache::new();
         for key in affected_keys {
             if let Some(old) = self.chain_relations.get(&key) {
                 for relation in old {
@@ -486,7 +490,7 @@ impl SemanticRelationStore {
             if chain.is_empty() {
                 self.chains.remove(&key);
             }
-            let rebuilt = build_chain_relations(&chain, &self.claim_by_id, &docs_by_id);
+            let rebuilt = build_chain_relations(&chain, &self.claim_by_id, &docs_by_id, &mut cues);
             for relation in &rebuilt {
                 affected_docs.insert(relation.source_doc_id.clone());
                 affected_docs.insert(relation.target_doc_id.clone());
@@ -655,12 +659,13 @@ fn explicit_relation_claims(
 /// Decides the relation between a claim and its predecessor on the same
 /// canonical-claim chain. Extracted verbatim from the full rebuild so both
 /// paths share the decision logic.
-fn push_chain_pair_relation(
+fn push_chain_pair_relation<'a>(
     relations: &mut Vec<SemanticRelation>,
     seen: &mut HashSet<String>,
     claim: &SemanticClaim,
     previous: &SemanticClaim,
-    docs_by_id: &HashMap<&str, &SourceDocument>,
+    docs_by_id: &HashMap<&'a str, &'a SourceDocument>,
+    cues: &mut DocCueCache<'a>,
 ) {
     if normalize(&previous.object) == normalize(&claim.object) {
         push_relation(
@@ -682,8 +687,8 @@ fn push_chain_pair_relation(
     // ("instead of X") is the corrector and must be the relation source.
     // Without this, cue-driven supersession is a coin flip on same-day writes.
     let (claim, previous, source_doc, target_doc) = if claim_date(claim) == claim_date(previous) {
-        let claim_has_cue = source_doc.is_some_and(|doc| has_correction_cue(&doc.content));
-        let previous_has_cue = target_doc.is_some_and(|doc| has_correction_cue(&doc.content));
+        let claim_has_cue = source_doc.is_some_and(|doc| cues.get(doc).correction);
+        let previous_has_cue = target_doc.is_some_and(|doc| cues.get(doc).correction);
         if previous_has_cue && !claim_has_cue {
             (previous, claim, target_doc, source_doc)
         } else {
@@ -692,16 +697,16 @@ fn push_chain_pair_relation(
     } else {
         (claim, previous, source_doc, target_doc)
     };
-    let direct_correction = source_doc.is_some_and(|doc| has_correction_cue(&doc.content));
+    let direct_correction = source_doc.is_some_and(|doc| cues.get(doc).correction);
     // A cue that names a specific old value only corrects the claim with
     // that value ("instead of Postgres" retires Postgres, not SQLite).
     // A cue naming a different value is a genuine clash, not a directed
     // correction. Cues that name no value ("no longer", "previously") or
     // only a generic anaphor remain general corrections. A cue whose value
     // cannot be extracted never authorizes supersession.
-    let cue_directed = match source_doc.map(|doc| cue_reference(&doc.content)) {
+    let cue_directed = match source_doc.map(|doc| &cues.get(doc).reference) {
         Some(CueReference::Named(referenced)) => {
-            normalize(&referenced) == normalize(&previous.object)
+            normalize(referenced) == normalize(&previous.object)
         }
         Some(CueReference::General) => true,
         Some(CueReference::Unparseable) | None => false,
@@ -752,10 +757,11 @@ fn push_chain_pair_relation(
 /// Rebuilds the relations for one canonical-claim chain: consecutive claims in
 /// canonical order (from different docs) relate to each other, exactly as the
 /// full rebuild's per-key pass does.
-fn build_chain_relations(
+fn build_chain_relations<'a>(
     chain: &[String],
     claim_by_id: &HashMap<String, SemanticClaim>,
-    docs_by_id: &HashMap<&str, &SourceDocument>,
+    docs_by_id: &HashMap<&'a str, &'a SourceDocument>,
+    cues: &mut DocCueCache<'a>,
 ) -> Vec<SemanticRelation> {
     let mut relations = Vec::new();
     let mut seen = HashSet::new();
@@ -773,16 +779,23 @@ fn build_chain_relations(
         };
         if let Some(previous) = latest {
             if previous.source_doc_id != claim.source_doc_id {
-                push_chain_pair_relation(&mut relations, &mut seen, claim, previous, docs_by_id);
+                push_chain_pair_relation(
+                    &mut relations,
+                    &mut seen,
+                    claim,
+                    previous,
+                    docs_by_id,
+                    cues,
+                );
             }
         }
         // Cue-directed lookback: if this claim's cue names a specific value,
         // pair it with the most recent previous claim bearing that value.
         // The `seen` set dedupes the case where it matches the immediate
         // predecessor (already paired above).
-        if let Some(source_doc) = docs_by_id.get(claim.source_doc_id.as_str()) {
-            if let CueReference::Named(named) = cue_reference(&source_doc.content) {
-                let named_norm = normalize(&named);
+        if let Some(source_doc) = docs_by_id.get(claim.source_doc_id.as_str()).copied() {
+            if let CueReference::Named(named) = &cues.get(source_doc).reference {
+                let named_norm = normalize(named);
                 for prev in history.iter().rev() {
                     if prev.source_doc_id != claim.source_doc_id
                         && normalize(&prev.object) == named_norm
@@ -793,6 +806,7 @@ fn build_chain_relations(
                             claim,
                             prev,
                             docs_by_id,
+                            cues,
                         );
                         break;
                     }
@@ -1470,11 +1484,47 @@ const CORRECTION_CUES: &[&str] = &[
     "formerly",
 ];
 
+#[cfg(test)]
 fn has_correction_cue(content: &str) -> bool {
-    let lower = content.to_lowercase();
+    has_correction_cue_lower(&content.to_lowercase())
+}
+
+fn has_correction_cue_lower(lower: &str) -> bool {
     CORRECTION_CUES
         .iter()
-        .any(|cue| find_cue_word(&lower, cue).is_some())
+        .any(|cue| find_cue_word(lower, cue).is_some())
+}
+
+/// Correction-cue analysis of one document's content. Chain pairing asks the
+/// same questions about a document for every claim it holds, so a relation
+/// rebuild computes this once per document instead of once per pair.
+struct DocCues {
+    correction: bool,
+    reference: CueReference,
+}
+
+impl DocCues {
+    fn analyze(content: &str) -> Self {
+        let lower = content.to_lowercase();
+        Self {
+            correction: has_correction_cue_lower(&lower),
+            reference: cue_reference_lower(&lower),
+        }
+    }
+}
+
+struct DocCueCache<'a>(HashMap<&'a str, DocCues>);
+
+impl<'a> DocCueCache<'a> {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    fn get(&mut self, doc: &'a SourceDocument) -> &DocCues {
+        self.0
+            .entry(doc.doc_id.as_str())
+            .or_insert_with(|| DocCues::analyze(&doc.content))
+    }
 }
 
 /// Finds a cue phrase at word boundaries and outside double-quoted spans, so
@@ -1533,8 +1583,12 @@ enum CueReference {
 /// Classify what a correction cue says about the old value. Quoted values
 /// (`instead of "Postgres"`) are unquoted before comparison so they still
 /// direct the correction.
+#[cfg(test)]
 fn cue_reference(content: &str) -> CueReference {
-    let lower = content.to_lowercase();
+    cue_reference_lower(&content.to_lowercase())
+}
+
+fn cue_reference_lower(lower: &str) -> CueReference {
     for pattern in [
         "supersedes",
         "instead of",
@@ -1543,7 +1597,7 @@ fn cue_reference(content: &str) -> CueReference {
         "changed from",
         "moved from",
     ] {
-        if let Some(pos) = find_cue_word(&lower, pattern) {
+        if let Some(pos) = find_cue_word(lower, pattern) {
             let mut rest = lower[pos + pattern.len()..].trim_start();
             // Frontmatter `supersedes: decision-a.md` is an explicit link
             // (handled via supersedes_id), not a natural-language correction

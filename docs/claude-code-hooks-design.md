@@ -34,10 +34,11 @@ Claude Code:
 - reduce repeated repository exploration and repeated user explanations
 - bound hook latency and the number of tokens injected into Claude's context
 
-The integration stores every parsed user and assistant transcript observation
-in source order as session memory, including tool calls, tool results, empty
-messages, and image blocks. Text blocks and serialized structured blocks are
-kept in full. Credentials are redacted before persistence.
+The integration stores every parsed user and assistant transcript message in
+source order inside one searchable turn document per capture, including tool
+calls, tool results, empty messages, and image blocks. Text blocks and
+serialized structured blocks are kept in full. Credentials are redacted before
+persistence.
 
 Claude and Codex hooks submit a durable capture request to the existing project
 resident and return after acceptance. Acceptance means queued, not fully
@@ -69,35 +70,40 @@ batched up to 1 MiB without splitting a line. An unusually large line remains
 intact in its own batch. All transcript text is retained; batching limits work
 per pass and never truncates the session.
 
-Each parsed transcript observation in that slice is stored as its own stable
-`SourceDocument` with its speaker, order, provider message ID when available,
-timestamp when available, and complete text or serialized blocks. When a
-provider turn ID is available, it is retained in `filters["turn_id"]` and
-included in the document ID alongside the existing provider, project, session,
-and event identity. Transcript turn IDs take precedence; a multi-turn backfill
-is never labeled with the hook's latest turn ID. Messages without a provider
-message ID use their actual JSONL line byte position, which stays stable when
-capture boundaries change. Capture fragments retain separate event identities
-so two portions of the same turn do not overwrite each other's text. Existing
-stored document IDs are not migrated by this change.
+A context compaction starts a new segment. Codex records a top-level
+`compacted` line in its rollout and Claude Code a `compact_boundary` system
+line. A batch always ends at such a line, and the stretch between two
+compactions is one epoch. Epoch 0, everything before the first compaction,
+keeps the session's segment key. Later epochs use `<session key>:epoch-N` and
+carry a `session_epoch` filter, while the `session_id` filter stays the same, so
+session-scoped lookups still see the whole session. Only the current epoch's
+segment changes as the session grows. The epoch is read from the transcript and
+saved in the cursor, so replaying a transcript assigns the same epochs. The
+Claude Code marker is not yet confirmed against a real compacted transcript.
 
-The slice's text is also stored once as a turn document of the hook's type (`outcome`,
+The slice's text is stored once as a turn document of the hook's type (`outcome`,
 `checkpoint`, or `session-summary`) with project semantic scope, so its claims
-are compared with other sessions. Transcript discovery uses the hook path or
-project `.membrick/settings.toml`; it does not read environment variables.
+are compared with other sessions. All parsed messages and structured blocks in
+the slice remain in source order inside that turn document. A provider turn ID
+is attached only when every message in the slice belongs to the same turn, so a
+multi-turn backfill is not mislabeled. Transcript discovery uses the hook path
+or project `.membrick/settings.toml`; it does not read environment variables.
 
 One `session-context` document per session holds a short header and links the
-observations captured for that session. Search feedback can add a managed
+turn captured in the latest batch. Search feedback can add a managed
 conclusion, headings, and evidence-backed links to this existing document.
-Subsequent hook captures preserve those enrichments and accumulate links to
-the observations rather than dropping earlier references. Each batch is sent
-to `POST /provider-memory/mcp/documents/upsert`. The resident owner journals
+Each batch is sent to `POST /provider-memory/mcp/documents/upsert`. The resident owner journals
 the batch and replies once it is durable; the background publisher makes it
 searchable, usually within the refresh interval. The server does not rebuild
 the session from the store, so a capture never waits for a full index refresh.
 If the transcript becomes shorter than the stored position, the capture starts
-from the beginning of the file and upserts the observations again. Observations
-from the old transcript that no longer exist remain as history. Session
+from the beginning of the file and upserts the turn at byte position zero.
+
+Raw `session-observation` documents are not created or indexed because their
+content duplicates the searchable turn document. The original provider
+transcript remains the authoritative raw record. `MemoryService` also rejects
+this document type at its write boundary, and opening an existing persistent
+store removes legacy observation documents before publishing the index. Session
 documents participate in normal hook retrieval. Hooks
 inject only query-matched excerpts, and the shared policy excludes conflicted
 results. Explicit search remains available for inspecting conflicts and full
@@ -347,8 +353,8 @@ Operation:
    capture. The cursor advances only after the upsert succeeds.
 2. Preserve each parsed message's speaker and full text in source order.
 3. Redact credentials before persistence.
-4. Create one observation document per message, one checkpoint turn document,
-   and update the stable session-context document with links to the batch.
+4. Create one checkpoint turn document and update the stable session-context
+   document with a link to that turn.
 5. Upsert the batch through the resident `MemoryService`.
 
 Repeated compaction for the same session uses deterministic checkpoint IDs or
@@ -358,11 +364,10 @@ content hashes so retries do not create duplicate memory.
 
 Purpose: capture the durable outcome after Claude finishes a response.
 
-The adapter stores newly appended transcript observations, including decisions,
-corrections, tool text, and results, in source order. Those observations and a
-turn-level outcome document are upserted with the stable session-context
-document. Prior observations remain linked as history; the hook does not resend
-the complete transcript on every capture.
+The adapter stores newly appended transcript messages, including decisions,
+corrections, tool text, and results, in source order inside a turn-level outcome
+document. It upserts that document with the stable session-context document.
+The hook does not resend the complete transcript on every capture.
 
 The implementation must respect Claude's stop-hook recursion indicator and must
 not cause another stop cycle.
@@ -372,9 +377,8 @@ not cause another stop cycle.
 Purpose: record final resumable session state and termination metadata.
 
 SessionEnd uses the same incremental capture path and creates a turn document
-of type `SessionSummary`, alongside the observation documents and session
-context links. It does not inject context. A resumed session can continue
-adding observations to the same session context.
+of type `SessionSummary` with the session-context link. It does not inject
+context. A resumed session can continue adding turns to the same session.
 
 ## Retrieval Provenance
 

@@ -293,6 +293,7 @@ pub fn install_memory_policy(root: &Path) -> Result<PathBuf> {
 }
 
 pub fn run_server(root: &Path, options: MuseServerOptions<'_>) -> Result<()> {
+    let _resident_lease = crate::local_ipc::start_provider_session(root, "muse")?;
     mcp_index::trace_event("server-start");
     let mcp = MuseMcp {
         root: root.to_path_buf(),

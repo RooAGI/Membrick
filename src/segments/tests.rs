@@ -13,6 +13,55 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[test]
+fn catalog_cache_rebuilds_only_changed_segments_and_matches_a_full_build() {
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+        "membrick-catalog-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = segment_catalog_cache_path(&root);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let stale = path.with_file_name("stale-corpus-hash.bin");
+    std::fs::write(&stale, b"old cache").unwrap();
+    let build = |records: Vec<DocRecord>| {
+        SegmentedMemoryIndex::from_records_by_group_id_with_generation(&records, 0)
+    };
+
+    let first = build(vec![
+        record("a", "kept", "alpha notes", &["alpha"]),
+        record("b", "changed", "beta notes", &["beta"]),
+        record("c", "removed", "gamma notes", &["gamma"]),
+    ]);
+    SegmentCatalog::load_or_build(&first.segments, 1, Some(&path));
+    assert!(path.exists());
+    assert!(!stale.exists(), "superseded cache files are removed");
+
+    // One segment changes, one disappears, and one is new.
+    let second = build(vec![
+        record("a", "kept", "alpha notes", &["alpha"]),
+        record("b", "changed", "beta revised", &["beta", "delta"]),
+        record("d", "added", "epsilon notes", &["epsilon"]),
+    ]);
+    let cached = SegmentCatalog::load_or_build(&second.segments, 2, Some(&path));
+    let oracle = SegmentCatalog::from_segments(&second.segments, 2);
+    assert_eq!(normalized_catalog(&cached), normalized_catalog(&oracle));
+    assert_eq!(
+        cached.derived_maps_snapshot(),
+        oracle.derived_maps_snapshot()
+    );
+
+    // An unchanged reopen loads the cache without rewriting it.
+    let written = std::fs::read(&path).unwrap();
+    let reopened = SegmentCatalog::load_or_build(&second.segments, 3, Some(&path));
+    assert_eq!(std::fs::read(&path).unwrap(), written);
+    assert_eq!(normalized_catalog(&reopened), normalized_catalog(&oracle));
+    assert_eq!(reopened.generation, 3);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn segment_candidate_limit_oversamples_without_overflow() {
     assert_eq!(segment_candidate_limit(0), 0);
     assert_eq!(segment_candidate_limit(3), 6);

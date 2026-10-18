@@ -1,6 +1,6 @@
 use crate::ids::stable_chunk_id;
 use crate::query_expansion::normalize_for_index;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::helpers::*;
 use super::model::*;
@@ -275,17 +275,35 @@ impl SemanticAggregate {
     }
 
     pub(crate) fn remove_doc(&mut self, doc_id: &str) {
-        let Some(chunk_ids) = self.doc_to_chunks.remove(doc_id) else {
+        self.remove_docs([doc_id]);
+    }
+
+    /// Remove many documents with one scan of each aggregate posting map.
+    /// Per-document removal rescans every posting list, which is quadratic
+    /// when a startup migration prunes thousands of documents.
+    pub(crate) fn remove_docs<'a>(&mut self, doc_ids: impl IntoIterator<Item = &'a str>) {
+        let mut removed_docs = HashSet::new();
+        let mut removed_chunks = HashSet::new();
+        for doc_id in doc_ids {
+            let Some(chunk_ids) = self.doc_to_chunks.remove(doc_id) else {
+                continue;
+            };
+            removed_docs.insert(doc_id.to_string());
+            removed_chunks.extend(chunk_ids);
+        }
+        if removed_docs.is_empty() {
             return;
-        };
-        for chunk_id in chunk_ids {
-            self.chunk_to_doc.remove(&chunk_id);
-            self.chunk_ranges.remove(&chunk_id);
+        }
+        for chunk_id in &removed_chunks {
+            self.chunk_to_doc.remove(chunk_id);
+            self.chunk_ranges.remove(chunk_id);
+        }
+        if !removed_chunks.is_empty() {
             for postings in self.term_to_chunks.values_mut() {
-                postings.retain(|(id, _)| id != &chunk_id);
+                postings.retain(|(id, _)| !removed_chunks.contains(id));
             }
             for postings in self.entity_to_chunks.values_mut() {
-                postings.retain(|(id, _)| id != &chunk_id);
+                postings.retain(|(id, _)| !removed_chunks.contains(id));
             }
         }
         self.term_to_chunks
@@ -293,16 +311,16 @@ impl SemanticAggregate {
         self.entity_to_chunks
             .retain(|_, postings| !postings.is_empty());
         for postings in self.entity_to_docs.values_mut() {
-            postings.retain(|posting| posting.doc_id != doc_id);
+            postings.retain(|posting| !removed_docs.contains(&posting.doc_id));
         }
         self.entity_to_docs
             .retain(|_, postings| !postings.is_empty());
         for postings in self.term_to_docs.values_mut() {
-            postings.retain(|posting| posting.doc_id != doc_id);
+            postings.retain(|posting| !removed_docs.contains(&posting.doc_id));
         }
         self.term_to_docs.retain(|_, postings| !postings.is_empty());
         for postings in self.claim_to_docs.values_mut() {
-            postings.retain(|posting| posting.doc_id != doc_id);
+            postings.retain(|posting| !removed_docs.contains(&posting.doc_id));
         }
         self.claim_to_docs
             .retain(|_, postings| !postings.is_empty());
@@ -313,11 +331,11 @@ impl SemanticAggregate {
         self.pending_claim_posting_keys
             .retain(|key| self.claim_to_docs.contains_key(key));
         for docs in self.topic_to_docs.values_mut() {
-            docs.retain(|id| id != doc_id);
+            docs.retain(|id| !removed_docs.contains(id));
         }
         self.topic_to_docs.retain(|_, docs| !docs.is_empty());
         for docs in self.doc_type_to_docs.values_mut() {
-            docs.retain(|id| id != doc_id);
+            docs.retain(|id| !removed_docs.contains(id));
         }
         self.doc_type_to_docs.retain(|_, docs| !docs.is_empty());
     }
@@ -335,11 +353,11 @@ mod aggregate_tests {
     fn remove_doc_short_circuits_for_unindexed_documents() {
         let source = include_str!("semantic.rs");
         let start = source
-            .find("pub(crate) fn remove_doc(&mut self, doc_id: &str)")
-            .expect("remove_doc implementation exists");
+            .find("pub(crate) fn remove_docs<'a>(")
+            .expect("remove_docs implementation exists");
         let body = &source[start..];
         let guard_pos = body
-            .find("let Some(chunk_ids) = self.doc_to_chunks.remove(doc_id) else {")
+            .find("if removed_docs.is_empty() {")
             .expect("unindexed document guard exists");
         let return_pos = body[guard_pos..]
             .find("return;")
@@ -432,5 +450,36 @@ mod aggregate_tests {
         );
         assert!(aggregate.pending_entity_posting_keys.is_empty());
         assert!(aggregate.pending_claim_posting_keys.is_empty());
+    }
+
+    #[test]
+    fn batch_removal_keeps_postings_of_retained_documents() {
+        let mut aggregate = SemanticAggregate::default();
+        for doc_id in ["removed-a", "removed-b", "retained"] {
+            let mut state = SemanticDocState {
+                doc_id: doc_id.into(),
+                topic: Some("shared-topic".into()),
+                ..SemanticDocState::default()
+            };
+            state.term_to_docs.insert(
+                "shared-term".into(),
+                vec![TermPosting {
+                    doc_id: doc_id.into(),
+                    score: 1.0,
+                }],
+            );
+            aggregate.insert_doc_state(&state);
+        }
+        aggregate.remove_docs(["removed-a", "removed-b", "never-indexed"]);
+        let term_docs = aggregate.term_to_docs["shared-term"]
+            .iter()
+            .map(|posting| posting.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(term_docs, ["retained"]);
+        assert_eq!(aggregate.topic_to_docs["shared-topic"], ["retained"]);
+        assert_eq!(
+            aggregate.doc_to_chunks.keys().collect::<Vec<_>>(),
+            ["retained"]
+        );
     }
 }

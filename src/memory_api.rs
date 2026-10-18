@@ -1955,7 +1955,22 @@ impl MemoryService {
     /// anchors) survive across those invocations.
     pub fn at_path(index_root: impl AsRef<Path>, options: PipelineOptions) -> anyhow::Result<Self> {
         let index_root = index_root.as_ref();
-        let mut service = Self::new(IndexStore::at_path(index_root, options)?);
+        let mut store = IndexStore::at_path(index_root, options)?;
+        let legacy_observations = store
+            .source_documents()
+            .into_iter()
+            .filter(|document| is_session_observation(document))
+            .map(|document| document.doc_id.clone())
+            .collect::<Vec<_>>();
+        if !legacy_observations.is_empty() {
+            store.remove_many(legacy_observations.iter().map(String::as_str));
+            store.refresh()?;
+            eprintln!(
+                "removed {} legacy session-observation documents from the searchable index",
+                legacy_observations.len()
+            );
+        }
+        let mut service = Self::new(store);
         service.conversation_states = std::sync::Arc::new(std::sync::Mutex::new(
             crate::conversation_state::ConversationStateStore::open_under(index_root),
         ));
@@ -3046,10 +3061,12 @@ impl MemoryService {
             .into_iter()
             .filter(|doc| owns_memory(doc, &request.user_id))
             .filter(|doc| {
-                request
-                    .session_id
-                    .as_deref()
-                    .is_none_or(|session| doc.group_id.as_deref() == Some(session))
+                request.session_id.as_deref().is_none_or(|session| {
+                    doc.group_id
+                        .as_deref()
+                        .map(crate::provider_sources::session_group)
+                        == Some(session)
+                })
             })
             .filter(|doc| request.include_inactive || self.is_visible(doc))
             .collect::<Vec<_>>();
@@ -3336,7 +3353,12 @@ impl MemoryService {
             if let Some(record) = self.record_by_id(&result.doc_id) {
                 // If session_id given, filter to that session. Otherwise include all.
                 if let Some(sid) = session_id {
-                    if record.group_id.as_deref() != Some(sid) {
+                    if record
+                        .group_id
+                        .as_deref()
+                        .map(crate::provider_sources::session_group)
+                        != Some(sid)
+                    {
                         continue;
                     }
                 }
@@ -3853,8 +3875,14 @@ impl MemoryService {
     /// durable resident mutations use the service's staged writer path. Agent
     /// adapters must not mutate `IndexStore` directly.
     pub fn upsert(&mut self, document: crate::SourceDocument) {
+        // Raw transcript observations duplicate the bounded turn document
+        // produced by the same capture. They remain available in the provider
+        // transcript, but must never consume semantic, lexical, or segment
+        // index memory.
+        if is_session_observation(&document) {
+            return;
+        }
         self.has_expiring_documents |= document.filters.contains_key("expires_at_ms");
-        self.has_session_observations |= is_session_observation(&document);
         self.queue_key_phrase_enrichment(std::slice::from_ref(&document));
         self.store.upsert(document)
     }
@@ -6836,7 +6864,7 @@ mod tests {
     }
 
     #[test]
-    fn session_observations_are_persisted_but_excluded_from_memoryservice_search() {
+    fn session_observations_are_not_indexed_by_memoryservice() {
         let mut service = service();
         let mut observation = direct_doc("observation-1", "rare raw transcript phrase");
         observation.filters.insert(
@@ -6847,6 +6875,14 @@ mod tests {
         service.upsert(observation);
         service.upsert(turn);
         service.refresh_index().unwrap();
+
+        assert!(
+            service
+                .store
+                .source_document_by_id("observation-1")
+                .is_none(),
+            "raw session observation entered the searchable store"
+        );
 
         let hits = service
             .search_with_filters(
@@ -6879,11 +6915,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["turn-1"]
         );
+    }
 
+    #[test]
+    fn opening_persistent_memory_removes_legacy_session_observations() {
+        let dir = canonical_temp_dir("prune-session-observations");
+        let mut store = IndexStore::at_path(&dir, PipelineOptions::default()).unwrap();
+        let mut observation = direct_doc("legacy-observation", "duplicated raw message");
+        observation.filters.insert(
+            "document_type".into(),
+            SESSION_OBSERVATION_DOCUMENT_TYPE.into(),
+        );
+        store.upsert(observation);
+        store.upsert(direct_doc("retained-turn", "searchable turn result"));
+        store.refresh().unwrap();
+        drop(store);
+
+        let service = MemoryService::at_path(&dir, PipelineOptions::default()).unwrap();
         assert!(service
             .store
-            .source_document_by_id("observation-1")
+            .source_document_by_id("legacy-observation")
+            .is_none());
+        assert!(service
+            .store
+            .source_document_by_id("retained-turn")
             .is_some());
+        drop(service);
+
+        let reopened = IndexStore::at_path(&dir, PipelineOptions::default()).unwrap();
+        assert!(reopened
+            .source_document_by_id("legacy-observation")
+            .is_none());
+        assert!(reopened.source_document_by_id("retained-turn").is_some());
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(any(

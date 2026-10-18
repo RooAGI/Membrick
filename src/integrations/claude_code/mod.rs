@@ -414,6 +414,7 @@ pub fn run_status_line() -> Result<()> {
 }
 
 pub fn run_server(root: &Path, options: ClaudeCodeServerOptions<'_>) -> Result<()> {
+    let _resident_lease = crate::local_ipc::start_provider_session(root, "claude")?;
     mcp_index::trace_event("server-start");
     let mcp = ClaudeMcp {
         root: root.to_path_buf(),

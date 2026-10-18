@@ -61,18 +61,37 @@ open promptly instead of holding the provider hook for the queue's full
 request timeout.
 
 Each workspace keeps its resident socket (macOS and Linux), startup marker,
-and diagnostics under its own `.membrick/runtime/` directory. On Unix-like
-systems the directory is restricted to the current user and the socket is
-restricted to its owner. Windows uses a workspace-specific named pipe, with
-its startup marker and diagnostics in the project runtime directory. Different
-project roots therefore use separate runtime state and endpoints without
-requiring access to the user's home directory.
+owner lock, and diagnostics under its own `.membrick/runtime/` directory. On
+Unix-like systems the directory is restricted to the current user and the
+socket is restricted to its owner. Windows uses a workspace-specific named
+pipe and the same project-scoped OS file locks for startup and resident
+ownership. The OS releases these locks when a process exits or crashes; the
+lock files may remain and are reused by the next owner. Different project roots
+therefore use separate runtime state and endpoints without requiring access to
+the user's home directory.
 
-On Ctrl-C or SIGTERM the resident stops accepting connections, flushes its
+The provider-launched MCP adapter owns the resident lifecycle. When a provider
+starts its stdio MCP process, the adapter registers a kernel-locked lease in
+`.membrick/runtime/provider-leases/` and triggers resident startup. The resident
+is shared by all provider MCP processes using that project, so Claude, Codex,
+and other providers can use it at the same time. The resident keeps running
+while any provider adapter or one-shot hook/request holds a lease. When the last
+provider process exits, the OS releases its lease even if it crashed; the
+resident detects that no leases remain, waits three seconds for a reconnect,
+then flushes its writer and shuts down. A later provider starts a fresh
+resident automatically. Stale lease files are detected by testing the kernel
+lock and removed during the resident's lease scan. Lease registration and the
+resident's final empty-lease check share the kernel lock at
+`.membrick/runtime/provider-lifecycle.lock`. If a provider starts while the
+resident is shutting down, registration waits until the old resident has
+closed its endpoints and flushed its writer; the new provider then starts a
+fresh owner. The resident holds this lock through its shutdown path. Manual
+`--resident-server` mode remains signal-controlled rather than lease-controlled.
+
+On normal shutdown the resident stops accepting connections, flushes its
 writer, and removes its socket file if the path still refers to the socket it
 created. A socket left by a process that was killed outright is removed by the
-next owner when it fails to connect to it. The resident does not exit on its
-own when idle; stop it with SIGTERM.
+next owner when it fails to connect to it.
 
 Project installation creates `.membrick/server.toml` when it does not already
 exist. It preserves an existing file. The installed port is selected for the

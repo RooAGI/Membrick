@@ -1,7 +1,6 @@
 use crate::index::{
     DocRecord, GlobalBm25Statistics, QueryTimings, SearchResult, TemporalQueryContext,
 };
-use sha2::{Digest, Sha256};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,41 +19,17 @@ pub struct SegmentedMemoryIndex {
     pub(crate) generation: u64,
 }
 
-fn segment_catalog_cache_identity(
-    segments: &[MemoryIndexSegment],
-    lexical_root: &Path,
-) -> (Option<PathBuf>, String) {
-    let mut ordered = segments.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
-    let mut hasher = Sha256::new();
-    hasher.update(b"lint-ai-segment-catalog-v1");
-    for segment in ordered {
-        hasher.update(segment.segment_id.as_bytes());
-        hasher.update([0]);
-        for doc_id in &segment.doc_ids {
-            hasher.update(doc_id.as_bytes());
-            hasher.update([0]);
-            if let Some(record) = segment.index.docs.get(doc_id) {
-                hasher.update(record.content_hash.as_bytes());
-                for tag in &record.semantic_tags {
-                    hasher.update(tag.as_bytes());
-                    hasher.update([0]);
-                }
-            }
-        }
-    }
-    let fingerprint = format!("{:x}", hasher.finalize());
-    let cache_root = lexical_root
-        .parent()
-        .unwrap_or(lexical_root)
-        .join("segment-catalog");
-    (
-        Some(cache_root.join(format!("{fingerprint}.bin"))),
-        fingerprint,
-    )
+/// The catalog cache sits beside the store's `segment-lexical` directory.
+fn segment_catalog_cache_path_for_lexical_root(lexical_root: &Path) -> PathBuf {
+    segment_catalog_cache_path(lexical_root.parent().unwrap_or(lexical_root))
 }
 
 impl SegmentedMemoryIndex {
+    /// The catalog cache for this snapshot, for a store checkpoint to write.
+    pub(crate) fn encode_catalog_cache(&self) -> anyhow::Result<Vec<u8>> {
+        self.catalog.encode_cache(&self.segments)
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
@@ -129,15 +104,8 @@ impl SegmentedMemoryIndex {
         lexical_root: Option<&Path>,
     ) -> Result<Self, String> {
         validate_segments(&segments)?;
-        let (cache_path, fingerprint) = lexical_root
-            .map(|root| segment_catalog_cache_identity(&segments, root))
-            .unwrap_or_else(|| (None, String::new()));
-        let catalog = SegmentCatalog::load_or_build(
-            &segments,
-            generation,
-            cache_path.as_deref(),
-            &fingerprint,
-        );
+        let cache_path = lexical_root.map(segment_catalog_cache_path_for_lexical_root);
+        let catalog = SegmentCatalog::load_or_build(&segments, generation, cache_path.as_deref());
         let global_statistics = GlobalBm25Statistics::from_indexes_with_generation(
             segments.iter().map(|segment| segment.index.as_ref()),
             generation,

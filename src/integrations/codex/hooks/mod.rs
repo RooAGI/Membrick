@@ -662,36 +662,7 @@ fn build_capture_documents(
             command_args: input.command_args.clone(),
             affected_paths: affected_paths.clone(),
         };
-    let mut documents = Vec::with_capacity(messages.len() + 2);
-    for message in messages {
-        // The actual JSONL line position stays stable across batch boundaries.
-        let order = slice.start as usize + message.source_offset;
-        let turn_id = message.turn_id.as_deref().or(capture_turn_id.as_deref());
-        let identity = message.message_id.as_deref().unwrap_or("");
-        let event_id = if identity.is_empty() {
-            format!("observation-{order}")
-        } else {
-            format!("observation-{identity}")
-        };
-        let mut observation = make_document(
-            event_id,
-            CodexDocumentType::SessionSummary,
-            format!("{}\n{}", message.role, message.content),
-            message.timestamp,
-        )
-        .into_source_document()?;
-        transcript_cursor::link_provider_turn(&mut observation, turn_id);
-        observation
-            .filters
-            .insert("document_type".into(), "session-observation".into());
-        observation.filters.insert("speaker".into(), message.role);
-        observation
-            .filters
-            .insert("observation_index".into(), order.to_string());
-        observation.concept = "session-observation".into();
-        observation.headings = vec!["session-observation".into()];
-        documents.push(observation);
-    }
+    let mut documents = Vec::with_capacity(2);
     // This capture's text, compared with other sessions at project scope.
     let mut turn = make_document(
         format!("turn-{}", slice.start),
@@ -701,6 +672,7 @@ fn build_capture_documents(
     )
     .into_source_document()?;
     transcript_cursor::link_provider_turn(&mut turn, capture_turn_id.as_deref());
+    transcript_cursor::assign_session_epoch(&mut turn, slice.epoch);
     if let Some(project_id) = turn.filters.get("project_id").cloned() {
         turn.filters
             .insert("semantic_scope".into(), format!("project:{project_id}"));
@@ -710,7 +682,7 @@ fn build_capture_documents(
         "whole-session".to_string(),
         CodexDocumentType::SessionSummary,
         format!(
-            "Session {} context. Observations are linked in source order.",
+            "Session {} context. The latest searchable turn is linked.",
             input.session_id
         ),
         Some(current_timestamp()),
@@ -721,14 +693,16 @@ fn build_capture_documents(
         .insert("document_type".into(), "session-context".into());
     context.concept = "session-context".into();
     context.headings = vec!["session-context".into()];
-    // Link the observations captured in this batch. The server never
-    // rebuilds the context from the store, so each capture stays one upsert.
+    // Link the searchable turn captured in this batch. Raw transcript
+    // observations duplicate this content and stay outside the index.
     context.links = documents
         .iter()
         .map(|document| document.doc_id.clone())
         .collect();
     context.doc_id = stable_doc_id_from_source(&format!("{}::whole-session", context.source));
     context.doc_length = context.content.len();
+    // The one session-wide context document follows the current epoch.
+    transcript_cursor::assign_session_epoch(&mut context, slice.epoch);
     documents.push(context);
     Ok(documents)
 }
@@ -823,10 +797,7 @@ fn resolve_root(cwd: &Path, fallback_root: &Path) -> Result<PathBuf> {
 struct ConversationMessage {
     role: String,
     content: String,
-    timestamp: Option<String>,
-    message_id: Option<String>,
     turn_id: Option<String>,
-    source_offset: usize,
 }
 
 fn structured_memory(
@@ -836,8 +807,7 @@ fn structured_memory(
 ) -> String {
     let mut fields = vec![
         format!("Memory type: {}", document_type.as_str()),
-        "Parsed transcript text observations in source order. Credentials are redacted."
-            .to_string(),
+        "Parsed transcript messages in source order. Credentials are redacted.".to_string(),
     ];
     for (index, message) in messages.iter().enumerate() {
         let content = &message.content;
@@ -845,7 +815,7 @@ fn structured_memory(
             continue;
         }
         fields.push(format!(
-            "Observation {} [{}]:\n{}",
+            "Message {} [{}]:\n{}",
             index + 1,
             message.role,
             content
@@ -877,11 +847,8 @@ fn extract_structured_memory(
 
 fn extract_messages(text: &str) -> VecDeque<ConversationMessage> {
     let mut messages = VecDeque::new();
-    let mut source_offset = 0;
     let mut context_turn_id = None;
     for line in text.split_inclusive('\n') {
-        let line_start = source_offset;
-        source_offset += line.len();
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -915,23 +882,12 @@ fn extract_messages(text: &str) -> VecDeque<ConversationMessage> {
             turn_id: transcript_cursor::transcript_turn_id(&value)
                 .map(str::to_owned)
                 .or_else(|| context_turn_id.clone()),
-            source_offset: line_start,
             role: role.to_string(),
             content: redact(if content.trim().is_empty() {
                 "[empty message content]"
             } else {
                 &content
             }),
-            timestamp: value
-                .get("timestamp")
-                .or_else(|| message.get("timestamp"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            message_id: value
-                .get("uuid")
-                .or_else(|| message.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
         });
     }
     messages
@@ -1057,7 +1013,93 @@ mod tests {
     }
 
     #[test]
-    fn batch_replay_persists_every_codex_observation_and_checkpoints_each_batch() {
+    fn turns_after_a_compaction_start_a_new_session_segment() {
+        let root = temp_dir("compaction-epoch");
+        let transcript = root.join("transcript.jsonl");
+        let message = |turn_id: &str, content: &str| {
+            serde_json::json!({
+                "turn_id": turn_id,
+                "message": {"role": "user", "content": content}
+            })
+            .to_string()
+                + "\n"
+        };
+        let contents = [
+            message("turn-1", "Before compaction request"),
+            serde_json::json!({"type": "compacted", "payload": {"window_number": 1}}).to_string()
+                + "\n",
+            message("turn-2", "After compaction request"),
+        ]
+        .concat();
+        fs::write(&transcript, contents).unwrap();
+        let hook_input = input(&root, Some(transcript.clone()), "Stop");
+        let state_dir = provider_state_dir(RecordingProvider::Codex, &root);
+        transcript_cursor::replay_batches(
+            &state_dir,
+            &hook_input.session_id,
+            &transcript,
+            |slice| capture_slice(&root, &hook_input, CodexDocumentType::Outcome, slice),
+        )
+        .unwrap();
+
+        let store = open_store(&root).unwrap();
+        let documents = store.source_documents();
+        let turn = |text: &str| {
+            documents
+                .iter()
+                .find(|doc| {
+                    doc.filters.get("document_type").map(String::as_str) == Some("outcome")
+                        && doc.content.contains(text)
+                })
+                .unwrap_or_else(|| panic!("missing turn {text}"))
+        };
+        let before = turn("Before compaction request");
+        let after = turn("After compaction request");
+        let session_group = before.group_id.clone().unwrap();
+        assert!(
+            !session_group.contains(":epoch-"),
+            "epoch 0 keeps the session key"
+        );
+        assert_eq!(
+            after.group_id.as_deref(),
+            Some(format!("{session_group}:epoch-1").as_str())
+        );
+        assert_eq!(
+            after.filters.get("session_epoch").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            before.filters.get("session_id"),
+            after.filters.get("session_id")
+        );
+        let context = documents
+            .iter()
+            .find(|doc| {
+                doc.filters.get("document_type").map(String::as_str) == Some("session-context")
+            })
+            .unwrap();
+        assert_eq!(
+            context.group_id, after.group_id,
+            "context follows the latest epoch"
+        );
+        let Some(crate::pipeline::MemoryIndexSnapshot::Segmented(index)) =
+            store.memory_index_snapshot()
+        else {
+            panic!("the provider store publishes a segmented snapshot");
+        };
+        let segment_ids = index
+            .segments
+            .iter()
+            .map(|segment| segment.segment_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(segment_ids.contains(session_group.as_str()));
+        assert!(segment_ids.contains(after.group_id.as_deref().unwrap()));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_replay_persists_every_codex_turn_and_checkpoints_each_batch() {
         let root = temp_dir("batch-replay");
         let transcript = root.join("transcript.jsonl");
         let rows = [
@@ -1096,16 +1138,14 @@ mod tests {
             contents.len() as u64
         );
         let store = open_store(&root).unwrap();
-        let observations = store
+        let turns = store
             .source_documents()
             .into_iter()
-            .filter(|doc| {
-                doc.filters.get("document_type").map(String::as_str) == Some("session-observation")
-            })
+            .filter(|doc| doc.filters.get("document_type").map(String::as_str) == Some("outcome"))
             .collect::<Vec<_>>();
-        assert_eq!(observations.len(), rows.len());
+        assert_eq!(turns.len(), rows.len());
         for (_, _, content) in rows {
-            assert!(observations.iter().any(|doc| doc.content.contains(content)));
+            assert!(turns.iter().any(|doc| doc.content.contains(content)));
         }
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -1127,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_turn_id_preserves_backfill_attribution() {
+    fn mixed_provider_turn_ids_do_not_mislabel_capture() {
         let root = temp_dir("turn-backfill");
         let transcript = root.join("transcript.jsonl");
         fs::write(&transcript, concat!(
@@ -1139,24 +1179,12 @@ mod tests {
         handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
         let store = open_store(&root).unwrap();
         let documents = store.source_documents();
-        for (text, expected) in [("Earlier request", "earlier"), ("Latest request", "latest")] {
-            let doc = documents
-                .iter()
-                .find(|doc| {
-                    doc.filters.get("document_type").map(String::as_str)
-                        == Some("session-observation")
-                        && doc.content.contains(text)
-                })
-                .unwrap();
-            assert_eq!(
-                doc.filters.get("turn_id").map(String::as_str),
-                Some(expected)
-            );
-        }
         let capture = documents
             .iter()
             .find(|doc| doc.filters.get("document_type").map(String::as_str) == Some("outcome"))
             .unwrap();
+        assert!(capture.content.contains("Earlier request"));
+        assert!(capture.content.contains("Latest request"));
         assert!(
             !capture.filters.contains_key("turn_id"),
             "a capture spanning turns must not be mislabeled as the latest turn"
@@ -1166,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_turn_id_replay_keeps_message_ids_across_capture_boundaries() {
+    fn missing_cursor_replay_upserts_the_same_turn_documents() {
         let root = temp_dir("turn-replay");
         let transcript = root.join("transcript.jsonl");
         fs::write(
@@ -1188,8 +1216,7 @@ mod tests {
                 .source_documents()
                 .into_iter()
                 .filter(|doc| {
-                    doc.filters.get("document_type").map(String::as_str)
-                        == Some("session-observation")
+                    doc.filters.get("document_type").map(String::as_str) == Some("outcome")
                 })
                 .map(|doc| doc.doc_id.clone())
                 .collect::<HashSet<_>>()
@@ -1200,15 +1227,13 @@ mod tests {
         let after = store
             .source_documents()
             .into_iter()
-            .filter(|doc| {
-                doc.filters.get("document_type").map(String::as_str) == Some("session-observation")
-            })
+            .filter(|doc| doc.filters.get("document_type").map(String::as_str) == Some("outcome"))
             .map(|doc| doc.doc_id.clone())
             .collect::<HashSet<_>>();
         assert_eq!(before.len(), 2);
         assert_eq!(
             before, after,
-            "replaying with a missing cursor must upsert the same observations"
+            "replaying with a missing cursor must upsert the same turns"
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
@@ -1327,7 +1352,7 @@ mod tests {
         stored.refresh_index().unwrap();
         assert_eq!(
             stored.records().len(),
-            4,
+            2,
             "Stop must still capture the turn"
         );
         drop(stored);
@@ -1402,8 +1427,8 @@ mod tests {
         stored.refresh_index().unwrap();
         assert_eq!(
             stored.records().len(),
-            4,
-            "capture should store two observations, one outcome, and one session context"
+            2,
+            "capture should store one outcome and one session context"
         );
         let records_after_first_capture = stored.records().len();
         drop(stored);
@@ -1597,13 +1622,12 @@ mod tests {
                 "checkpoint".to_string(),
                 "outcome".to_string(),
                 "session-context".to_string(),
-                "session-observation".to_string(),
             ])
         );
         assert_eq!(
             store.records().len(),
-            5,
-            "two observations, two turn documents, one session context; SessionEnd writes nothing"
+            3,
+            "two turn documents and one session context; SessionEnd writes nothing"
         );
 
         drop(store);
@@ -1646,7 +1670,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(of_type("session-observation").len(), 2);
+        assert!(of_type("session-observation").is_empty());
         let outcomes = of_type("outcome");
         assert_eq!(outcomes.len(), 2, "one outcome per stop");
         let second = outcomes
@@ -1660,12 +1684,8 @@ mod tests {
         let contexts = of_type("session-context");
         assert_eq!(contexts.len(), 1, "one session-wide context");
         assert!(!contexts[0].content.contains("cobalt"));
-        // The context links the observations of the latest capture.
-        let latest = of_type("session-observation")
-            .into_iter()
-            .find(|record| record.content.contains("amber"))
-            .expect("second stop observation");
-        assert!(contexts[0].links.contains(&latest.doc_id));
+        // The context links the searchable turn from the latest capture.
+        assert!(contexts[0].links.contains(&second.doc_id));
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1697,20 +1717,18 @@ mod tests {
         handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
 
         let store = open_store(&root).unwrap();
-        let observations = store
+        let outcomes = store
             .records()
             .into_iter()
             .filter(|record| {
-                record.filters.get("document_type").map(String::as_str)
-                    == Some("session-observation")
+                record.filters.get("document_type").map(String::as_str) == Some("outcome")
             })
             .collect::<Vec<_>>();
-        // Captures are upserts only: the rewritten first line replaces the
-        // observation at the same position, and later ones remain as history.
-        assert!(observations
+        // The rewritten transcript replaces the turn at the same position.
+        assert!(outcomes
             .iter()
             .any(|record| record.content.contains("Short")));
-        assert!(!observations
+        assert!(!outcomes
             .iter()
             .any(|record| record.content.contains("long request")));
         drop(store);

@@ -311,8 +311,6 @@ fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> 
     let project_id = crate::ids::stable_doc_id_from_source(&root.to_string_lossy())
         .trim_start_matches("doc:")
         .to_string();
-    let mut observations = Vec::new();
-    let mut links = Vec::new();
     let mut summary = Vec::new();
     for (index, line) in content.lines().enumerate() {
         if line.is_empty() {
@@ -324,44 +322,10 @@ fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> 
             .and_then(|value| value.get("type"))
             .and_then(Value::as_str)
             .unwrap_or("raw-record");
-        let timestamp = value
-            .as_ref()
-            .and_then(|value| value.get("timestamp"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let record = format!("AGY transcript record {index} [{event_type}]\n{line}");
-        let source = format!("agy://{session_id}/observation/{index}");
-        let filters = std::collections::BTreeMap::from([
-            ("provider".to_string(), "agy".to_string()),
-            ("project_id".to_string(), project_id.clone()),
-            ("session_id".to_string(), session_id.to_string()),
-            (
-                "document_type".to_string(),
-                "session-observation".to_string(),
-            ),
-            ("observation_index".to_string(), index.to_string()),
-            ("speaker".to_string(), event_type.to_string()),
-        ]);
-        let document = crate::source::SourceDocument {
-            doc_id: crate::ids::stable_doc_id_from_source(&source),
-            source,
-            content: record.clone(),
-            concept: "session-observation".to_string(),
-            group_id: Some(format!("agy-session:{project_id}:{session_id}")),
-            headings: vec!["session-observation".to_string()],
-            links: vec![],
-            timestamp,
-            doc_length: record.len(),
-            author_agent: Some("agy".to_string()),
-            filters,
-            key_phrases: Vec::new(),
-            key_phrase_extraction_hash: String::new(),
-        };
-        links.push(document.doc_id.clone());
         summary.push(record);
-        observations.push(document);
     }
-    if observations.is_empty() {
+    if summary.is_empty() {
         return Ok(());
     }
     let body = summary.join("\n\n");
@@ -380,7 +344,7 @@ fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> 
         concept: "session-context".to_string(),
         group_id: Some(format!("agy-session:{project_id}:{session_id}")),
         headings: vec!["session-context".to_string()],
-        links,
+        links: vec![],
         timestamp: Some(current_timestamp()),
         doc_length: body.len(),
         author_agent: Some("agy".to_string()),
@@ -388,8 +352,7 @@ fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> 
         key_phrases: Vec::new(),
         key_phrase_extraction_hash: String::new(),
     };
-    observations.push(context);
-    crate::integrations::mcp_tools::upsert_hook_documents(root, "agy", session_id, observations)
+    crate::integrations::mcp_tools::upsert_hook_documents(root, "agy", session_id, vec![context])
 }
 
 fn current_timestamp() -> String {

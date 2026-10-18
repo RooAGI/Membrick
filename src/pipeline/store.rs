@@ -37,6 +37,7 @@ pub(crate) const SEMANTIC_RECORDS_FILE: &str = "records.json";
 pub(crate) const SEMANTIC_CORE_FILE: &str = "core.bin";
 pub(crate) const SEGMENT_MANIFEST_FILE: &str = "segments.json";
 pub(crate) const CHUNK_LIFECYCLE_FILE: &str = "chunk_lifecycle.json";
+pub(crate) const SEMANTIC_RELATIONS_FILE: &str = "relations.bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkLifecycleMeta {
@@ -257,6 +258,20 @@ pub struct IndexStore {
 pub(crate) struct PreparedCheckpoint {
     semantic: super::PreparedSemanticState,
     manifest: Option<String>,
+    /// Relation cache for the same generation, when one could be prepared.
+    relations: Option<Vec<u8>>,
+    /// Segment catalog cache for the same generation (segmented layouts).
+    catalog: Option<Vec<u8>>,
+}
+
+/// Write a segmented snapshot's catalog cache for the store under
+/// `store_root`. A missing cache only costs the next start a rebuild, so
+/// failures are reported, not returned.
+fn write_catalog_cache_best_effort(store_root: &Path, bytes: &[u8]) {
+    let path = crate::segments::segment_catalog_cache_path(store_root);
+    if let Err(error) = crate::segments::write_segment_catalog_cache(&path, bytes) {
+        eprintln!("warning: could not write segment catalog cache: {error:#}");
+    }
 }
 
 /// Group members visible to the conversational rerank: documents in `group_id`
@@ -427,6 +442,17 @@ impl IndexStore {
                     .join(SEGMENT_MANIFEST_FILE);
                 super::write_text_file_atomic(&path, manifest)?;
             }
+            // Written after the records it was fingerprinted against, so a
+            // crash in between leaves a cache that no longer matches.
+            if let Some(relations) = &prepared.relations {
+                if let Err(error) = super::persist_semantic_relations(&self.store_paths, relations)
+                {
+                    eprintln!("warning: could not write semantic relation cache: {error:#}");
+                }
+            }
+            if let (Some(catalog), Some(root)) = (&prepared.catalog, &self.store_paths.root) {
+                write_catalog_cache_best_effort(root, catalog);
+            }
         } else {
             anyhow::ensure!(
                 self.store_paths.semantic_dir.is_none(),
@@ -441,15 +467,35 @@ impl IndexStore {
             .snapshot
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("checkpoint has no snapshot"))?;
-        let (single, manifest) = match snapshot {
-            MemoryIndexSnapshot::Single(index) => (Some(index), None),
+        let (single, manifest, catalog) = match snapshot {
+            MemoryIndexSnapshot::Single(index) => (Some(index), None, None),
             MemoryIndexSnapshot::Segmented(index) => {
-                (None, Some(serde_json::to_string_pretty(&index.manifest())?))
+                let catalog = index.encode_catalog_cache().unwrap_or_else(|error| {
+                    eprintln!("warning: could not prepare segment catalog cache: {error:#}");
+                    Vec::new()
+                });
+                (
+                    None,
+                    Some(serde_json::to_string_pretty(&index.manifest())?),
+                    (!catalog.is_empty()).then_some(catalog),
+                )
             }
         };
+        let relations = super::prepare_semantic_relations(
+            &self.semantic_relations,
+            &self.source_docs,
+            &self.records,
+            self.options.supersession,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("warning: could not prepare semantic relation cache: {error:#}");
+            None
+        });
         Ok(PreparedCheckpoint {
             semantic: super::prepare_semantic_state(single, &self.records, &self.chunk_lifecycle)?,
             manifest,
+            relations,
+            catalog,
         })
     }
 
@@ -651,18 +697,46 @@ impl IndexStore {
             records,
             chunk_lifecycle,
             options,
+            semantic_relations: workspace_relations,
+            dirty: workspace_dirty,
             ..
         } = workspace;
         let mut source_docs = Arc::unwrap_or_clone(source_docs);
         let mut records = Arc::unwrap_or_clone(records);
         let mut chunk_lifecycle = Arc::unwrap_or_clone(chunk_lifecycle);
+        // Each side already holds relations for its own documents. Start from
+        // the larger side and add the other side's documents incrementally,
+        // instead of rebuilding relations for the whole union.
+        let mut reusable_relations = None;
         if let Some(provider_memory) = provider_memory {
             let IndexStore {
                 source_docs: provider_docs,
                 records: provider_records,
                 chunk_lifecycle: provider_lifecycle,
+                options: provider_options,
+                semantic_relations: provider_relations,
+                dirty: provider_dirty,
                 ..
             } = provider_memory;
+            let provider_is_base = provider_docs.len() >= source_docs.len();
+            let (base_relations, base_dirty, base_options, added_ids) = if provider_is_base {
+                (
+                    provider_relations,
+                    provider_dirty,
+                    provider_options.supersession,
+                    source_docs.keys().cloned().collect::<Vec<_>>(),
+                )
+            } else {
+                (
+                    workspace_relations,
+                    workspace_dirty,
+                    options.supersession,
+                    provider_docs.keys().cloned().collect::<Vec<_>>(),
+                )
+            };
+            if !base_dirty && base_options == options.supersession {
+                reusable_relations = Some((base_relations, added_ids));
+            }
             merge_composed_map(
                 &mut source_docs,
                 Arc::unwrap_or_clone(provider_docs),
@@ -695,10 +769,25 @@ impl IndexStore {
         }
         let temporal_facts =
             TemporalFactStore::from_records(records.values().map(AsRef::as_ref), &chunk_lifecycle);
-        let semantic_relations = SemanticRelationStore::try_from_documents(
-            source_docs.values().map(AsRef::as_ref),
-            options.supersession,
-        )?;
+        let semantic_relations = match reusable_relations {
+            Some((mut relations, added_ids)) => {
+                let added = added_ids
+                    .iter()
+                    .filter_map(|doc_id| source_docs.get(doc_id).map(AsRef::as_ref))
+                    .collect::<Vec<_>>();
+                relations.update_documents_borrowed(
+                    &source_docs,
+                    &added,
+                    &[],
+                    options.supersession,
+                )?;
+                relations
+            }
+            None => SemanticRelationStore::try_from_documents(
+                source_docs.values().map(AsRef::as_ref),
+                options.supersession,
+            )?,
+        };
 
         Ok(Self {
             options: PipelineOptions {
@@ -807,10 +896,26 @@ impl IndexStore {
         let mut chunk_latest_by_lineage = HashMap::new();
         let temporal_facts =
             TemporalFactStore::from_records(records.values().map(AsRef::as_ref), &chunk_lifecycle);
-        let semantic_relations = SemanticRelationStore::try_from_documents(
-            source_docs.values().map(AsRef::as_ref),
-            options.supersession,
-        )?;
+        let semantic_relations =
+            match super::load_semantic_relations(&store_paths, &records, options.supersession) {
+                Some(cached) => cached,
+                None => {
+                    let built = SemanticRelationStore::try_from_documents(
+                        source_docs.values().map(AsRef::as_ref),
+                        options.supersession,
+                    )?;
+                    if !records.is_empty() {
+                        super::persist_semantic_relations_best_effort(
+                            &store_paths,
+                            &built,
+                            &source_docs,
+                            &records,
+                            options.supersession,
+                        );
+                    }
+                    built
+                }
+            };
         for record in records.values().map(AsRef::as_ref) {
             let state = build_semantic_doc_state(record, options.claim_extraction);
             semantic_aggregate.insert_doc_state(&state);
@@ -878,13 +983,29 @@ impl IndexStore {
         }
         match self.snapshot.as_deref().expect("snapshot should exist") {
             MemoryIndexSnapshot::Single(index) => {
-                persist_semantic_state(paths, Some(index), &self.records, &self.chunk_lifecycle)
+                persist_semantic_state(paths, Some(index), &self.records, &self.chunk_lifecycle)?
             }
             MemoryIndexSnapshot::Segmented(segmented) => {
                 persist_semantic_state(paths, None, &self.records, &self.chunk_lifecycle)?;
-                persist_segment_manifest(paths, &segmented.manifest())
+                persist_segment_manifest(paths, &segmented.manifest())?;
+                if let Some(root) = &paths.root {
+                    match segmented.encode_catalog_cache() {
+                        Ok(bytes) => write_catalog_cache_best_effort(root, &bytes),
+                        Err(error) => {
+                            eprintln!("warning: could not prepare segment catalog cache: {error:#}")
+                        }
+                    }
+                }
             }
         }
+        super::persist_semantic_relations_best_effort(
+            paths,
+            &self.semantic_relations,
+            &self.source_docs,
+            &self.records,
+            self.options.supersession,
+        );
+        Ok(())
     }
 
     /// Serialize the current index state to a pair of opaque byte buffers suitable
@@ -1107,6 +1228,28 @@ impl IndexStore {
             self.dirty = true;
         }
         removed.map(Arc::unwrap_or_clone)
+    }
+
+    /// Remove many documents with one aggregate pass. Returns how many existed.
+    pub fn remove_many<'a>(&mut self, doc_ids: impl IntoIterator<Item = &'a str>) -> usize {
+        let source_docs = Arc::make_mut(&mut self.source_docs);
+        let records = Arc::make_mut(&mut self.records);
+        let mut removed = Vec::new();
+        for doc_id in doc_ids {
+            if source_docs.remove(doc_id).is_some() {
+                records.remove(doc_id);
+                self.semantic_docs.remove(doc_id);
+                self.dirty_docs.remove(doc_id);
+                self.tombstones.insert(doc_id.to_string());
+                removed.push(doc_id);
+            }
+        }
+        if !removed.is_empty() {
+            self.semantic_aggregate.remove_docs(removed.iter().copied());
+            self.store_revision = self.store_revision.saturating_add(1);
+            self.dirty = true;
+        }
+        removed.len()
     }
 
     pub fn len(&self) -> usize {
@@ -1882,6 +2025,257 @@ mod tests {
         assert!(retired_source.upgrade().is_none());
         assert!(retired_record.upgrade().is_none());
         assert!(retired.upgrade().is_none(), "retired view remains retained");
+    }
+
+    fn relation_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "membrick-relations-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn correction_docs() -> Vec<SourceDocument> {
+        [
+            (
+                "old",
+                "We use Postgres for analytics.",
+                "2023-11-14T00:00:00Z",
+            ),
+            (
+                "new",
+                "We use MongoDB for analytics instead of Postgres.",
+                "2023-11-15T00:00:00Z",
+            ),
+        ]
+        .into_iter()
+        .map(|(doc_id, content, timestamp)| {
+            let mut doc = test_doc(doc_id, Some("session"), &[]);
+            doc.content = content.into();
+            doc.doc_length = content.len();
+            doc.timestamp = Some(timestamp.into());
+            doc
+        })
+        .collect()
+    }
+
+    /// Relations a restart computes: a full rebuild from reconstructed records.
+    fn assert_restart_equivalent(relations: &SemanticRelationStore, store: &IndexStore) {
+        let reconstructed = store
+            .records
+            .values()
+            .map(|record| source_document_from_record(record))
+            .collect::<Vec<_>>();
+        let expected = SemanticRelationStore::try_from_documents(
+            reconstructed.iter(),
+            store.options.supersession,
+        )
+        .unwrap();
+        assert_eq!(relations.claims(), expected.claims());
+        assert_eq!(relations.relations(), expected.relations());
+        for doc_id in store.records.keys() {
+            assert_eq!(
+                relations.document_state(doc_id),
+                expected.document_state(doc_id),
+                "{doc_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn reopened_store_loads_relations_saved_at_checkpoint() {
+        let root = relation_test_root("reopen");
+        let mut store = IndexStore::at_path(&root, PipelineOptions::default()).unwrap();
+        for doc in correction_docs() {
+            store.upsert(doc);
+        }
+        store.refresh().unwrap();
+        assert!(!store.semantic_relations().is_empty());
+        drop(store);
+        assert!(root.join("semantic").join(SEMANTIC_RELATIONS_FILE).exists());
+
+        let reopened = IndexStore::at_path(&root, PipelineOptions::default()).unwrap();
+        let cached = super::super::load_semantic_relations(
+            &reopened.store_paths,
+            &reopened.records,
+            reopened.options.supersession,
+        )
+        .expect("the checkpoint cache matches the reopened records");
+        assert_restart_equivalent(&cached, &reopened);
+        assert_restart_equivalent(&reopened.semantic_relations, &reopened);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn segmented_store_saves_its_catalog_cache_after_each_write() {
+        let root = relation_test_root("catalog");
+        let options = PipelineOptions {
+            memory_index_layout: MemoryIndexLayout::Segmented {
+                query_top_n: 4,
+                routing_strategy: crate::segments::SegmentRoutingStrategy::SparseOverlap,
+            },
+            ..PipelineOptions::default()
+        };
+        let cache = crate::segments::segment_catalog_cache_path(&root);
+        let mut store = IndexStore::at_path(&root, options.clone()).unwrap();
+        for doc in correction_docs() {
+            store.upsert(doc);
+        }
+        store.refresh().unwrap();
+        let first = std::fs::read(&cache).expect("refresh writes the catalog cache");
+
+        let mut added = test_doc("later", Some("other-session"), &[]);
+        added.content = "We deploy with Nomad.".into();
+        added.doc_length = added.content.len();
+        store.upsert(added);
+        store.refresh().unwrap();
+        let second = std::fs::read(&cache).unwrap();
+        assert_ne!(first, second, "a write refreshes the saved catalog");
+        drop(store);
+
+        let reopened = IndexStore::at_path(&root, options).unwrap();
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            second,
+            "an unchanged reopen reuses the saved catalog"
+        );
+        assert!(!reopened
+            .query_prepared_cached(
+                &crate::query_plan::PreparedQuery::new("Nomad"),
+                5,
+                &BTreeMap::new()
+            )
+            .unwrap()
+            .is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_relations_match_a_restart_when_concept_is_not_persisted() {
+        let root = relation_test_root("concept");
+        let mut store = IndexStore::at_path(&root, PipelineOptions::default()).unwrap();
+        for mut doc in correction_docs() {
+            // Records do not keep `concept`; a restart derives a different one.
+            doc.concept = format!("live-only-{}", doc.doc_id);
+            store.upsert(doc);
+        }
+        store.refresh().unwrap();
+        let cached = super::super::load_semantic_relations(
+            &store.store_paths,
+            &store.records,
+            store.options.supersession,
+        )
+        .expect("checkpoint wrote a cache");
+        assert_restart_equivalent(&cached, &store);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_records_invalidate_the_relation_cache() {
+        let root = relation_test_root("invalidate");
+        let mut store = IndexStore::at_path(&root, PipelineOptions::default()).unwrap();
+        for doc in correction_docs() {
+            store.upsert(doc);
+        }
+        store.refresh().unwrap();
+        let cache = root.join("semantic").join(SEMANTIC_RELATIONS_FILE);
+        let saved = std::fs::read(&cache).unwrap();
+
+        let mut changed = correction_docs().remove(1);
+        changed.content = "We use SQLite for analytics instead of Postgres.".into();
+        changed.doc_length = changed.content.len();
+        store.upsert(changed);
+        store.refresh().unwrap();
+        // Restore the cache written for the previous records.
+        std::fs::write(&cache, saved).unwrap();
+        assert!(super::super::load_semantic_relations(
+            &store.store_paths,
+            &store.records,
+            store.options.supersession,
+        )
+        .is_none());
+        let disabled = crate::semantic_relations::SupersessionOptions {
+            enabled: false,
+            ..store.options.supersession
+        };
+        assert!(super::super::load_semantic_relations(
+            &store.store_paths,
+            &store.records,
+            disabled
+        )
+        .is_none());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn composed_relations_match_a_full_rebuild_of_the_union() {
+        let options = PipelineOptions {
+            memory_index_layout: MemoryIndexLayout::Segmented {
+                query_top_n: 4,
+                routing_strategy: crate::segments::SegmentRoutingStrategy::SparseOverlap,
+            },
+            ..PipelineOptions::default()
+        };
+        let doc = |doc_id: &str, content: &str, timestamp: &str| {
+            let mut doc = test_doc(doc_id, Some("session"), &[]);
+            doc.content = content.into();
+            doc.doc_length = content.len();
+            doc.timestamp = Some(timestamp.into());
+            doc
+        };
+        let mut workspace = IndexStore::in_memory(options.clone());
+        workspace.upsert(doc(
+            "old",
+            "We use Postgres for analytics.",
+            "2023-11-14T00:00:00Z",
+        ));
+        workspace.refresh().unwrap();
+        let mut provider = IndexStore::in_memory(options);
+        provider.upsert(doc(
+            "new",
+            "We use MongoDB for analytics instead of Postgres.",
+            "2023-11-15T00:00:00Z",
+        ));
+        provider.upsert(doc(
+            "other",
+            "We use Redis for caching.",
+            "2023-11-15T00:00:00Z",
+        ));
+        provider.refresh().unwrap();
+        let union = [&workspace, &provider]
+            .iter()
+            .flat_map(|store| store.source_docs.values().cloned())
+            .collect::<Vec<_>>();
+        let expected = SemanticRelationStore::try_from_documents(
+            union.iter().map(AsRef::as_ref),
+            workspace.options.supersession,
+        )
+        .unwrap();
+        assert!(
+            !expected.relations().is_empty(),
+            "the fixture must produce a cross-store relation"
+        );
+
+        let view = IndexStore::compose_segmented_read_view(
+            workspace.published_read_view(),
+            Some(provider.published_read_view()),
+        )
+        .unwrap();
+        assert_eq!(view.semantic_relations(), expected.relations());
+        assert_eq!(view.semantic_claims(), expected.claims());
+        for doc_id in ["old", "new", "other"] {
+            assert_eq!(
+                view.semantic_document_state(doc_id),
+                expected.document_state(doc_id),
+                "{doc_id}"
+            );
+        }
     }
 
     #[test]

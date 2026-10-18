@@ -102,6 +102,9 @@ struct Args {
     /// Serve the resident workspace API over local IPC instead of TCP.
     #[arg(long, hide = true)]
     resident_server: bool,
+    /// Stop this automatically started resident when provider leases end.
+    #[arg(long, hide = true)]
+    managed_resident: bool,
     /// Additional exact project roots this server may open. Repeat for multiple projects.
     #[arg(long = "workspace-root", value_name = "PATH")]
     workspace_roots: Vec<PathBuf>,
@@ -666,6 +669,9 @@ fn open_workspace_owner_at(
 
 #[tokio::main]
 pub(crate) async fn main() -> anyhow::Result<()> {
+    // Declare this first so Rust drops it after server state, writer workers,
+    // and workspace ownership locks during the function's teardown.
+    let mut _resident_shutdown_gate = None;
     let mut matches = Args::command().get_matches();
     let bind_was_set = matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
     let mut args = Args::from_arg_matches_mut(&mut matches)?;
@@ -940,10 +946,25 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     }
     let app = app_router(state.clone());
     if args.resident_server {
-        crate::local_ipc::serve(
+        let root = state.project_root.clone();
+        let shutdown = async move {
+            if args.managed_resident {
+                tokio::select! {
+                    _ = shutdown_signal() => None,
+                    gate = crate::local_ipc::wait_for_no_provider_sessions(
+                        &root,
+                        Duration::from_secs(3),
+                    ) => Some(gate),
+                }
+            } else {
+                shutdown_signal().await;
+                None
+            }
+        };
+        _resident_shutdown_gate = crate::local_ipc::serve(
             app,
             &state.project_root,
-            shutdown_signal(),
+            shutdown,
             resident_http_bind.as_deref(),
             resident_http_auto_port,
             Some(&settings_file),
@@ -1000,7 +1021,7 @@ async fn shutdown_signal() {
 
 fn app_router(state: AppState) -> Router {
     let router = Router::new()
-        .route("/health", get(health))
+        .route("/health", get(health).post(health))
         .route("/dashboard", get(dashboard))
         .route("/dashboard/app.js", get(dashboard_app))
         .route("/dashboard/event-detail.js", get(dashboard_event_detail))
@@ -4589,7 +4610,7 @@ mod tests {
             crate::local_ipc::serve(
                 app_router(provider_memory_test_state(&server_root)),
                 &server_root,
-                std::future::pending(),
+                std::future::pending::<Option<std::fs::File>>(),
                 None,
                 false,
                 None,

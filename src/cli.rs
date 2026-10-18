@@ -474,6 +474,9 @@ pub struct Args {
     /// Internal mode used by the provider clients to start the local resident memory owner.
     #[arg(long, hide = true)]
     pub resident_server: bool,
+    /// Internal lifecycle mode for provider-managed resident processes.
+    #[arg(long, hide = true)]
+    pub managed_resident: bool,
     #[arg(long, hide = true)]
     pub inspect_index: Option<String>,
     #[arg(long, hide = true)]

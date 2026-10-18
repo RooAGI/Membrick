@@ -69,7 +69,7 @@ observation documents remain stored.
 ## Document update contract
 
 1. Keep document IDs, ownership, source identity, and original capture text.
-   Do not rewrite repository files or replace raw observations with summaries.
+   Do not rewrite repository files or replace searchable turn evidence with summaries.
 2. Add terminology and valid links to existing source documents. Preserve
    human-authored headings and extractor-owned metadata. Generated topic
    headings belong on generated session-context documents.
