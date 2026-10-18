@@ -2,6 +2,7 @@ use crate::source::SourceDocument;
 use crate::temporal::parse_temporal_date;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -265,6 +266,16 @@ impl SemanticRelationStore {
         removed: &[String],
         options: SupersessionOptions,
     ) -> anyhow::Result<()> {
+        self.update_documents_borrowed(all_docs, changed, removed, options)
+    }
+
+    pub(crate) fn update_documents_borrowed<D: Borrow<SourceDocument>>(
+        &mut self,
+        all_docs: &HashMap<String, D>,
+        changed: &[&SourceDocument],
+        removed: &[String],
+        options: SupersessionOptions,
+    ) -> anyhow::Result<()> {
         if !options.enabled {
             *self = Self::default();
             return Ok(());
@@ -272,14 +283,14 @@ impl SemanticRelationStore {
         options.validate()?;
         let docs_by_id = all_docs
             .iter()
-            .map(|(id, doc)| (id.as_str(), doc))
+            .map(|(id, doc)| (id.as_str(), doc.borrow()))
             .collect::<HashMap<_, _>>();
 
         // Defensive: a store that was never built falls back to the oracle.
         // (`initialized`, not claim emptiness: a store built from a
         // claim-free corpus must stay on the incremental path.)
         if !self.initialized && (!changed.is_empty() || !removed.is_empty()) {
-            *self = Self::try_from_documents(all_docs.values(), options)?;
+            *self = Self::try_from_documents(all_docs.values().map(Borrow::borrow), options)?;
             return Ok(());
         }
 

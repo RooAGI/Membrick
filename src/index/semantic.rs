@@ -306,6 +306,12 @@ impl SemanticAggregate {
         }
         self.claim_to_docs
             .retain(|_, postings| !postings.is_empty());
+        self.pending_entity_posting_keys
+            .retain(|key| self.entity_to_docs.contains_key(key));
+        self.pending_term_posting_keys
+            .retain(|key| self.term_to_docs.contains_key(key));
+        self.pending_claim_posting_keys
+            .retain(|key| self.claim_to_docs.contains_key(key));
         for docs in self.topic_to_docs.values_mut() {
             docs.retain(|id| id != doc_id);
         }
@@ -385,5 +391,46 @@ mod aggregate_tests {
         let postings = index.entity_to_docs.get("entity").unwrap();
         assert_eq!(postings[0].doc_id, "higher");
         assert_eq!(postings[1].doc_id, "lower");
+    }
+    #[test]
+    fn removed_documents_release_pending_posting_keys() {
+        let mut aggregate = SemanticAggregate::default();
+        for i in 0..100 {
+            let mut state = SemanticDocState {
+                doc_id: "changing-document".into(),
+                ..SemanticDocState::default()
+            };
+            state.term_to_docs.insert(
+                format!("obsolete-term-{i}"),
+                vec![TermPosting {
+                    doc_id: state.doc_id.clone(),
+                    score: 1.0,
+                }],
+            );
+            state.entity_to_docs.insert(
+                format!("obsolete-entity-{i}"),
+                vec![EntityPosting {
+                    doc_id: state.doc_id.clone(),
+                    score: 1.0,
+                }],
+            );
+            state.claim_to_docs.insert(
+                format!("obsolete-claim-{i}"),
+                vec![TermPosting {
+                    doc_id: state.doc_id.clone(),
+                    score: 1.0,
+                }],
+            );
+            aggregate.insert_doc_state(&state);
+            aggregate.remove_doc(&state.doc_id);
+        }
+        assert!(aggregate.term_to_docs.is_empty());
+        assert!(
+            aggregate.pending_term_posting_keys.is_empty(),
+            "retained {} obsolete term keys",
+            aggregate.pending_term_posting_keys.len()
+        );
+        assert!(aggregate.pending_entity_posting_keys.is_empty());
+        assert!(aggregate.pending_claim_posting_keys.is_empty());
     }
 }

@@ -59,6 +59,7 @@ impl MemoryService {
             request_fingerprints: HashMap::new(),
             request_receipts: HashMap::new(),
             receipts_path: None,
+            pending_receipt_persistence: HashSet::new(),
             pending_adds: HashMap::new(),
             publication: None,
             conversation_states: Arc::clone(&self.conversation_states),
@@ -262,6 +263,7 @@ impl MemoryService {
         for key in keys {
             self.pending_adds.remove(&key);
         }
+        self.trim_receipt_cache();
         Ok(Some(*result.view))
     }
 
@@ -456,6 +458,7 @@ impl MemoryService {
             }
         }
         self.pending_adds.clear();
+        self.trim_receipt_cache();
         if checkpoint {
             self.store
                 .complete_checkpoint(self.store.snapshot_revision());

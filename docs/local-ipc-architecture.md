@@ -108,6 +108,33 @@ same retention period. Cleanup runs at resident startup and every 15 minutes.
 The startup recovery handles claims only after the previous resident has lost
 the project owner lock, so an active request is never mistaken for an orphan.
 
+## Resident memory ownership
+
+`MemoryService` remains the only entry point for reads and writes. The writer
+and published search views share immutable source documents and processed
+records through `Arc`. Replacing one document copies that document when an
+older reader still uses it; an unrelated write does not copy every document's
+content. Retired views release their entries when their last reader finishes.
+
+Published combined views reuse the segment indexes and omit the writer's
+semantic posting aggregate. Cross-document semantic relations and temporal
+facts remain available to retrieval. Checkpoints serialize borrowed records,
+and startup parses persisted JSON through a buffered reader, avoiding an extra
+copy of the complete file. The persisted record format is unchanged.
+
+Removing or replacing documents also removes obsolete pending posting keys.
+Persistent services cache at most 512 adjudication receipts after successful
+persistence. The existing receipt snapshot and journal retain the full history;
+older retries stream that history to recover the exact receipt. Failed receipt
+writes remain pinned in memory and are retried before eviction. Services with
+no persistent backing retain their receipts to preserve retry behavior.
+Request fingerprints remain the compact idempotency ledger, so the service can
+reject a reused request ID with different content.
+
+These changes reduce retained and temporary copies without discarding captured
+observations, source documents, or recorded MCP calls. Resident footprint still
+depends on corpus size, derived indexes, concurrent readers, and publication.
+
 ## Relationship to the HTTP server
 
 The standalone HTTP API remains available for applications, custom clients,

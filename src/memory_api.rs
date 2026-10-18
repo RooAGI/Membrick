@@ -36,6 +36,7 @@ pub(crate) mod workspace;
 #[cfg(any(feature = "claude-code", feature = "codex"))]
 pub(crate) mod transcript_capture;
 
+mod receipts;
 mod staged;
 pub use staged::StagedAddResponse;
 
@@ -1090,6 +1091,8 @@ pub struct MemoryService {
     request_receipts: HashMap<(String, String), WriteAdjudicationReceipt>,
     /// Where receipts persist across restarts. None for in-memory services.
     receipts_path: Option<std::path::PathBuf>,
+    /// Receipt writes that must succeed before their cached values can be evicted.
+    pending_receipt_persistence: HashSet<(String, String)>,
     pending_adds: HashMap<(String, String), Vec<String>>,
     publication: Option<staged::PendingPublication>,
     conversation_states:
@@ -1964,42 +1967,22 @@ impl MemoryService {
         Ok(service)
     }
 
-    /// Loads persisted write-adjudication receipts. A missing or corrupt file
-    /// is not fatal: the cache simply starts empty and retries rebuild from
-    /// the persisted documents.
-    fn load_receipts(&mut self) {
-        let Some(path) = self.receipts_path.as_ref() else {
-            return;
-        };
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(entries) =
-                serde_json::from_str::<Vec<((String, String), WriteAdjudicationReceipt)>>(&content)
-            {
-                self.request_receipts.extend(entries);
-            }
-        }
-        let journal = path.with_extension("jsonl");
-        let Ok(content) = std::fs::read_to_string(journal) else {
-            return;
-        };
-        for line in content.lines() {
-            if let Ok(entries) =
-                serde_json::from_str::<Vec<((String, String), WriteAdjudicationReceipt)>>(line)
-            {
-                self.request_receipts.extend(entries);
-            }
-        }
-    }
-
     /// Appends only newly created receipts. Rewriting the full receipt cache
     /// made every write O(total historical requests); the journal keeps the
     /// persistent write cost proportional to this mutation's batch size.
     /// Failure is logged but never fails the write because retries can rebuild
     /// receipts from the persisted source documents.
-    fn persist_receipts(&self, keys: &[(String, String)]) {
-        let Some(path) = self.receipts_path.as_ref() else {
+    fn persist_receipts(&mut self, keys: &[(String, String)]) {
+        let Some(path) = self.receipts_path.clone() else {
             return;
         };
+        let keys = keys
+            .iter()
+            .chain(self.pending_receipt_persistence.iter())
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.pending_receipt_persistence
+            .extend(keys.iter().cloned());
         let entries: Vec<((String, String), WriteAdjudicationReceipt)> = keys
             .iter()
             .filter_map(|key| {
@@ -2025,6 +2008,9 @@ impl MemoryService {
                 })();
                 if let Err(e) = result {
                     eprintln!("failed to append adjudication receipts: {e}");
+                } else {
+                    self.pending_receipt_persistence.clear();
+                    self.trim_receipt_cache();
                 }
             }
             Err(e) => eprintln!("failed to serialize adjudication receipts: {e}"),
@@ -2141,6 +2127,7 @@ impl MemoryService {
             request_fingerprints,
             request_receipts: HashMap::new(),
             receipts_path: None,
+            pending_receipt_persistence: HashSet::new(),
             pending_adds: HashMap::new(),
             publication: None,
             conversation_states: std::sync::Arc::new(std::sync::Mutex::new(
@@ -2560,6 +2547,7 @@ impl MemoryService {
                             .insert(request_key.clone(), receipt.clone());
                         Some(receipt)
                     });
+            self.trim_receipt_cache();
         }
     }
 
@@ -2664,6 +2652,9 @@ impl MemoryService {
     /// located without the in-memory cache. Returns None when no documents
     /// for the request exist.
     fn rebuild_receipt(&self, request_key: &(String, String)) -> Option<WriteAdjudicationReceipt> {
+        if let Some(receipt) = self.persisted_receipt(request_key) {
+            return Some(receipt);
+        }
         let (user_id, request_id) = request_key;
         let doc_ids: Vec<String> = self
             .store
@@ -3759,7 +3750,7 @@ impl MemoryService {
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
-        let composed = crate::IndexStore::compose_segmented(
+        let composed = crate::IndexStore::compose_segmented_read_view(
             workspace.store,
             provider_memory.map(|service| service.store),
         )?;
@@ -3776,6 +3767,7 @@ impl MemoryService {
             request_fingerprints,
             request_receipts: HashMap::new(),
             receipts_path: None,
+            pending_receipt_persistence: HashSet::new(),
             pending_adds: HashMap::new(),
             publication: None,
             conversation_states,
@@ -6673,6 +6665,68 @@ mod tests {
         assert!((evaluation["ndcg_at_5"]["value"].as_f64().unwrap() - 0.6309297536).abs() < 1e-8);
         assert_eq!(evaluation["overall_labels"]["not_helpful"], 1);
         assert_eq!(evaluation["sample_status"], "small");
+    }
+
+    #[test]
+    fn persistent_receipt_cache_is_bounded_and_evicted_retries_are_exact() {
+        let dir = canonical_temp_dir("bounded-receipts");
+        let mut owner = MemoryService::at_path(&dir, PipelineOptions::default()).unwrap();
+        let request = AddRequest {
+            request_id: "original".into(),
+            user_id: "alice".into(),
+            session_id: "session".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                content: "remember violet lantern".into(),
+                timestamp: None,
+                expires_at_ms: None,
+                supersedes_id: None,
+            }],
+        };
+        let response = owner.add(request.clone()).unwrap();
+        let mut expected = response.adjudication.unwrap();
+        expected
+            .retired_doc_ids
+            .push("persisted-receipt-marker".into());
+        let mut entries = Vec::new();
+        for i in 0..532 {
+            let mut receipt = expected.clone();
+            receipt.request_id = format!("other-{i}");
+            entries.push((("alice".to_string(), receipt.request_id.clone()), receipt));
+        }
+        entries.push((
+            ("alice".to_string(), "original".to_string()),
+            expected.clone(),
+        ));
+        std::fs::write(
+            dir.join("receipts.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        // A newer journal receipt must win over the snapshot.
+        expected.retired_doc_ids.push("newer-journal-marker".into());
+        let journal = serde_json::to_vec(&vec![(
+            ("alice".to_string(), "original".to_string()),
+            expected.clone(),
+        )])
+        .unwrap();
+        std::fs::write(dir.join("receipts.jsonl"), journal).unwrap();
+        drop(owner);
+        let mut owner = MemoryService::at_path(&dir, PipelineOptions::default()).unwrap();
+        assert!(
+            owner.request_receipts.len() <= 512,
+            "loaded {} receipts into memory",
+            owner.request_receipts.len()
+        );
+        owner
+            .request_receipts
+            .remove(&("alice".into(), "original".into()));
+        let retry = owner.add(request).unwrap();
+        assert_eq!(
+            serde_json::to_value(retry.adjudication.unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn service() -> MemoryService {

@@ -16,11 +16,12 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) fn execute_prepared_on_snapshot_parts(
     options: &PipelineOptions,
-    source_docs: &HashMap<String, SourceDocument>,
-    records: &HashMap<String, DocRecord>,
+    source_docs: &HashMap<String, Arc<SourceDocument>>,
+    records: &HashMap<String, Arc<DocRecord>>,
     semantic_relations: &SemanticRelationStore,
     snapshot: Option<&MemoryIndexSnapshot>,
     prepared: &PreparedQuery,
@@ -592,8 +593,8 @@ pub(crate) fn source_document_from_record(record: &DocRecord) -> SourceDocument 
 }
 
 type SemanticState = (
-    HashMap<String, SourceDocument>,
-    HashMap<String, DocRecord>,
+    HashMap<String, Arc<SourceDocument>>,
+    HashMap<String, Arc<DocRecord>>,
     HashMap<String, ChunkLifecycleMeta>,
     Option<MemoryIndex>,
 );
@@ -616,7 +617,7 @@ pub(crate) fn load_semantic_state(
     }
 
     let persisted: PersistedSemanticRecords =
-        serde_json::from_str(&fs::read_to_string(&records_path)?)?;
+        serde_json::from_reader(std::io::BufReader::new(fs::File::open(&records_path)?))?;
     if persisted.schema_version != STORE_SCHEMA_VERSION {
         anyhow::bail!(
             "semantic record schema mismatch at {}: found {}, expected {}",
@@ -653,8 +654,11 @@ pub(crate) fn load_semantic_state(
     let mut source_docs = HashMap::new();
     let mut records = HashMap::new();
     for record in restored_records {
-        source_docs.insert(record.doc_id.clone(), source_document_from_record(&record));
-        records.insert(record.doc_id.clone(), record);
+        source_docs.insert(
+            record.doc_id.clone(),
+            Arc::new(source_document_from_record(&record)),
+        );
+        records.insert(record.doc_id.clone(), Arc::new(record));
     }
     let mut chunk_lifecycle = persisted
         .chunk_lifecycle
@@ -662,7 +666,7 @@ pub(crate) fn load_semantic_state(
         .map(|meta| (meta.chunk_id.clone(), meta))
         .collect::<HashMap<_, _>>();
     if chunk_lifecycle.is_empty() {
-        for record in records.values() {
+        for record in records.values().map(AsRef::as_ref) {
             for chunk in &record.section_chunks {
                 let chunk_id = chunk.chunk_id.clone();
                 chunk_lifecycle.insert(
@@ -702,18 +706,39 @@ pub(crate) struct PreparedSemanticState {
 /// Serialize a matching generation without touching the filesystem.
 pub(crate) fn prepare_semantic_state(
     snapshot: Option<&MemoryIndex>,
-    records_map: &HashMap<String, DocRecord>,
+    records_map: &HashMap<String, Arc<DocRecord>>,
     chunk_lifecycle_map: &HashMap<String, ChunkLifecycleMeta>,
 ) -> Result<PreparedSemanticState> {
-    let mut records = records_map.values().cloned().collect::<Vec<_>>();
+    #[derive(serde::Serialize)]
+    struct RecordRef<'a> {
+        #[serde(flatten)]
+        record: &'a DocRecord,
+        // DocRecord skips this field in its public serialization. The existing
+        // persistent format includes it, so restore it without cloning it.
+        content: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct RecordsRef<'a> {
+        schema_version: u32,
+        layout_version: &'a str,
+        records: Vec<RecordRef<'a>>,
+        chunk_lifecycle: Vec<&'a ChunkLifecycleMeta>,
+    }
+    let mut records = records_map.values().map(AsRef::as_ref).collect::<Vec<_>>();
     records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
-    let payload = PersistedSemanticRecords {
+    let payload = RecordsRef {
         schema_version: STORE_SCHEMA_VERSION,
-        layout_version: STORE_LAYOUT_VERSION.to_string(),
-        records: records.into_iter().map(PersistedDocRecord::from).collect(),
-        chunk_lifecycle: chunk_lifecycle_map.values().cloned().collect(),
+        layout_version: STORE_LAYOUT_VERSION,
+        records: records
+            .into_iter()
+            .map(|record| RecordRef {
+                record,
+                content: &record.content,
+            })
+            .collect(),
+        chunk_lifecycle: chunk_lifecycle_map.values().collect(),
     };
-    let mut lifecycle = chunk_lifecycle_map.values().cloned().collect::<Vec<_>>();
+    let mut lifecycle = chunk_lifecycle_map.values().collect::<Vec<_>>();
     lifecycle.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
     Ok(PreparedSemanticState {
         records: serde_json::to_string(&payload)?,
@@ -747,7 +772,7 @@ pub(crate) fn persist_prepared_semantic_state(
 pub(crate) fn persist_semantic_state(
     paths: &StorePaths,
     snapshot: Option<&MemoryIndex>,
-    records: &HashMap<String, DocRecord>,
+    records: &HashMap<String, Arc<DocRecord>>,
     lifecycle: &HashMap<String, ChunkLifecycleMeta>,
 ) -> Result<()> {
     if paths.semantic_dir.is_none() {

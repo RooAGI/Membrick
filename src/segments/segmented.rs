@@ -2,6 +2,7 @@ use crate::index::{
     DocRecord, GlobalBm25Statistics, QueryTimings, SearchResult, TemporalQueryContext,
 };
 use sha2::{Digest, Sha256};
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -318,15 +319,16 @@ impl SegmentedMemoryIndex {
         )
     }
 
-    pub(crate) fn refresh_incremental_with_lexical_root(
+    pub(crate) fn refresh_incremental_with_lexical_root<R: Borrow<DocRecord>>(
         previous: &Self,
-        records: &HashMap<String, DocRecord>,
+        records: &HashMap<String, R>,
         reprocessed_doc_ids: &HashSet<String>,
         generation: u64,
         lexical_root: Option<&Path>,
     ) -> Result<Self, String> {
         let mut grouped: HashMap<&str, Vec<&str>> = HashMap::new();
         for record in records.values() {
+            let record = record.borrow();
             let segment_id = record.group_id.as_deref().unwrap_or("ungrouped");
             grouped
                 .entry(segment_id)
@@ -366,9 +368,14 @@ impl SegmentedMemoryIndex {
                 None => {
                     let mut segment_records = Vec::with_capacity(new_doc_ids.len());
                     for doc_id in &new_doc_ids {
-                        segment_records.push(records.get(*doc_id).cloned().ok_or_else(|| {
-                            format!("grouped document missing from records: {doc_id}")
-                        })?);
+                        segment_records.push(
+                            records
+                                .get(*doc_id)
+                                .map(|r| r.borrow().clone())
+                                .ok_or_else(|| {
+                                    format!("grouped document missing from records: {doc_id}")
+                                })?,
+                        );
                     }
                     segments.push(build_memory_index_segment_with_lexical_root(
                         segment_id.to_string(),
@@ -400,9 +407,9 @@ impl SegmentedMemoryIndex {
     /// Refresh using a complete change set, including removed documents.
     /// Unlike `refresh_incremental`, this path does not regroup the corpus.
     /// Membership of unchanged documents comes from the previous generation.
-    pub(crate) fn refresh_changed(
+    pub(crate) fn refresh_changed<R: Borrow<DocRecord>>(
         previous: &Self,
-        records: &HashMap<String, DocRecord>,
+        records: &HashMap<String, R>,
         changed_doc_ids: &HashSet<String>,
         generation: u64,
     ) -> Result<Self, String> {
@@ -415,9 +422,9 @@ impl SegmentedMemoryIndex {
         )
     }
 
-    pub(crate) fn refresh_changed_with_lexical_root(
+    pub(crate) fn refresh_changed_with_lexical_root<R: Borrow<DocRecord>>(
         previous: &Self,
-        records: &HashMap<String, DocRecord>,
+        records: &HashMap<String, R>,
         changed_doc_ids: &HashSet<String>,
         generation: u64,
         lexical_root: Option<&Path>,
@@ -431,6 +438,7 @@ impl SegmentedMemoryIndex {
                 }
             }
             if let Some(record) = records.get(doc_id) {
+                let record = record.borrow();
                 let segment_id = record.group_id.as_deref().unwrap_or("ungrouped");
                 if segment_id.trim().is_empty() {
                     return Err("segment id must not be empty".to_string());
@@ -453,16 +461,21 @@ impl SegmentedMemoryIndex {
             let mut segment_records = Vec::with_capacity(segment.doc_ids.len());
             for doc_id in &segment.doc_ids {
                 if !changed_doc_ids.contains(doc_id) {
-                    segment_records.push(records.get(doc_id).cloned().ok_or_else(|| {
-                        format!("unchanged document missing from records: {doc_id}")
-                    })?);
+                    segment_records.push(
+                        records
+                            .get(doc_id)
+                            .map(|r| r.borrow().clone())
+                            .ok_or_else(|| {
+                                format!("unchanged document missing from records: {doc_id}")
+                            })?,
+                    );
                 }
             }
             for doc_id in additions
                 .remove(segment.segment_id.as_str())
                 .unwrap_or_default()
             {
-                segment_records.push(records[doc_id].clone());
+                segment_records.push(records[doc_id].borrow().clone());
             }
             if !segment_records.is_empty() {
                 segments.push(build_memory_index_segment_with_lexical_root(
@@ -473,7 +486,10 @@ impl SegmentedMemoryIndex {
             }
         }
         for (segment_id, doc_ids) in additions {
-            let segment_records = doc_ids.into_iter().map(|id| records[id].clone()).collect();
+            let segment_records = doc_ids
+                .into_iter()
+                .map(|id| records[id].borrow().clone())
+                .collect();
             segments.push(build_memory_index_segment_with_lexical_root(
                 segment_id.to_string(),
                 segment_records,
