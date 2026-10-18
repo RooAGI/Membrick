@@ -1763,6 +1763,7 @@ dependencies = [
  "comrak",
  "console 0.16.6",
  "deunicode",
+ "fs4",
  "fuzzydate",
  "http-body-util",
  "hyper",

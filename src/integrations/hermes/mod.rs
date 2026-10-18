@@ -565,7 +565,18 @@ mod tests {
             .as_str()
             .expect("search should have an ID");
 
-        let page = call_tool(&mcp, "review_search", json!({"page_size": 10}));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            let page = call_tool(&mcp, "review_search", json!({"page_size": 10}));
+            if page.get("status").is_none() {
+                break page;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search history index did not become ready: {page}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert_eq!(page["searches"].as_array().unwrap().len(), 1);
         assert_eq!(page["searches"][0]["search_id"], json!(search_id));
 

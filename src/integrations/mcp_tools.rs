@@ -238,6 +238,27 @@ pub(crate) fn record_mcp_tool_response(
     } else {
         None
     };
+    if tool == "search"
+        && prepared_trace.is_none()
+        && response
+            .as_ref()
+            .is_ok_and(|response| response.error.is_none())
+    {
+        let id = response
+            .as_ref()
+            .ok()
+            .and_then(|response| response.id.clone());
+        *response = Ok(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32603,
+                message: "search results could not be assigned a review ID; retry the search"
+                    .to_string(),
+            }),
+        });
+    }
     let (error, payload) = match response {
         Ok(response) => (
             response.error.is_some(),
@@ -290,6 +311,27 @@ pub(crate) fn record_mcp_tool_response(
     };
     if let Err(error) = record {
         eprintln!("Membrick could not append MCP call history: {error:#}");
+        if tool == "search"
+            && response
+                .as_ref()
+                .is_ok_and(|response| response.error.is_none())
+        {
+            let id = response
+                .as_ref()
+                .ok()
+                .and_then(|response| response.id.clone());
+            *response = Ok(JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!(
+                        "search results could not be saved for review; retry the search ({error:#})"
+                    ),
+                }),
+            });
+        }
     }
 }
 
@@ -1184,7 +1226,7 @@ pub(crate) fn memory_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "review_search".to_string(),
-            description: "Review MCP searches. Omit search_id to page through unreviewed searches with cursor and page_size. Supply search_id to retrieve that exact query, result, and available source documents. Reading a page does not mark a search reviewed.".to_string(),
+            description: "Review recorded MCP searches through the resident's in-memory lookup index. The first request may return status=indexing while it rebuilds from telemetry; retry shortly. Omit search_id to page through unreviewed searches with cursor and page_size. Supply search_id to retrieve that exact query, result, and available source documents. Reading a page does not mark a search reviewed.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1437,20 +1479,30 @@ pub(crate) fn call_board_or_memory_tool(
                 write_arguments["session_id"] = json!(session_id);
             }
         }
-        match crate::memory_api::MemoryService::with_shared_memory(root, |store| {
-            dispatch_write_tool(
-                tool_name,
-                &write_arguments,
-                store,
-                "mcp",
-                &workspace,
-                provider,
-                root,
-            )
-            .map_err(anyhow::Error::msg)
-        }) {
-            Ok(value) => Ok(value),
-            Err(error) => Err(format!("{error:#}")),
+        if tool_name == "search_feedback" {
+            // Feedback must use the resident's search-history locator and
+            // review-state caches. Opening a temporary shared-memory service
+            // here gives feedback an empty locator map and makes a just
+            // recorded search look like it is still indexing (or absent).
+            service
+                .search_feedback_mcp(root, &write_arguments)
+                .map_err(|error| format!("{error:#}"))
+        } else {
+            match crate::memory_api::MemoryService::with_shared_memory(root, |store| {
+                dispatch_write_tool(
+                    tool_name,
+                    &write_arguments,
+                    store,
+                    "mcp",
+                    &workspace,
+                    provider,
+                    root,
+                )
+                .map_err(anyhow::Error::msg)
+            }) {
+                Ok(value) => Ok(value),
+                Err(error) => Err(format!("{error:#}")),
+            }
         }
     } else {
         match tool_name {
@@ -1468,7 +1520,7 @@ pub(crate) fn call_board_or_memory_tool(
         }
     };
     #[cfg(test)]
-    if is_write && result.is_ok() {
+    if is_write && tool_name != "search_feedback" && result.is_ok() {
         service.sync_shared_memory(&crate::integrations::mcp_index::shared_memory_root(root))?;
     }
     match result {
@@ -1693,15 +1745,29 @@ mod tests {
         .unwrap();
 
         let mut service = memory_service();
-        let page = call_board_or_memory_tool(
-            "review_search",
-            Some(json!(92)),
-            &json!({"page_size":10}),
-            &mut service,
-            &root,
-            "codex",
-        )
-        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            let page = call_board_or_memory_tool(
+                "review_search",
+                Some(json!(92)),
+                &json!({"page_size":10}),
+                &mut service,
+                &root,
+                "codex",
+            )
+            .unwrap();
+            let body = page.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if body.as_ref().and_then(|body| body.get("status")).is_none() {
+                break page;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search history index did not become ready: {body:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let page_text = page.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -1918,6 +1984,39 @@ mod tests {
             Some(text.as_str())
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_search_is_not_returned_when_history_cannot_be_appended() {
+        let root = std::env::temp_dir().join(format!(
+            "membrick-search-history-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".membrick/mcp-call-history.lock")).unwrap();
+        let mut response = Ok(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: Some(json!(9)),
+            result: Some(json!({
+                "content":[{"type":"text","text":"{\"results\":[{\"id\":\"doc-1\"}]}"}]
+            })),
+            error: None,
+        });
+
+        record_mcp_tool_response(
+            &root,
+            "codex",
+            "search",
+            Some(json!(9)),
+            &json!({"query":"example"}),
+            2,
+            &mut response,
+        );
+
+        let response = response.unwrap();
+        assert!(response.error.is_some(), "unrecorded success was returned");
+        assert!(response.result.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
