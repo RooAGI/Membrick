@@ -6,18 +6,24 @@ results remain below as historical measurements.
 
 ## Offline MCP search-feedback evaluation
 
-`feedback_eval` reads copies of `.membrick/mcp-call-history.jsonl` and
-`.membrick/search-review-state.json` and reports label coverage plus baseline
-NDCG and MRR. It is a separate, read-only binary: it does not import
-`MemoryService`, access the running resident, or write workspace files. The
-`experimental` feature keeps it out of normal builds and installs.
+`feedback_eval` reads `.membrick/mcp-call-history.jsonl` and
+`.membrick/search-review-state.json` in a separate process, then writes one
+page-ready JSONL snapshot to `.membrick/`. The first line stores ranking
+metrics and snapshot metadata; following lines store review rows. It does not
+import `MemoryService`, access the running resident, or run during MCP calls.
+The `experimental` feature keeps it out of normal builds and installs.
 
 ```bash
 cargo run --features experimental --bin feedback_eval -- \
   --history /path/to/copied/mcp-call-history.jsonl \
   --reviews /path/to/copied/search-review-state.json \
+  --output-dir /path/to/dashboard-snapshot \
   --k 5,10
 ```
+
+Omit `--output-dir` to write the dashboard snapshot beside the review file.
+The evaluator atomically replaces the complete snapshot so rows and metrics
+always come from the same run.
 
 The metrics cover only returned documents with complete submitted judgments.
 They are not corpus-wide recall and do not measure a trained model. Keep the

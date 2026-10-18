@@ -64,10 +64,14 @@ evidence-backed update to one exact source document ID and revision, such as
 adding a session conclusion, headings, or links to reviewed observations.
 Later hook captures preserve those enrichments while retaining raw
 observations as separate documents. These tools do not rewrite the append-only
-history. The opaque continuation cursor includes a byte offset
-and a fingerprint of the history prefix already read. If that prefix is
+history. Queue pagination streams JSONL records through a bounded buffer and
+retains only the current response page. The opaque continuation cursor
+includes a byte offset and a fingerprint of the history prefix already read.
+Cursor validation hashes that prefix with a fixed-size buffer; if the prefix is
 replaced or edited, the cursor is rejected and pagination should restart from
 the first page. Appending new records does not invalidate an existing cursor.
+Each page is capped at 8 MiB of history records, and records over 16 MiB are
+skipped and counted in the response.
 See the [MCP interface](mcp.md#tools) and the
 [document enrichment implementation plan](document-enrichment-plan.md) for
 scope and current limitations.
@@ -122,24 +126,33 @@ The local dashboard reads query and provider telemetry through these endpoints:
 | --- | --- |
 | `GET /api/status` | Index state, query summary, and integration cards |
 | `GET /api/timeseries` | Five-second query aggregates over the rolling window |
-| `GET /api/search-reviews?offset=0&page_size=25` | Paginated submitted search feedback and aggregate offline evaluation |
+| `GET /api/search-reviews?offset=0&page_size=25` | Paginated rows from the latest offline search-feedback snapshot |
 | `GET /api/integrations` | Provider readiness |
 | `GET /api/sessions` | Recent sessions and sanitized lifecycle counts |
 | `GET /api/events` | Latest sanitized provider events |
 | `GET /api/sessions/:session_key/events` | Events for one opaque session key |
 | `GET /api/metrics` and `GET /metrics` | Aggregate metrics, including Prometheus text format |
 
-The dashboard's **Search reviews** view lists submitted feedback from
-`.membrick/search-review-state.json`, joins each entry to its original MCP
-search for the provider and query, and shows the overall label and per-document
-relevance judgments. The response also includes overall label counts, document
-relevance counts, and NDCG@5, NDCG@10, and MRR for searches with complete
-judgments matching the recorded result list. Each metric includes its sample
-count. Fewer than 30 fully judged searches are marked as a small sample. These
-metrics evaluate recorded ranking only; feedback does not train or alter the
-live ranker. The view is paginated and only loads when opened. The dashboard
-API uses the same workspace telemetry authentication rules as the other
-workspace-wide views.
+The dashboard's **Search reviews** view reads one page-ready snapshot at
+`.membrick/search-feedback-dashboard.jsonl`. Its first JSONL row contains the
+evaluation summary and snapshot metadata; later rows contain the paginated
+reviews. It does not read the MCP history or review state, or acquire the
+resident memory lock. Refresh the snapshot by running the separate evaluator
+when desired:
+
+```bash
+cargo run --features experimental --bin feedback_eval -- \
+  --history .membrick/mcp-call-history.jsonl \
+  --reviews .membrick/search-review-state.json
+```
+
+The evaluator runs as a separate process and writes derived dashboard files;
+MCP search and feedback calls never invoke it. Metrics evaluate recorded
+ranking only; feedback does not train or alter the live ranker. Dashboard pages
+are bounded and use explicit feedback labels rather than treating unreviewed
+searches as negative examples. The dashboard reports when its snapshot was last
+generated and uses the same workspace telemetry authentication rules as the
+other workspace-wide views.
 
 Run the dashboard renderer unit tests with `node --test dashboard/search-evaluation.test.mjs`.
 

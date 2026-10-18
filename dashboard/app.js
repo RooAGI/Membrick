@@ -111,7 +111,11 @@ async function loadSearchReviews(offset = 0) {
     state.reviewOffset = page.offset || 0;
     state.reviewTotal = Number(page.total || 0);
     const reviews = page.reviews || [];
-    renderSearchEvaluation(page.evaluation || {});
+    if (page.evaluation_status === 'ready') {
+      renderSearchEvaluation(page.evaluation || {}, page.evaluation_generated_at);
+    } else {
+      document.querySelector('#search-review-evaluation').innerHTML = '<section class="review-evaluation__panel"><p class="eyebrow">Offline ranking evaluation</p><p class="muted">Not run yet. Run the offline feedback evaluator to refresh this summary.</p></section>';
+    }
     document.querySelector('#search-reviews-count').textContent = `${fmt(state.reviewTotal)} reviews`;
     document.querySelector('#search-reviews-page').textContent = state.reviewTotal
       ? `${fmt(state.reviewOffset + 1)}–${fmt(state.reviewOffset + reviews.length)} of ${fmt(state.reviewTotal)}`
@@ -121,7 +125,9 @@ async function loadSearchReviews(offset = 0) {
     document.querySelector('#search-reviews-previous').onclick = () => loadSearchReviews(Math.max(0, state.reviewOffset - 25));
     document.querySelector('#search-reviews-next').onclick = () => loadSearchReviews(page.next_offset);
     container.innerHTML = reviews.length ? reviews.map(renderSearchReview).join('')
-      : '<div class="empty-state">Search feedback submitted through MCP will appear here.</div>';
+      : page.evaluation_status === 'ready'
+        ? '<div class="empty-state">No submitted search feedback yet.</div>'
+        : '<div class="empty-state">Run the offline feedback evaluator to populate this review page.</div>';
   } catch (error) {
     document.querySelector('#search-reviews-count').textContent = '';
     document.querySelector('#search-reviews-page').textContent = '';
@@ -130,8 +136,8 @@ async function loadSearchReviews(offset = 0) {
   }
 }
 
-function renderSearchEvaluation(evaluation) {
-  document.querySelector('#search-review-evaluation').innerHTML = renderSearchEvaluationHtml(evaluation);
+function renderSearchEvaluation(evaluation, generatedAt) {
+  document.querySelector('#search-review-evaluation').innerHTML = renderSearchEvaluationHtml(evaluation, generatedAt);
 }
 
 function renderSearchReview(review) {

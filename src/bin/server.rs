@@ -1558,22 +1558,15 @@ async fn api_search_reviews(
     State(state): State<AppState>,
     Query(query): Query<DashboardSearchReviewsQuery>,
 ) -> impl IntoResponse {
-    match state.service.read() {
-        Ok(service) => match service.dashboard_search_feedback_reviews(
-            &state.project_root,
-            query.offset.unwrap_or_default(),
-            query.page_size.unwrap_or(25),
-        ) {
-            Ok(reviews) => Json(reviews).into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": format!("search reviews unavailable: {error}")})),
-            )
-                .into_response(),
-        },
-        Err(_) => (
+    match crate::memory_api::MemoryService::dashboard_search_feedback_reviews(
+        &state.project_root,
+        query.offset.unwrap_or_default(),
+        query.page_size.unwrap_or(25),
+    ) {
+        Ok(reviews) => Json(reviews).into_response(),
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"search reviews unavailable"})),
+            Json(json!({"detail": format!("search reviews unavailable: {error}")})),
         )
             .into_response(),
     }
