@@ -980,6 +980,7 @@ impl IndexStore {
 
     pub fn upsert(&mut self, doc: SourceDocument) {
         let mut doc = doc;
+        doc.normalize_timestamp_metadata();
         const RECORDED_AT_FILTER: &str = "membrick_recorded_at";
         let doc_id = doc.doc_id.clone();
         let recorded_at = self.source_docs.get(&doc_id).and_then(|previous| {

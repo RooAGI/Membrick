@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 use temps::chrono::{parse_to_datetime, Language};
 
+use crate::query_semantics::QueryIntent;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TemporalTarget {
     pub target_date: NaiveDate,
@@ -13,6 +15,99 @@ pub struct TemporalTarget {
 
 pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 pub const DEFAULT_RECENCY_MAX_BOOST: f32 = 0.25;
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessMode {
+    Relative,
+    Legacy,
+    Disabled,
+}
+
+impl Default for FreshnessMode {
+    fn default() -> Self {
+        Self::Relative
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct FreshnessPolicy {
+    pub mode: FreshnessMode,
+    pub half_life_days: f32,
+    pub weight: f32,
+}
+
+impl Default for FreshnessPolicy {
+    fn default() -> Self {
+        Self {
+            mode: FreshnessMode::Relative,
+            half_life_days: DEFAULT_RECENCY_HALF_LIFE_DAYS,
+            weight: DEFAULT_RECENCY_MAX_BOOST,
+        }
+    }
+}
+
+impl FreshnessPolicy {
+    pub fn validate(self) -> Result<Self, &'static str> {
+        if !self.half_life_days.is_finite() || self.half_life_days <= 0.0 {
+            return Err("freshness half_life_days must be a finite positive number");
+        }
+        if !self.weight.is_finite() || !(0.0..=1.0).contains(&self.weight) {
+            return Err("freshness weight must be finite and between 0 and 1");
+        }
+        Ok(self)
+    }
+
+    pub fn weight_for_intent(self, intent: QueryIntent) -> f32 {
+        if self.mode == FreshnessMode::Disabled || self.validate().is_err() {
+            return 0.0;
+        }
+        match intent {
+            QueryIntent::CurrentState => self.weight,
+            // Ordinary factual lookups often concern durable or historical
+            // information. Do not infer that newer is better unless query
+            // analysis explicitly classified the request as current state.
+            QueryIntent::Lookup | QueryIntent::Explain => 0.0,
+            QueryIntent::Aggregate
+            | QueryIntent::Compare
+            | QueryIntent::TemporalDiff
+            | QueryIntent::TemporalOrder
+            | QueryIntent::Choose
+            | QueryIntent::TemporalFilter
+            | QueryIntent::SharedRelation => 0.0,
+        }
+    }
+}
+
+/// Relative freshness delta for a nonnegative relevance score. Missing or
+/// malformed timestamps receive no freshness contribution.
+pub fn relative_freshness_delta(
+    relevance_score: f32,
+    timestamp: Option<&str>,
+    as_of: DateTime<Utc>,
+    half_life_days: f32,
+    weight: f32,
+) -> Option<f32> {
+    if !relevance_score.is_finite()
+        || relevance_score <= 0.0
+        || !half_life_days.is_finite()
+        || half_life_days <= 0.0
+        || !weight.is_finite()
+        || !(0.0..=1.0).contains(&weight)
+    {
+        return None;
+    }
+    let timestamp_date = parse_date(timestamp)?;
+    let age_days = as_of
+        .date_naive()
+        .signed_duration_since(timestamp_date)
+        .num_days()
+        .max(0) as f32;
+    let freshness = 2.0f32.powf(-age_days / half_life_days);
+    let delta = relevance_score * weight * freshness;
+    Some(delta.min(f32::MAX - relevance_score).max(0.0))
+}
 
 pub fn recency_boost(
     timestamp: Option<&str>,
@@ -139,6 +234,48 @@ pub fn augment_query_with_temporal_context(query: &str, question_date: Option<&s
 
 pub fn parse_temporal_date(input: Option<&str>) -> Option<NaiveDate> {
     parse_date(input)
+}
+
+/// Normalize supported document timestamp inputs to an RFC 3339 instant or a
+/// date-only value. Bare legacy integers are accepted only when their
+/// magnitude identifies Unix seconds or milliseconds; small numbers such as
+/// years are not treated as timestamps.
+pub fn normalize_timestamp(input: &str) -> Option<String> {
+    let value = input.trim();
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Some(date.format("%Y-%m-%d").to_string());
+    }
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return Some(
+            datetime
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        );
+    }
+    #[derive(Clone, Copy)]
+    enum EpochUnit {
+        Seconds,
+        Milliseconds,
+    }
+    let (number, explicit_unit) = if let Some(number) = value.strip_prefix("unix_ms:") {
+        (number.parse::<i64>().ok()?, Some(EpochUnit::Milliseconds))
+    } else if let Some(number) = value.strip_prefix("unix:") {
+        (number.parse::<i64>().ok()?, Some(EpochUnit::Seconds))
+    } else {
+        (value.parse::<i64>().ok()?, None)
+    };
+    let datetime = match explicit_unit {
+        Some(EpochUnit::Seconds) => DateTime::<Utc>::from_timestamp(number, 0)?,
+        Some(EpochUnit::Milliseconds) => DateTime::<Utc>::from_timestamp_millis(number)?,
+        None if (100_000_000..=253_402_300_799).contains(&number) => {
+            DateTime::<Utc>::from_timestamp(number, 0)?
+        }
+        None if (100_000_000_000..=253_402_300_799_999).contains(&number) => {
+            DateTime::<Utc>::from_timestamp_millis(number)?
+        }
+        None => return None,
+    };
+    Some(datetime.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 pub fn resolve_temporal_target(query: &str, anchor_date: Option<&str>) -> Option<TemporalTarget> {
@@ -963,12 +1100,7 @@ fn parse_date(input: Option<&str>) -> Option<NaiveDate> {
         })
         .or_else(|| NaiveDate::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
         .or_else(|| NaiveDate::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").ok())
-        .or_else(|| {
-            s.parse::<i64>()
-                .ok()
-                .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
-                .map(|date| date.date_naive())
-        })
+        .or_else(|| normalize_timestamp(s).and_then(|value| parse_date(Some(&value))))
 }
 
 fn query_word_tokens(query: &str) -> Vec<String> {
@@ -1831,6 +1963,68 @@ mod tests {
     }
 
     #[test]
+    fn relative_freshness_scales_with_relevance_and_decays_by_half_life() {
+        let as_of = DateTime::parse_from_rfc3339("2024-07-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let today = relative_freshness_delta(100.0, Some("2024-07-01"), as_of, 30.0, 0.25).unwrap();
+        let thirty_days =
+            relative_freshness_delta(100.0, Some("2024-06-01"), as_of, 30.0, 0.25).unwrap();
+        let sixty_days =
+            relative_freshness_delta(100.0, Some("2024-05-02"), as_of, 30.0, 0.25).unwrap();
+        let weak_recent =
+            relative_freshness_delta(5.0, Some("2024-07-01"), as_of, 30.0, 0.25).unwrap();
+        assert!((today - 25.0).abs() < 0.001);
+        assert!((thirty_days - 12.5).abs() < 0.001);
+        assert!((sixty_days - 6.25).abs() < 0.001);
+        assert!((weak_recent - 1.25).abs() < 0.001);
+        assert!(today > thirty_days && thirty_days > sixty_days);
+    }
+
+    #[test]
+    fn relative_freshness_ignores_unknown_and_invalid_timestamps_and_bounds_future_dates() {
+        let as_of = DateTime::parse_from_rfc3339("2024-07-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            relative_freshness_delta(100.0, None, as_of, 30.0, 0.25),
+            None
+        );
+        assert_eq!(
+            relative_freshness_delta(100.0, Some("not-a-date"), as_of, 30.0, 0.25),
+            None
+        );
+        assert_eq!(
+            relative_freshness_delta(100.0, Some("2025-01-01"), as_of, 30.0, 0.25),
+            Some(25.0)
+        );
+        let near_max = relative_freshness_delta(f32::MAX, Some("2024-07-01"), as_of, 30.0, 1.0)
+            .expect("finite score should remain usable");
+        assert!((f32::MAX + near_max).is_finite());
+    }
+
+    #[test]
+    fn freshness_policy_varies_by_query_intent_and_validates_configuration() {
+        let policy = FreshnessPolicy::default();
+        assert_eq!(policy.weight_for_intent(QueryIntent::CurrentState), 0.25);
+        assert_eq!(policy.weight_for_intent(QueryIntent::Lookup), 0.0);
+        assert_eq!(policy.weight_for_intent(QueryIntent::Explain), 0.0);
+        assert_eq!(policy.weight_for_intent(QueryIntent::Compare), 0.0);
+        assert!(FreshnessPolicy {
+            half_life_days: 0.0,
+            ..policy
+        }
+        .validate()
+        .is_err());
+        assert!(FreshnessPolicy {
+            weight: 1.1,
+            ..policy
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn extreme_temporal_offsets_never_panic() {
         // Regression: "百万年前" (a million years ago, from MIRACL corpus
         // docs 6769570#0 / 2736869#0) panicked `last_day_of_month` via
@@ -1876,11 +2070,39 @@ mod tests {
 
 #[cfg(test)]
 mod unix_timestamp_tests {
-    use super::parse_temporal_date;
+    use super::{normalize_timestamp, parse_temporal_date};
 
     #[test]
     fn parses_unix_epoch_seconds_for_timeline_dates() {
         let date = parse_temporal_date(Some("1788710927")).expect("epoch timestamp should parse");
         assert_eq!(date.to_string(), "2026-09-06");
+    }
+
+    #[test]
+    fn normalizes_legacy_epoch_seconds_and_milliseconds_without_ambiguous_numbers() {
+        assert_eq!(
+            normalize_timestamp("1792220974").as_deref(),
+            Some("2026-10-17T07:09:34Z")
+        );
+        assert_eq!(
+            normalize_timestamp("1792220974000").as_deref(),
+            Some("2026-10-17T07:09:34Z")
+        );
+        assert_eq!(normalize_timestamp("2026").as_deref(), None);
+        assert_eq!(
+            normalize_timestamp("2026-10-17").as_deref(),
+            Some("2026-10-17")
+        );
+        assert_eq!(
+            normalize_timestamp("2026-10-17T07:09:34-07:00").as_deref(),
+            Some("2026-10-17T14:09:34Z")
+        );
+    }
+
+    #[test]
+    fn parses_legacy_milliseconds_as_milliseconds_not_seconds() {
+        let date = parse_temporal_date(Some("1792220974000")).unwrap();
+        assert_eq!(date.to_string(), "2026-10-17");
+        assert_eq!(parse_temporal_date(Some("2026")), None);
     }
 }

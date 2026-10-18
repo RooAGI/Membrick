@@ -140,6 +140,7 @@ pub use crate::source::{
     source_document_hash, KeyPhrase, KeyPhraseOrigin, SourceDocument, SourceDocumentEnrichment,
     SourceDocumentEvidence,
 };
+pub use crate::temporal::{FreshnessMode, FreshnessPolicy};
 pub use crate::temporal_fact::TemporalFact;
 
 // Internal aliases used by implementation modules and development tools.

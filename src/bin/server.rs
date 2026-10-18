@@ -123,6 +123,7 @@ struct ServerSettings {
     tenant_id: Option<String>,
     jwt_secret: Option<String>,
     adaptive_segment_max_n: Option<usize>,
+    freshness: Option<crate::temporal::FreshnessPolicy>,
 }
 
 fn settings_path(args: &Args) -> anyhow::Result<PathBuf> {
@@ -727,6 +728,11 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         !args.no_conversational_rerank,
         args.segment_routing.strategy(),
     );
+    options.freshness_policy = settings
+        .freshness
+        .unwrap_or_default()
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     options.lang = args.lang;
     let project_root = args
         .project_root
@@ -3181,6 +3187,23 @@ fn token_is_valid(supplied: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_settings_load_relative_freshness_and_default_to_relative() {
+        let settings: ServerSettings =
+            toml::from_str("[freshness]\nmode = 'relative'\nhalf_life_days = 45.0\nweight = 0.3\n")
+                .expect("freshness settings should deserialize");
+        let policy = settings.freshness.unwrap().validate().unwrap();
+        assert_eq!(policy.mode, crate::temporal::FreshnessMode::Relative);
+        assert_eq!(policy.half_life_days, 45.0);
+        assert_eq!(policy.weight, 0.3);
+
+        let defaults: ServerSettings = toml::from_str("").expect("empty settings are valid");
+        assert_eq!(
+            defaults.freshness.unwrap_or_default().mode,
+            crate::temporal::FreshnessMode::Relative
+        );
+    }
 
     pub(super) fn security_test_root() -> PathBuf {
         static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

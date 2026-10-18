@@ -83,6 +83,7 @@ nav:
       - Claim contract: claim-contract.md
       - MemoryService API: memory-service-api.md
       - Temporal query resolution: temporal-query-resolution.md
+      - Freshness ranking plan: freshness-ranking-plan.md
       - Corpus graph: build-corpus-graph.md
       - Integration glossary: integration-glossary.md
       - Chunk strategy: chunk-strategy.md

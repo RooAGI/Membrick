@@ -703,6 +703,7 @@ pub(crate) fn capture_workspace_file_changes(
             filters.insert("event".to_string(), change.event.clone());
             filters.insert("captured_by".to_string(), provider.as_str().to_string());
             filters.insert("provider".to_string(), provider.as_str().to_string());
+            filters.insert("timestamp_kind".to_string(), "workspace_event".to_string());
             filters.insert(
                 "session_id".to_string(),
                 format!("{}:workspace-watcher", provider.as_str()),
@@ -722,7 +723,10 @@ pub(crate) fn capture_workspace_file_changes(
                 group_id: Some("workspace-file-changes".to_string()),
                 headings: vec!["Workspace file change".to_string()],
                 links: Vec::new(),
-                timestamp: Some(change.timestamp_ms.to_string()),
+                timestamp: crate::temporal::normalize_timestamp(&format!(
+                    "unix_ms:{}",
+                    change.timestamp_ms
+                )),
                 author_agent: None,
                 filters,
                 key_phrases: Vec::new(),
@@ -1523,6 +1527,10 @@ mod tests {
         MemoryService::with_shared_memory(&root, |service| {
             let documents = service.source_documents();
             assert_eq!(documents.len(), 1);
+            assert_eq!(
+                documents[0].timestamp.as_deref(),
+                Some("1970-01-01T00:00:00.123Z")
+            );
             let content = &documents[0].content;
             assert!(
                 !content.contains("old-private-value")

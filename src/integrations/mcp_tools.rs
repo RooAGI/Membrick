@@ -654,10 +654,32 @@ fn format_search_results(
             // Anchor relative date expressions ("yesterday", "last month") to
             // an absolute date the agent can see. Fail-open: memories without
             // a timestamp keep their original text.
-            let content = match document.timestamp.as_deref() {
-                Some(date) => format!("[session date: {date}]\n{content}"),
-                None => content,
+            let timestamp_kind = document.timestamp_kind();
+            let timestamp = document
+                .timestamp
+                .as_deref()
+                .and_then(crate::temporal::normalize_timestamp);
+            let content = match (timestamp_kind, timestamp.as_deref()) {
+                (crate::source::TimestampKind::Session, Some(date)) => {
+                    format!("[session date: {date}]\n{content}")
+                }
+                (crate::source::TimestampKind::UserSupplied, Some(date)) => {
+                    format!("[memory date: {date}]\n{content}")
+                }
+                _ => content,
             };
+            let created_at = matches!(
+                timestamp_kind,
+                crate::source::TimestampKind::Session | crate::source::TimestampKind::UserSupplied
+            )
+            .then(|| timestamp.clone())
+            .flatten();
+            let modified_at = (timestamp_kind == crate::source::TimestampKind::SourceModified)
+                .then(|| timestamp.clone())
+                .flatten();
+            let event_at = (timestamp_kind == crate::source::TimestampKind::WorkspaceEvent)
+                .then(|| timestamp.clone())
+                .flatten();
             Some(json!({
                 "id": result.doc_id,
                 "doc_id": result.doc_id,
@@ -666,7 +688,10 @@ fn format_search_results(
                 "source": result.source,
                 "content": content,
                 "score": result.score,
-                "created_at": document.timestamp.clone(),
+                "created_at": created_at,
+                "modified_at": modified_at,
+                "event_at": event_at,
+                "timestamp_kind": timestamp_kind.as_str(),
                 "session_id": document.group_id.clone(),
                 "matched_terms": result.matched_terms,
                 "matched_entities": result.matched_entities,
@@ -2258,7 +2283,7 @@ mod tests {
                 source: "codex://project/session-1/outcome".to_string(),
                 content: "we deployed yesterday".to_string(),
                 concept: "outcome".to_string(),
-                group_id: Some("session-1".to_string()),
+                group_id: Some("codex-session:project:session-1".to_string()),
                 filters: BTreeMap::new(),
                 headings: vec![],
                 links: vec![],
@@ -2273,7 +2298,7 @@ mod tests {
             SearchResult {
                 doc_id: doc_id.to_string(),
                 source: "codex://project/session-1/outcome".to_string(),
-                group_id: Some("session-1".to_string()),
+                group_id: Some("codex-session:project:session-1".to_string()),
                 score: 1.0,
                 score_breakdown: crate::index::ScoreBreakdown::default(),
                 matched_entities: Vec::new(),
@@ -2291,10 +2316,37 @@ mod tests {
         let mut store = IndexStore::in_memory(PipelineOptions::default());
         store.upsert(memory("dated", Some("2026-09-20T10:00:00Z")));
         store.upsert(memory("undated", None));
+        let mut file = memory("file-modified", Some("1792220974"));
+        file.source = "docs/guide.md".to_string();
+        file.group_id = None;
+        file.filters
+            .insert("timestamp_kind".to_string(), "source_modified".to_string());
+        file.content = "Repository guide contents".to_string();
+        store.upsert(file);
+        let mut event = memory("file-event", Some("1792220974000"));
+        event.source = "membrick://workspace/file-change/abc".to_string();
+        event.group_id = Some("workspace-file-changes".to_string());
+        event.filters.insert(
+            "source_type".to_string(),
+            "workspace-file-change".to_string(),
+        );
+        event
+            .filters
+            .insert("timestamp_kind".to_string(), "workspace_event".to_string());
+        event.content = "Workspace file change".to_string();
+        store.upsert(event);
         let service = MemoryService::new(store);
-        let payload = search_results(&service, vec![hit("dated"), hit("undated")]);
+        let payload = search_results(
+            &service,
+            vec![
+                hit("dated"),
+                hit("undated"),
+                hit("file-modified"),
+                hit("file-event"),
+            ],
+        );
         let results = payload["results"].as_array().unwrap();
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 4);
         assert_eq!(results[0]["doc_id"], "dated");
         assert_eq!(results[0]["rank"], 1);
         assert_eq!(results[1]["doc_id"], "undated");
@@ -2302,7 +2354,8 @@ mod tests {
 
         let dated = &results[0];
         assert_eq!(dated["created_at"], "2026-09-20T10:00:00Z");
-        assert_eq!(dated["session_id"], "session-1");
+        assert_eq!(dated["timestamp_kind"], "session");
+        assert_eq!(dated["session_id"], "codex-session:project:session-1");
         let content = dated["content"].as_str().unwrap();
         let indexed_dated = service.source_document_by_id("dated").unwrap();
         assert_eq!(
@@ -2319,6 +2372,22 @@ mod tests {
         let undated = &results[1];
         assert!(undated["created_at"].is_null());
         assert_eq!(undated["content"], "we deployed yesterday");
+
+        let file_modified = &results[2];
+        assert_eq!(file_modified["timestamp_kind"], "source_modified");
+        assert!(file_modified["created_at"].is_null());
+        assert_eq!(file_modified["modified_at"], "2026-10-17T07:09:34Z");
+        assert_eq!(file_modified["content"], "Repository guide contents");
+        assert!(!file_modified["content"]
+            .as_str()
+            .unwrap()
+            .contains("session date"));
+
+        let file_event = &results[3];
+        assert_eq!(file_event["timestamp_kind"], "workspace_event");
+        assert!(file_event["created_at"].is_null());
+        assert_eq!(file_event["event_at"], "2026-10-17T07:09:34Z");
+        assert_eq!(file_event["content"], "Workspace file change");
     }
 
     #[cfg(any(

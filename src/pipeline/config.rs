@@ -2,6 +2,7 @@ use crate::index::MemoryIndex;
 use crate::lang::{default_spacy_model_for_lang, detect_lang, Lang};
 use crate::segments::{SegmentRoutingStrategy, SegmentedMemoryIndex};
 use crate::semantic_relations::SupersessionOptions;
+use crate::temporal::FreshnessPolicy;
 use crate::tier1::DEFAULT_SPACY_MODEL;
 use clap::ValueEnum;
 use serde::Serialize;
@@ -98,6 +99,9 @@ pub struct PipelineOptions {
     /// fail-open and applies on the next refresh cycle. When false, no
     /// background extraction runs and documents keep empty key phrases.
     pub key_phrase_enrichment: bool,
+    /// Query-time freshness contribution. This is a ranking-only option and
+    /// does not change or rebuild indexed documents.
+    pub freshness_policy: FreshnessPolicy,
     /// Override path for the extractor script. `None` (default) uses the
     /// bundled `scripts/spacy_relations.py`; set to a test double in tests.
     pub extractor_script: Option<std::path::PathBuf>,
@@ -130,6 +134,7 @@ impl Default for PipelineOptions {
             conversational_rerank: true,
             structured_fact_retrieval: true,
             key_phrase_enrichment: true,
+            freshness_policy: FreshnessPolicy::default(),
             extractor_script: None,
         }
     }

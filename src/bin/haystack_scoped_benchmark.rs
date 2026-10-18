@@ -1,8 +1,8 @@
 use crate::memory_api::{AddRequest, MemoryService, Message, SearchRequest};
 use crate::{
     parse_reference_date, segments::SegmentRoutingStrategy, AggregateOutput, ChunkStrategy,
-    MemoryIndexLayout, PipelineOptions, QueryDiagnostics, QueryTimings, Tier1NerProvider,
-    Tier1TermRankerKind,
+    FreshnessMode, FreshnessPolicy, MemoryIndexLayout, PipelineOptions, QueryDiagnostics,
+    QueryTimings, Tier1NerProvider, Tier1TermRankerKind,
 };
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -113,6 +113,13 @@ struct Args {
     /// `adaptive` starts routed and expands when evidence is thin.
     #[arg(long, value_enum, default_value_t = IndexModeArg::Single)]
     index_mode: IndexModeArg,
+
+    /// Freshness policy for controlled ranking comparisons.
+    #[arg(long, value_enum, default_value_t = FreshnessModeArg::Legacy)]
+    freshness_mode: FreshnessModeArg,
+    /// Relative freshness weight for calibration runs; recorded in the report.
+    #[arg(long, default_value_t = 0.25)]
+    freshness_weight: f32,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
@@ -121,6 +128,24 @@ enum IndexModeArg {
     Single,
     Segmented,
     Adaptive,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FreshnessModeArg {
+    Legacy,
+    Relative,
+    Disabled,
+}
+
+impl From<FreshnessModeArg> for FreshnessMode {
+    fn from(value: FreshnessModeArg) -> Self {
+        match value {
+            FreshnessModeArg::Legacy => Self::Legacy,
+            FreshnessModeArg::Relative => Self::Relative,
+            FreshnessModeArg::Disabled => Self::Disabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -274,6 +299,8 @@ struct TypeMetrics {
 struct BenchmarkReport {
     ner_provider: Tier1NerProvider,
     index_mode: IndexModeArg,
+    freshness_mode: FreshnessModeArg,
+    freshness_weight: f32,
     structured_fact_retrieval: bool,
     combsum: bool,
     rrf: bool,
@@ -712,6 +739,8 @@ pub(crate) fn main() -> Result<()> {
         args.segment_router.into(),
         args.ner_provider.clone(),
         args.index_mode,
+        args.freshness_mode,
+        args.freshness_weight,
         args.combsum,
         args.rrf,
         args.prf,
@@ -745,6 +774,8 @@ fn run_scoped_benchmark(
     segment_router: SegmentRoutingStrategy,
     ner_provider: Tier1NerProvider,
     index_mode: IndexModeArg,
+    freshness_mode: FreshnessModeArg,
+    freshness_weight: f32,
     combsum: bool,
     rrf: bool,
     prf: bool,
@@ -820,6 +851,11 @@ fn run_scoped_benchmark(
             text_rerank_ngram,
             text_rerank_lcs,
             structured_fact_retrieval,
+            freshness_policy: FreshnessPolicy {
+                mode: freshness_mode.into(),
+                weight: freshness_weight,
+                ..FreshnessPolicy::default()
+            },
             memory_index_layout,
             ..PipelineOptions::default()
         };
@@ -1019,6 +1055,8 @@ fn run_scoped_benchmark(
     Ok(BenchmarkReport {
         ner_provider,
         index_mode,
+        freshness_mode,
+        freshness_weight,
         structured_fact_retrieval,
         combsum,
         rrf,

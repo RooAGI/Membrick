@@ -854,10 +854,12 @@ mod tests {
                 .any(|s| s.session_id == "valid" && s.status == "caught-up")
         });
         let statuses = worker.status().unwrap();
-        assert!(statuses.iter().any(|s| s.status == "invalid"
-            && s.last_error
-                .as_ref()
-                .is_some_and(|e| e.contains("broken.json"))));
+        assert!(statuses.iter().any(|s| {
+            s.status == "invalid"
+                && s.last_error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("broken.json"))
+        }));
         assert!(broken.exists());
         worker.shutdown();
     }

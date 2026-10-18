@@ -4,8 +4,8 @@ use crate::query_semantics::{
     QueryEvidenceRelation, QueryEvidenceRequirements, QueryRoutingIntent,
 };
 use crate::temporal::{
-    recency_boost, resolve_temporal_target, DEFAULT_RECENCY_HALF_LIFE_DAYS,
-    DEFAULT_RECENCY_MAX_BOOST,
+    recency_boost, resolve_temporal_target, FreshnessMode, FreshnessPolicy,
+    DEFAULT_RECENCY_HALF_LIFE_DAYS, DEFAULT_RECENCY_MAX_BOOST,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use roaring::RoaringBitmap;
@@ -366,6 +366,14 @@ impl MemoryIndex {
             temporal.allowed_doc_ids,
             temporal.allowed_doc_bitmap,
             apply_recency,
+            temporal.freshness_policy,
+            temporal.intent,
+            temporal
+                .freshness_as_of
+                .and_then(crate::query_semantics::parse_reference_date)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date| DateTime::<Utc>::from_naive_utc_and_offset(date, Utc))
+                .unwrap_or_else(|| DateTime::<Utc>::from(SystemTime::now())),
             local_terms,
         );
         let snapshot_query_ms = snapshot_start.elapsed().as_secs_f64() * 1000.0;
@@ -397,6 +405,9 @@ impl MemoryIndex {
             None,
             None,
             true,
+            FreshnessPolicy::default(),
+            crate::query_semantics::QueryIntent::Lookup,
+            Utc::now(),
             &[],
         )
         .0
@@ -520,6 +531,9 @@ impl MemoryIndex {
             Some(&allowed),
             None,
             true,
+            FreshnessPolicy::default(),
+            crate::query_semantics::QueryIntent::Lookup,
+            Utc::now(),
             &[],
         )
         .0
@@ -570,6 +584,9 @@ impl MemoryIndex {
                     allowed_opt.as_ref(),
                     None,
                     true,
+                    FreshnessPolicy::default(),
+                    crate::query_semantics::QueryIntent::Lookup,
+                    Utc::now(),
                     &[],
                 )
                 .0
@@ -589,6 +606,9 @@ impl MemoryIndex {
         allowed_doc_ids: Option<&HashSet<String>>,
         allowed_doc_bitmap: Option<&RoaringBitmap>,
         apply_recency: bool,
+        freshness_policy: FreshnessPolicy,
+        _intent: crate::query_semantics::QueryIntent,
+        freshness_as_of: DateTime<Utc>,
         local_terms: &[String],
     ) -> (Vec<SearchResult>, QueryTimings, QueryDiagnostics) {
         let rerank_start = Instant::now();
@@ -992,16 +1012,19 @@ impl MemoryIndex {
                 }
             }
             if apply_recency {
-                let delta = recency_boost(
-                    doc.section_chunks
-                        .iter()
-                        .find_map(|chunk| chunk.timestamp.as_deref())
-                        .or(doc.timestamp.as_deref()),
-                    DateTime::<Utc>::from(SystemTime::now()),
-                    DEFAULT_RECENCY_HALF_LIFE_DAYS,
-                    DEFAULT_RECENCY_MAX_BOOST,
-                )
-                .unwrap_or(0.0);
+                let delta = match freshness_policy.mode {
+                    // Relative freshness is applied once after MemoryService
+                    // has completed merge and intent-specific reranking.
+                    FreshnessMode::Relative => 0.0,
+                    FreshnessMode::Legacy => recency_boost(
+                        doc.timestamp.as_deref(),
+                        freshness_as_of,
+                        DEFAULT_RECENCY_HALF_LIFE_DAYS,
+                        DEFAULT_RECENCY_MAX_BOOST,
+                    )
+                    .unwrap_or(0.0),
+                    FreshnessMode::Disabled => 0.0,
+                };
                 if delta > 0.0 {
                     entry.score += delta;
                     entry.breakdown.recency_score += delta;
@@ -1539,10 +1562,20 @@ impl MemoryIndex {
         if std::env::var_os("MEMBRICK_QUERY_TIMINGS").is_some() {
             eprintln!(
                 "index_timing total={:.3} parse={:.3} sparse_setup={:.3} sparse={:.3} lexical={:.3} posting={:.3} accumulate={:.3} metadata={:.3} rank={:.3} graph={:.3} entity_graph={:.3} sequence={:.3} evidence={:.3} group_build={:.3} group_sort={:.3} candidates={}",
-                rerank_ms, parse_ms, sparse_setup_ms, sparse_scoring_ms, lexical_merge_ms, posting_scoring_ms,
-                candidate_accumulation_ms, metadata_ms,
-                candidate_rank_ms, graph_ms,
-                entity_graph_ms, sequence_rerank_ms, evidence_ms, group_build_ms,
+                rerank_ms,
+                parse_ms,
+                sparse_setup_ms,
+                sparse_scoring_ms,
+                lexical_merge_ms,
+                posting_scoring_ms,
+                candidate_accumulation_ms,
+                metadata_ms,
+                candidate_rank_ms,
+                graph_ms,
+                entity_graph_ms,
+                sequence_rerank_ms,
+                evidence_ms,
+                group_build_ms,
                 group_sort_ms,
                 candidates.len()
             );

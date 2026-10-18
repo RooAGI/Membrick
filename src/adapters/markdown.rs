@@ -223,7 +223,9 @@ pub fn build_markdown_corpus(
             .modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs().to_string());
+            .and_then(|duration| {
+                crate::temporal::normalize_timestamp(&format!("unix:{}", duration.as_secs()))
+            });
         let frontmatter = parse_frontmatter_kv(&page.content);
         if let Some(supersedes) = frontmatter
             .get("supersedes")

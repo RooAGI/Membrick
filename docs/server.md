@@ -46,7 +46,20 @@ server_token = "replace-with-a-secret"
 tenant_id = "team-a"
 adaptive_segment_max_n = 32
 jwt_secret = "replace-with-a-secret"
+
+# Optional freshness override. The default is relative freshness for
+# CurrentState queries only.
+[freshness]
+mode = "relative" # relative, legacy, or disabled
+half_life_days = 30.0
+weight = 0.25
 ```
+
+`freshness` is read at server startup from the same settings file. Relative
+freshness is query-time only and does not rebuild the index. The same effective
+policy is used by ordinary and structured retrieval. Omit the table to use the
+default CurrentState-only relative policy. Set `mode = "legacy"` to restore the
+previous ranking policy, or `mode = "disabled"` to disable generic freshness.
 
 Keep secrets in a user-private settings file and restrict its filesystem
 permissions. The server does not read configuration from environment variables.

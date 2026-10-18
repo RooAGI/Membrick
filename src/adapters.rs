@@ -76,6 +76,9 @@ pub fn graph_to_source_documents(graph: &Graph) -> Vec<SourceDocument> {
         .map(|p| {
             let t0 = tier0_by_source.get(&p.rel_path).copied();
             let mut filters = BTreeMap::new();
+            if t0.and_then(|record| record.timestamp.as_ref()).is_some() {
+                filters.insert("timestamp_kind".to_string(), "source_modified".to_string());
+            }
             if let Some(supersedes_id) = t0.and_then(|record| record.metadata.get("supersedes_id"))
             {
                 filters.insert("supersedes_id".to_string(), supersedes_id.clone());

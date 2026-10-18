@@ -13,7 +13,7 @@ use crate::segments::relations::{
 };
 use crate::session_prepare::is_follow_up;
 use crate::{IndexStore, SourceDocument};
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -1199,7 +1199,8 @@ fn structured_fact_results_with_rules(
     // stays defensive against index/query skew.
     let by_id: HashMap<&str, &SourceDocument> =
         visible.iter().map(|d| (d.doc_id.as_str(), *d)).collect();
-    hits.into_iter()
+    let results = hits
+        .into_iter()
         .filter_map(|hit| {
             let doc = by_id.get(hit.doc_id.as_str())?;
             Some(crate::SearchResult {
@@ -1219,7 +1220,8 @@ fn structured_fact_results_with_rules(
                 comparison_operands: Vec::new(),
             })
         })
-        .collect()
+        .collect();
+    results
 }
 
 /// Return `Some(results)` when native claims support the query's personal
@@ -1433,6 +1435,77 @@ fn blend_structured_first(
             .take(room),
     );
     blended
+}
+
+/// Apply relative freshness after MemoryService has merged lexical and
+/// structured results and completed its other rerankers. Structured facts
+/// retain their established priority tier; freshness only reorders results
+/// within each tier.
+fn apply_relative_freshness(
+    store: &IndexStore,
+    prepared: &PreparedQuery,
+    mut results: Vec<crate::SearchResult>,
+) -> Vec<crate::SearchResult> {
+    let policy = store.options().freshness_policy;
+    let context = prepared.temporal_context();
+    let weight = policy.weight_for_intent(context.intent);
+    if policy.mode != crate::temporal::FreshnessMode::Relative
+        || context.has_explicit_temporal
+        || weight <= 0.0
+    {
+        return results;
+    }
+    let Some(as_of) = context
+        .freshness_as_of
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|date| Utc.from_utc_datetime(&date))
+    else {
+        return results;
+    };
+
+    for result in &mut results {
+        let timestamp = store
+            .record_by_id(&result.doc_id)
+            .and_then(|record| record.timestamp.as_deref());
+        if let Some(delta) = crate::temporal::relative_freshness_delta(
+            result.score,
+            timestamp,
+            as_of,
+            policy.half_life_days,
+            weight,
+        ) {
+            result.score += delta;
+            result.score_breakdown.recency_score += delta;
+        }
+    }
+
+    sort_by_adjusted_score_with_structured_priority(results)
+}
+
+fn sort_by_adjusted_score_with_structured_priority(
+    results: Vec<crate::SearchResult>,
+) -> Vec<crate::SearchResult> {
+    let mut structured = Vec::new();
+    let mut lexical = Vec::new();
+    for result in results {
+        if result.relation_evidence.is_empty() {
+            lexical.push(result);
+        } else {
+            structured.push(result);
+        }
+    }
+    // `sort_by` is stable: equal scores retain the preceding retrieval order.
+    // A secondary doc-ID ordering would reshuffle ties even at weight zero.
+    let by_adjusted_score = |a: &crate::SearchResult, b: &crate::SearchResult| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    structured.sort_by(by_adjusted_score);
+    lexical.sort_by(by_adjusted_score);
+    structured.extend(lexical);
+    structured
 }
 
 /// Merge independently ranked comparison sides while keeping both sides
@@ -3083,7 +3156,17 @@ impl MemoryService {
             session_id,
             query,
         );
-        let depth = if do_rerank {
+        let temporal_context = prepared.temporal_context();
+        let freshness_policy = self.store.options().freshness_policy;
+        let relative_freshness_enabled = freshness_policy.mode
+            == crate::temporal::FreshnessMode::Relative
+            && !temporal_context.has_explicit_temporal
+            && freshness_policy.weight_for_intent(temporal_context.intent) > 0.0
+            && temporal_context
+                .freshness_as_of
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                .is_some();
+        let depth = if do_rerank || relative_freshness_enabled {
             top_k.max(RERANK_DEEP_TOP_K)
         } else {
             top_k
@@ -3188,7 +3271,11 @@ impl MemoryService {
                 filters,
                 RERANK_WEIGHTS,
             );
-            lexical.truncate(top_k);
+            lexical.truncate(if relative_freshness_enabled {
+                depth
+            } else {
+                top_k
+            });
         }
         // Structured-fact path: dependency-parse relation evidence blends
         // ahead of the lexical results. The ownership filter comes from the
@@ -3205,7 +3292,11 @@ impl MemoryService {
                     query: query.to_string(),
                     options: None,
                     user_id,
-                    top_k,
+                    top_k: if relative_freshness_enabled {
+                        depth
+                    } else {
+                        top_k
+                    },
                     session_id: session_id.map(String::from),
                     scope: Some(scope.to_string()),
                     filters: None,
@@ -3220,12 +3311,22 @@ impl MemoryService {
                 )
             }
         };
-        let results = blend_structured_first(structured, lexical, top_k);
+        let results = blend_structured_first(
+            structured,
+            lexical,
+            if relative_freshness_enabled {
+                depth
+            } else {
+                top_k
+            },
+        );
         // Session tag link expansion (Luyi 2026-10-07): when a doc is boosted
         // via its tags, other docs in the same session sharing those tags
         // get boosted too. Also handles question-type routing ("where"->venue,
         // "when"->temporal). Supplements (not replaces) per-document tag BM25.
         let results = self.apply_session_tag_link_boost(results, session_id, query);
+        let mut results = apply_relative_freshness(&self.store, &prepared, results);
+        results.truncate(top_k);
         observe_session_search(
             &self.conversation_states,
             scope,
@@ -5952,6 +6053,87 @@ mod tests {
 
     fn service() -> MemoryService {
         MemoryService::in_memory(PipelineOptions::default())
+    }
+
+    #[test]
+    fn relative_freshness_runs_once_after_memoryservice_result_merge() {
+        let policy = crate::temporal::FreshnessPolicy {
+            mode: crate::temporal::FreshnessMode::Relative,
+            ..crate::temporal::FreshnessPolicy::default()
+        };
+        let mut service = MemoryService::in_memory(PipelineOptions {
+            freshness_policy: policy,
+            structured_fact_retrieval: false,
+            conversational_rerank: false,
+            ..PipelineOptions::default()
+        });
+        for (doc_id, timestamp) in [
+            ("freshness-old", "2024-05-02T12:00:00Z"),
+            ("freshness-latest", "2024-07-01T12:00:00Z"),
+        ] {
+            let mut document = direct_doc(doc_id, "Aurora release policy uses staged rollout.");
+            document.timestamp = Some(timestamp.to_string());
+            document
+                .filters
+                .insert(USER_FILTER.into(), "freshness-test-user".into());
+            service.upsert(document);
+        }
+        service.refresh_index().unwrap();
+
+        let hits = service
+            .search_with_filters(
+                "latest Aurora release policy",
+                "user",
+                None,
+                2,
+                &BTreeMap::from([(USER_FILTER.into(), "freshness-test-user".into())]),
+                Some("2024-07-01"),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.first().map(|hit| hit.doc_id.as_str()),
+            Some("freshness-latest"),
+            "MemoryService should apply relative freshness after candidate retrieval"
+        );
+        assert!(hits[0].score_breakdown.recency_score > hits[1].score_breakdown.recency_score);
+    }
+
+    #[test]
+    fn relative_freshness_sort_preserves_order_for_equal_scores() {
+        let result = |doc_id: &str, score: f32, structured: bool| crate::SearchResult {
+            doc_id: doc_id.into(),
+            source: String::new(),
+            group_id: None,
+            score,
+            score_breakdown: crate::index::ScoreBreakdown::default(),
+            matched_entities: Vec::new(),
+            matched_terms: Vec::new(),
+            probable_topic: None,
+            doc_type_guess: None,
+            semantic_status: None,
+            superseded_by: None,
+            relation_confidence: None,
+            relation_evidence: structured
+                .then(|| "claim".to_string())
+                .into_iter()
+                .collect(),
+            comparison_operands: Vec::new(),
+        };
+
+        let sorted = sort_by_adjusted_score_with_structured_priority(vec![
+            result("z-first", 3.0, false),
+            result("a-second", 3.0, false),
+            result("structured", 1.0, true),
+        ]);
+
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["structured", "z-first", "a-second"],
+            "equal-score results must retain the retrieval order within each tier"
+        );
     }
 
     #[test]
