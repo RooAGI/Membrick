@@ -238,6 +238,27 @@ pub(crate) fn record_mcp_tool_response(
     } else {
         None
     };
+    if tool == "search"
+        && prepared_trace.is_none()
+        && response
+            .as_ref()
+            .is_ok_and(|response| response.error.is_none())
+    {
+        let id = response
+            .as_ref()
+            .ok()
+            .and_then(|response| response.id.clone());
+        *response = Ok(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32603,
+                message: "search results could not be assigned a review ID; retry the search"
+                    .to_string(),
+            }),
+        });
+    }
     let (error, payload) = match response {
         Ok(response) => (
             response.error.is_some(),
@@ -290,6 +311,27 @@ pub(crate) fn record_mcp_tool_response(
     };
     if let Err(error) = record {
         eprintln!("Membrick could not append MCP call history: {error:#}");
+        if tool == "search"
+            && response
+                .as_ref()
+                .is_ok_and(|response| response.error.is_none())
+        {
+            let id = response
+                .as_ref()
+                .ok()
+                .and_then(|response| response.id.clone());
+            *response = Ok(JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!(
+                        "search results could not be saved for review; retry the search ({error:#})"
+                    ),
+                }),
+            });
+        }
     }
 }
 
@@ -654,10 +696,32 @@ fn format_search_results(
             // Anchor relative date expressions ("yesterday", "last month") to
             // an absolute date the agent can see. Fail-open: memories without
             // a timestamp keep their original text.
-            let content = match document.timestamp.as_deref() {
-                Some(date) => format!("[session date: {date}]\n{content}"),
-                None => content,
+            let timestamp_kind = document.timestamp_kind();
+            let timestamp = document
+                .timestamp
+                .as_deref()
+                .and_then(crate::temporal::normalize_timestamp);
+            let content = match (timestamp_kind, timestamp.as_deref()) {
+                (crate::source::TimestampKind::Session, Some(date)) => {
+                    format!("[session date: {date}]\n{content}")
+                }
+                (crate::source::TimestampKind::UserSupplied, Some(date)) => {
+                    format!("[memory date: {date}]\n{content}")
+                }
+                _ => content,
             };
+            let created_at = matches!(
+                timestamp_kind,
+                crate::source::TimestampKind::Session | crate::source::TimestampKind::UserSupplied
+            )
+            .then(|| timestamp.clone())
+            .flatten();
+            let modified_at = (timestamp_kind == crate::source::TimestampKind::SourceModified)
+                .then(|| timestamp.clone())
+                .flatten();
+            let event_at = (timestamp_kind == crate::source::TimestampKind::WorkspaceEvent)
+                .then(|| timestamp.clone())
+                .flatten();
             Some(json!({
                 "id": result.doc_id,
                 "doc_id": result.doc_id,
@@ -666,7 +730,10 @@ fn format_search_results(
                 "source": result.source,
                 "content": content,
                 "score": result.score,
-                "created_at": document.timestamp.clone(),
+                "created_at": created_at,
+                "modified_at": modified_at,
+                "event_at": event_at,
+                "timestamp_kind": timestamp_kind.as_str(),
                 "session_id": document.group_id.clone(),
                 "matched_terms": result.matched_terms,
                 "matched_entities": result.matched_entities,
@@ -1159,7 +1226,7 @@ pub(crate) fn memory_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "review_search".to_string(),
-            description: "Review MCP searches. Omit search_id to page through unreviewed searches with cursor and page_size. Supply search_id to retrieve that exact query, result, and available source documents. Reading a page does not mark a search reviewed.".to_string(),
+            description: "Review recorded MCP searches through the resident's in-memory lookup index. The first request may return status=indexing while it rebuilds from telemetry; retry shortly. Omit search_id to page through unreviewed searches with cursor and page_size. Supply search_id to retrieve that exact query, result, and available source documents. Reading a page does not mark a search reviewed.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1412,20 +1479,30 @@ pub(crate) fn call_board_or_memory_tool(
                 write_arguments["session_id"] = json!(session_id);
             }
         }
-        match crate::memory_api::MemoryService::with_shared_memory(root, |store| {
-            dispatch_write_tool(
-                tool_name,
-                &write_arguments,
-                store,
-                "mcp",
-                &workspace,
-                provider,
-                root,
-            )
-            .map_err(anyhow::Error::msg)
-        }) {
-            Ok(value) => Ok(value),
-            Err(error) => Err(format!("{error:#}")),
+        if tool_name == "search_feedback" {
+            // Feedback must use the resident's search-history locator and
+            // review-state caches. Opening a temporary shared-memory service
+            // here gives feedback an empty locator map and makes a just
+            // recorded search look like it is still indexing (or absent).
+            service
+                .search_feedback_mcp(root, &write_arguments)
+                .map_err(|error| format!("{error:#}"))
+        } else {
+            match crate::memory_api::MemoryService::with_shared_memory(root, |store| {
+                dispatch_write_tool(
+                    tool_name,
+                    &write_arguments,
+                    store,
+                    "mcp",
+                    &workspace,
+                    provider,
+                    root,
+                )
+                .map_err(anyhow::Error::msg)
+            }) {
+                Ok(value) => Ok(value),
+                Err(error) => Err(format!("{error:#}")),
+            }
         }
     } else {
         match tool_name {
@@ -1443,7 +1520,7 @@ pub(crate) fn call_board_or_memory_tool(
         }
     };
     #[cfg(test)]
-    if is_write && result.is_ok() {
+    if is_write && tool_name != "search_feedback" && result.is_ok() {
         service.sync_shared_memory(&crate::integrations::mcp_index::shared_memory_root(root))?;
     }
     match result {
@@ -1668,15 +1745,29 @@ mod tests {
         .unwrap();
 
         let mut service = memory_service();
-        let page = call_board_or_memory_tool(
-            "review_search",
-            Some(json!(92)),
-            &json!({"page_size":10}),
-            &mut service,
-            &root,
-            "codex",
-        )
-        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            let page = call_board_or_memory_tool(
+                "review_search",
+                Some(json!(92)),
+                &json!({"page_size":10}),
+                &mut service,
+                &root,
+                "codex",
+            )
+            .unwrap();
+            let body = page.result.as_ref().unwrap()["content"][0]["text"]
+                .as_str()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if body.as_ref().and_then(|body| body.get("status")).is_none() {
+                break page;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search history index did not become ready: {body:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let page_text = page.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -1893,6 +1984,39 @@ mod tests {
             Some(text.as_str())
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_search_is_not_returned_when_history_cannot_be_appended() {
+        let root = std::env::temp_dir().join(format!(
+            "membrick-search-history-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".membrick/mcp-call-history.lock")).unwrap();
+        let mut response = Ok(JsonRpcResponse {
+            jsonrpc: "2.0",
+            id: Some(json!(9)),
+            result: Some(json!({
+                "content":[{"type":"text","text":"{\"results\":[{\"id\":\"doc-1\"}]}"}]
+            })),
+            error: None,
+        });
+
+        record_mcp_tool_response(
+            &root,
+            "codex",
+            "search",
+            Some(json!(9)),
+            &json!({"query":"example"}),
+            2,
+            &mut response,
+        );
+
+        let response = response.unwrap();
+        assert!(response.error.is_some(), "unrecorded success was returned");
+        assert!(response.result.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2258,7 +2382,7 @@ mod tests {
                 source: "codex://project/session-1/outcome".to_string(),
                 content: "we deployed yesterday".to_string(),
                 concept: "outcome".to_string(),
-                group_id: Some("session-1".to_string()),
+                group_id: Some("codex-session:project:session-1".to_string()),
                 filters: BTreeMap::new(),
                 headings: vec![],
                 links: vec![],
@@ -2273,7 +2397,7 @@ mod tests {
             SearchResult {
                 doc_id: doc_id.to_string(),
                 source: "codex://project/session-1/outcome".to_string(),
-                group_id: Some("session-1".to_string()),
+                group_id: Some("codex-session:project:session-1".to_string()),
                 score: 1.0,
                 score_breakdown: crate::index::ScoreBreakdown::default(),
                 matched_entities: Vec::new(),
@@ -2291,10 +2415,37 @@ mod tests {
         let mut store = IndexStore::in_memory(PipelineOptions::default());
         store.upsert(memory("dated", Some("2026-09-20T10:00:00Z")));
         store.upsert(memory("undated", None));
+        let mut file = memory("file-modified", Some("1792220974"));
+        file.source = "docs/guide.md".to_string();
+        file.group_id = None;
+        file.filters
+            .insert("timestamp_kind".to_string(), "source_modified".to_string());
+        file.content = "Repository guide contents".to_string();
+        store.upsert(file);
+        let mut event = memory("file-event", Some("1792220974000"));
+        event.source = "membrick://workspace/file-change/abc".to_string();
+        event.group_id = Some("workspace-file-changes".to_string());
+        event.filters.insert(
+            "source_type".to_string(),
+            "workspace-file-change".to_string(),
+        );
+        event
+            .filters
+            .insert("timestamp_kind".to_string(), "workspace_event".to_string());
+        event.content = "Workspace file change".to_string();
+        store.upsert(event);
         let service = MemoryService::new(store);
-        let payload = search_results(&service, vec![hit("dated"), hit("undated")]);
+        let payload = search_results(
+            &service,
+            vec![
+                hit("dated"),
+                hit("undated"),
+                hit("file-modified"),
+                hit("file-event"),
+            ],
+        );
         let results = payload["results"].as_array().unwrap();
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 4);
         assert_eq!(results[0]["doc_id"], "dated");
         assert_eq!(results[0]["rank"], 1);
         assert_eq!(results[1]["doc_id"], "undated");
@@ -2302,7 +2453,8 @@ mod tests {
 
         let dated = &results[0];
         assert_eq!(dated["created_at"], "2026-09-20T10:00:00Z");
-        assert_eq!(dated["session_id"], "session-1");
+        assert_eq!(dated["timestamp_kind"], "session");
+        assert_eq!(dated["session_id"], "codex-session:project:session-1");
         let content = dated["content"].as_str().unwrap();
         let indexed_dated = service.source_document_by_id("dated").unwrap();
         assert_eq!(
@@ -2319,6 +2471,22 @@ mod tests {
         let undated = &results[1];
         assert!(undated["created_at"].is_null());
         assert_eq!(undated["content"], "we deployed yesterday");
+
+        let file_modified = &results[2];
+        assert_eq!(file_modified["timestamp_kind"], "source_modified");
+        assert!(file_modified["created_at"].is_null());
+        assert_eq!(file_modified["modified_at"], "2026-10-17T07:09:34Z");
+        assert_eq!(file_modified["content"], "Repository guide contents");
+        assert!(!file_modified["content"]
+            .as_str()
+            .unwrap()
+            .contains("session date"));
+
+        let file_event = &results[3];
+        assert_eq!(file_event["timestamp_kind"], "workspace_event");
+        assert!(file_event["created_at"].is_null());
+        assert_eq!(file_event["event_at"], "2026-10-17T07:09:34Z");
+        assert_eq!(file_event["content"], "Workspace file change");
     }
 
     #[cfg(any(

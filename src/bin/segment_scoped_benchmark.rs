@@ -507,6 +507,9 @@ fn run_scoped_benchmark(
             query_routing_intent: analysis.query_routing_intent,
             evidence_requirements: analysis.evidence_requirements,
             has_explicit_temporal: analysis.temporal.is_some(),
+            intent: analysis.intent,
+            freshness_as_of: Some(entry.question_date.as_str()),
+            freshness_policy: crate::temporal::FreshnessPolicy::default(),
         };
         let (results, timings, diagnostics) =
             index.query_with_temporal_context(&query_text, max_k, temporal);

@@ -49,8 +49,8 @@ judge the result automatically.
 
 | Tool | Purpose |
 |---|---|
-| `search` | Search the indexed workspace and return ranked results. Requires `query`; accepts `top_k` (1–20). Each hit carries `doc_id`, its original 1-based `rank`, `source_hash`, `created_at`, and `session_id`; hit text is prefixed with `[session date: ...]` when available. Use `doc_id` and `source_hash` as the target and expected revision when calling `enrich_doc`. The response includes a stable `search_id`. If results miss the question or important context, call `search_feedback` with an overall label and one document judgment for every returned hit; adequate results need no feedback call. |
-| `review_search` | With no `search_id`, return a page of unreviewed searches. Accepts optional `cursor` and `page_size` (default 10, maximum 100). With `search_id`, return that exact recorded search, its result, and available source documents, whether or not it was reviewed. Reading does not mark a search reviewed. |
+| `search` | Search the indexed workspace and return ranked results. Requires `query`; accepts `top_k` (1–20). Each hit carries `doc_id`, its original 1-based `rank`, `source_hash`, `timestamp_kind`, and the applicable time field: `created_at` for session or explicitly dated memory, `modified_at` for source files, or `event_at` for workspace events. Hit text gets a `[session date: ...]` prefix only when the timestamp describes a session; source modification times and workspace event times remain metadata. Recognized Unix-second and Unix-millisecond values are normalized to UTC RFC 3339 before indexing and output. Use `doc_id` and `source_hash` as the target and expected revision when calling `enrich_doc`. The response includes a stable `search_id`. If results miss the question or important context, call `search_feedback` with an overall label and one document judgment for every returned hit; adequate results need no feedback call. |
+| `review_search` | Uses a resident-owned in-memory locator rebuilt from the telemetry ledger in background batches. The first request can return `status: indexing` with progress; retry shortly. With no `search_id`, return a bounded page of unreviewed searches using `cursor` and `page_size` (default 10, maximum 100); pages are limited by examined records, source bytes, and an 8 MiB response budget. Oversized and malformed history rows are skipped and counted in `oversized_records_skipped` and `malformed_records_skipped`; `first_malformed_offset` identifies the first malformed row. Ambiguous duplicate search IDs are skipped in pages and counted in `ambiguous_searches_skipped`, but exact lookup for that ID remains an error. With `search_id`, return that exact recorded search, its result, and source documents for the returned hits only, whether or not it was reviewed. If an exact ID is absent while malformed or oversized rows exist, return `status: history_incomplete` because absence cannot be confirmed. Source document content is an 8 KiB UTF-8-safe preview; `content_bytes`, `content_truncated`, and the full-document `source_hash` identify the original revision. Reading does not mark a search reviewed. |
 | `search_feedback` | Submit an overall usefulness label, explanation, and a relevance judgment (`relevant`, `partially_relevant`, or `not_relevant`) for every document returned by one `search_id`. The service validates complete coverage and records the original rank and source hash from the immutable search snapshot. It may include grounded additions to supported query-only rules. Judgments support evaluation; they do not immediately change ranking or source documents. |
 | `enrich_doc` | Enrich one existing source document by `doc_id`, using its expected source hash and hash-cited evidence documents. Routes the validated update through `MemoryService`; it does not label a search. |
 | `info` | Return the workspace root, indexed document count, and the transport and endpoint that served the current request. |
@@ -93,12 +93,16 @@ policy. Tool and hook failures are fail-open so the host agent can continue.
 
 For HTTP deployment and authentication, see [Server and MCP](server.md).
 
-Search review reads the local `.membrick/mcp-call-history.jsonl` ledger. With
-no `search_id`, `review_search` scans from the supplied cursor and returns up
-to `page_size` unreviewed search records. The cursor is opaque: pass it back
-unchanged. It includes a history-prefix fingerprint, so replacing or editing
-the already-read part of the ledger invalidates it. A page can contain fewer
-than `page_size` results if reviewed entries were skipped. Supplying
+Search review uses `.membrick/mcp-call-history.jsonl` as the sole durable
+source. The resident rebuilds an in-memory map of search IDs to byte locations
+in 1 MiB batches and tails new records periodically. If the map is behind, the
+tool returns `status: indexing` with byte progress rather than scanning the
+ledger in the request. With no `search_id`, `review_search` reads at most 500
+indexed search locations per call and returns up to `page_size` unreviewed
+records. The cursor is opaque: pass it back unchanged. It identifies the
+history file generation and a record boundary; replacing the history file
+invalidates it. A page can contain fewer than `page_size` results if reviewed
+entries were skipped or a work/response limit was reached. Supplying
 `search_id` returns that exact search even if it has already received
 feedback. Reading a page or exact search does not mark anything reviewed.
 

@@ -739,30 +739,27 @@ fn lifecycle_category(event_name: &str) -> &'static str {
 }
 
 struct TelemetryLock {
-    path: std::path::PathBuf,
+    file: fs::File,
 }
 
 fn acquire_telemetry_lock(path: &Path) -> Result<TelemetryLock> {
+    use fs4::fs_std::FileExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
     for _ in 0..500 {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(_) => {
-                return Ok(TelemetryLock {
-                    path: path.to_path_buf(),
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(error) => return Err(error.into()),
+        if file.try_lock_exclusive()? {
+            return Ok(TelemetryLock { file });
         }
+        thread::sleep(Duration::from_millis(2));
     }
     anyhow::bail!("timed out waiting for provider telemetry lock")
-}
-
-impl Drop for TelemetryLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -1144,6 +1141,30 @@ mod tests {
         assert!(record.trace_id.is_some());
         assert!(record.session_id.is_none());
         assert_eq!(record.session_attribution, "absent");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn existing_unlocked_telemetry_lock_file_does_not_block_append() {
+        let directory = test_directory();
+        let membrick = directory.join(".membrick");
+        fs::create_dir_all(&membrick).unwrap();
+        fs::write(membrick.join("mcp-call-history.lock"), b"stale lock marker").unwrap();
+
+        record_mcp_call(
+            &directory,
+            "claude",
+            "search",
+            None,
+            &serde_json::json!({"query":"recover from stale marker"}),
+            1,
+            false,
+            serde_json::json!({"results": []}),
+        )
+        .expect("an unlocked lock file left by a crashed process must be reusable");
+
+        let history = fs::read_to_string(membrick.join(MCP_CALL_HISTORY_FILE)).unwrap();
+        assert_eq!(history.lines().count(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 

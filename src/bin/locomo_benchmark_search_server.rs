@@ -180,6 +180,7 @@ fn build_conv_index(conv: &LocomoConversation) -> Result<ConvIndex> {
             }
             let mut filters = BTreeMap::new();
             filters.insert("memory_user_id".to_string(), LOCOMO_USER_ID.to_string());
+            filters.insert("timestamp_kind".to_string(), "session".to_string());
             let doc_id = format!("{group_id}::turn{turn_idx}");
             rel_turns.push(RelationTurn {
                 speaker: turn.speaker.clone(),
@@ -456,6 +457,7 @@ mod tests {
         let mut service = MemoryService::in_memory(options);
         let mut filters = BTreeMap::new();
         filters.insert("memory_user_id".to_string(), LOCOMO_USER_ID.to_string());
+        filters.insert("timestamp_kind".to_string(), "session".to_string());
         service.upsert(SourceDocument {
             doc_id: "conv-1::session_1::turn0".to_string(),
             source: "locomo/conv-1/session/1/turn/0".to_string(),

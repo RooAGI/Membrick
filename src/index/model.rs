@@ -1,4 +1,4 @@
-use crate::query_semantics::{QueryEvidenceRequirements, QueryRoutingIntent};
+use crate::query_semantics::{QueryEvidenceRequirements, QueryIntent, QueryRoutingIntent};
 use crate::source::KeyPhrase;
 use crate::tier1::{RankedTerm, Tier1Entity};
 use chrono::NaiveDate;
@@ -760,6 +760,11 @@ pub struct TemporalQueryContext<'a> {
     pub query_routing_intent: Option<QueryRoutingIntent>,
     pub evidence_requirements: QueryEvidenceRequirements,
     pub has_explicit_temporal: bool,
+    /// Query intent determines how much freshness can influence ranking.
+    pub intent: QueryIntent,
+    /// One request-scoped reference date shared by all routed segments.
+    pub freshness_as_of: Option<&'a str>,
+    pub freshness_policy: crate::temporal::FreshnessPolicy,
     pub allowed_doc_ids: Option<&'a HashSet<String>>,
     pub allowed_doc_bitmap: Option<&'a RoaringBitmap>,
     pub allowed_segment_doc_bitmaps: Option<&'a HashMap<String, RoaringBitmap>>,
@@ -778,6 +783,9 @@ impl<'a> Default for TemporalQueryContext<'a> {
             query_routing_intent: None,
             evidence_requirements: QueryEvidenceRequirements::default(),
             has_explicit_temporal: false,
+            intent: QueryIntent::Lookup,
+            freshness_as_of: None,
+            freshness_policy: crate::temporal::FreshnessPolicy::default(),
             allowed_doc_ids: None,
             allowed_doc_bitmap: None,
             allowed_segment_doc_bitmaps: None,

@@ -163,9 +163,16 @@ fn query_prefers_latest_equally_relevant_conversation_memory() {
     );
     old.timestamp = Some(format!("{}T12:00:00Z", today - chrono::Duration::days(180)));
 
+    // These direct snapshot queries exercise the legacy absolute recency
+    // signal. Relative freshness is intentionally applied later by
+    // MemoryService after retrieval and reranking.
     let index = build_query_snapshot(&[old, latest], &PipelineOptions::default())
         .expect("conversation memories should build");
-    let results = index.query("Aurora rollout decision", 2);
+    let mut temporal = TemporalQueryContext::default();
+    temporal.freshness_policy.mode = crate::temporal::FreshnessMode::Legacy;
+    let results = index
+        .query_with_temporal_context("Aurora rollout decision", 2, temporal)
+        .0;
 
     assert_eq!(
         results.first().map(|result| result.doc_id.as_str()),
@@ -191,7 +198,11 @@ fn query_prefers_current_markdown_guidance_when_wording_changes() {
 
     let index = build_query_snapshot(&[old, current], &PipelineOptions::default())
         .expect("Markdown-like ownership guidance should build");
-    let results = index.query("who is responsible for valve control", 2);
+    let mut temporal = TemporalQueryContext::default();
+    temporal.freshness_policy.mode = crate::temporal::FreshnessMode::Legacy;
+    let results = index
+        .query_with_temporal_context("who is responsible for valve control", 2, temporal)
+        .0;
 
     assert_eq!(
         results.first().map(|result| result.doc_id.as_str()),

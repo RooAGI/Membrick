@@ -106,9 +106,11 @@ def main() -> int:
     replace_marker("src/integrations/openclaw/plugin/openclaw.plugin.json",
                    f'"version":"{OLD_VERSION}"', f'"version":"{version}"')
     replace_marker(".github/workflows/python-publish.yml", f"default: v{OLD_VERSION}", f"default: v{version}")
-    # The homepage can lag behind Cargo.toml, so update its displayed version
-    # independently instead of assuming its current copy matches OLD_VERSION.
-    replace_pattern("docs/index.md", r"Version \d+\.\d+\.\d+", f"Version {version}")
+    # The homepage may display a package version, but the current design does
+    # not require a version banner. Update it only when that display exists.
+    homepage = ROOT / "docs/index.md"
+    if re.search(r"Version \d+\.\d+\.\d+", homepage.read_text()):
+        replace_pattern("docs/index.md", r"Version \d+\.\d+\.\d+", f"Version {version}")
     replace_marker("docs/docker.md", f":{OLD_VERSION}", f":{version}")
     replace_marker("docs/docker.md", f"image.tag={OLD_VERSION}", f"image.tag={version}")
 

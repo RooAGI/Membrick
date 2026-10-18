@@ -83,6 +83,7 @@ nav:
       - Claim contract: claim-contract.md
       - MemoryService API: memory-service-api.md
       - Temporal query resolution: temporal-query-resolution.md
+      - Freshness ranking plan: freshness-ranking-plan.md
       - Corpus graph: build-corpus-graph.md
       - Integration glossary: integration-glossary.md
       - Chunk strategy: chunk-strategy.md
@@ -115,6 +116,7 @@ nav:
       - Python migration: python-migration-0.3.0.md
   - Releases:
       - Release checklist: release-checklist.md
+      - 0.6.3: releases/0.6.3.md
       - 0.6.2: releases/0.6.2.md
       - 0.6.1: releases/0.6.1.md
       - 0.6.0: releases/0.6.0.md

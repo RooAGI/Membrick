@@ -1,5 +1,10 @@
 # Document enrichment implementation plan
 
+The proposed [search review storage design](search-review-storage-plan.md)
+uses a resident in-memory lookup map rebuilt from existing MCP telemetry,
+with bounded recovery and pagination. It adds no database or persistent
+locator files. These changes are not implemented yet.
+
 Status: implementation in progress on `feat/document-enrichment`. The shared
 MCP router exposes `review_search`, `search_feedback`, and `enrich_doc`, assigns
 search IDs, pages unreviewed history, and routes evidence-checked document

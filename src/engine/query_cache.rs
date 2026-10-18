@@ -399,11 +399,9 @@ mod tests {
         assert_eq!(query_cache_file(&s).parent(), Some(dir.as_path()));
         assert_eq!(query_cache_core_file(&s).parent(), Some(dir.as_path()));
         assert_eq!(query_cache_lexical_dir(&s).parent(), Some(dir.as_path()));
-        assert!(
-            query_cache_lexical_dir(&s)
-                .extension()
-                .is_some_and(|ext| ext == "tantivy")
-        );
+        assert!(query_cache_lexical_dir(&s)
+            .extension()
+            .is_some_and(|ext| ext == "tantivy"));
         // The historical bug: a bare relative path resolved against the
         // process working directory instead of the corpus.
         assert_ne!(dir, PathBuf::from(".membrick-cache"));

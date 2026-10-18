@@ -607,6 +607,7 @@ pub(crate) fn memory_index_pipeline_options(
         conversational_rerank: true,
         structured_fact_retrieval: true,
         key_phrase_enrichment: false,
+        freshness_policy: crate::temporal::FreshnessPolicy::default(),
         extractor_script: None,
     }
 }

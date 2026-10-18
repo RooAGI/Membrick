@@ -1300,11 +1300,7 @@ fn show_project_status(project_root: &Path) -> Result<()> {
             .flatten()
             .filter_map(std::result::Result::ok)
             .filter(|entry| {
-                entry.path().is_dir()
-                    && entry
-                        .file_name()
-                        .to_string_lossy()
-                        .ends_with(".tantivy")
+                entry.path().is_dir() && entry.file_name().to_string_lossy().ends_with(".tantivy")
             })
             .count();
         println!(

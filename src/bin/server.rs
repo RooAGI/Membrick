@@ -123,6 +123,7 @@ struct ServerSettings {
     tenant_id: Option<String>,
     jwt_secret: Option<String>,
     adaptive_segment_max_n: Option<usize>,
+    freshness: Option<crate::temporal::FreshnessPolicy>,
 }
 
 fn settings_path(args: &Args) -> anyhow::Result<PathBuf> {
@@ -640,7 +641,7 @@ fn open_workspace_owner_at(
     options: PipelineOptions,
 ) -> anyhow::Result<MemoryService> {
     let ignore_paths = provider_memory_ignore_paths();
-    MemoryService::open_workspace_owner_with_options_at(
+    let owner = MemoryService::open_workspace_owner_with_options_at(
         root,
         workspace_root,
         crate::integrations::mcp_index::SHARED_MEMORY_DIR,
@@ -658,7 +659,9 @@ fn open_workspace_owner_at(
             let graph = crate::adapters::apply_ignore_paths(graph, &ignore_paths);
             Ok(crate::adapters::graph_to_source_documents(&graph))
         },
-    )
+    )?;
+    owner.start_search_history_index(root);
+    Ok(owner)
 }
 
 #[tokio::main]
@@ -727,6 +730,11 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         !args.no_conversational_rerank,
         args.segment_routing.strategy(),
     );
+    options.freshness_policy = settings
+        .freshness
+        .unwrap_or_default()
+        .validate()
+        .map_err(anyhow::Error::msg)?;
     options.lang = args.lang;
     let project_root = args
         .project_root
@@ -1558,22 +1566,15 @@ async fn api_search_reviews(
     State(state): State<AppState>,
     Query(query): Query<DashboardSearchReviewsQuery>,
 ) -> impl IntoResponse {
-    match state.service.read() {
-        Ok(service) => match service.dashboard_search_feedback_reviews(
-            &state.project_root,
-            query.offset.unwrap_or_default(),
-            query.page_size.unwrap_or(25),
-        ) {
-            Ok(reviews) => Json(reviews).into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": format!("search reviews unavailable: {error}")})),
-            )
-                .into_response(),
-        },
-        Err(_) => (
+    match crate::memory_api::MemoryService::dashboard_search_feedback_reviews(
+        &state.project_root,
+        query.offset.unwrap_or_default(),
+        query.page_size.unwrap_or(25),
+    ) {
+        Ok(reviews) => Json(reviews).into_response(),
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"search reviews unavailable"})),
+            Json(json!({"detail": format!("search reviews unavailable: {error}")})),
         )
             .into_response(),
     }
@@ -3188,6 +3189,23 @@ fn token_is_valid(supplied: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_settings_load_relative_freshness_and_default_to_relative() {
+        let settings: ServerSettings =
+            toml::from_str("[freshness]\nmode = 'relative'\nhalf_life_days = 45.0\nweight = 0.3\n")
+                .expect("freshness settings should deserialize");
+        let policy = settings.freshness.unwrap().validate().unwrap();
+        assert_eq!(policy.mode, crate::temporal::FreshnessMode::Relative);
+        assert_eq!(policy.half_life_days, 45.0);
+        assert_eq!(policy.weight, 0.3);
+
+        let defaults: ServerSettings = toml::from_str("").expect("empty settings are valid");
+        assert_eq!(
+            defaults.freshness.unwrap_or_default().mode,
+            crate::temporal::FreshnessMode::Relative
+        );
+    }
 
     pub(super) fn security_test_root() -> PathBuf {
         static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

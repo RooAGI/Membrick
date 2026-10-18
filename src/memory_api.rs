@@ -13,11 +13,11 @@ use crate::segments::relations::{
 };
 use crate::session_prepare::is_follow_up;
 use crate::{IndexStore, SourceDocument};
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -88,6 +88,39 @@ fn write_search_review_state(path: &Path, state: &serde_json::Value) -> anyhow::
     Ok(())
 }
 
+#[derive(Default)]
+struct SearchReviewStateIndex {
+    /// Per-project feedback snapshots loaded once by the resident. The JSON
+    /// file remains the durable copy and is atomically rewritten on updates.
+    projects: HashMap<PathBuf, HashMap<String, serde_json::Value>>,
+}
+
+impl SearchReviewStateIndex {
+    fn load_project(
+        &mut self,
+        project_root: &Path,
+    ) -> anyhow::Result<&mut HashMap<String, serde_json::Value>> {
+        let project_root = project_root.to_path_buf();
+        if !self.projects.contains_key(&project_root) {
+            let path = project_root
+                .join(".membrick")
+                .join("search-review-state.json");
+            let state = read_search_review_state(&path)?;
+            let reviews = state["reviews"]
+                .as_object()
+                .expect("validated search review state contains reviews")
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect();
+            self.projects.insert(project_root.clone(), reviews);
+        }
+        Ok(self
+            .projects
+            .get_mut(&project_root)
+            .expect("search review state was loaded"))
+    }
+}
+
 fn parse_mcp_search_history(
     bytes: &[u8],
 ) -> anyhow::Result<Vec<(usize, crate::telemetry::McpCallRecord)>> {
@@ -108,6 +141,386 @@ fn parse_mcp_search_history(
         position = end;
     }
     Ok(records)
+}
+
+const MAX_REVIEW_HISTORY_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REVIEW_DOCUMENT_CONTENT_BYTES: usize = 8 * 1024;
+const MAX_REVIEW_PAGE_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REVIEW_PAGE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const SEARCH_HISTORY_INDEX_BATCH_BYTES: usize = 1024 * 1024;
+const SEARCH_HISTORY_INDEX_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const MAX_REVIEW_PAGE_RECORDS_SCANNED: usize = 500;
+
+#[derive(Debug, Clone, Copy)]
+struct SearchHistoryLocation {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Default)]
+struct SearchHistoryIndexState {
+    initialized: bool,
+    generation: Option<String>,
+    scanned_offset: u64,
+    captured_end: u64,
+    partial_start: u64,
+    partial_line: Vec<u8>,
+    partial_oversized: bool,
+    locations: HashMap<String, SearchHistoryLocation>,
+    ordered_searches: Vec<(u64, String)>,
+    oversized_records: usize,
+    malformed_records: usize,
+    first_malformed_offset: Option<u64>,
+    ambiguous_ids: HashSet<String>,
+    worker_running: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct SearchHistoryIndex {
+    roots: Mutex<HashMap<PathBuf, Arc<Mutex<SearchHistoryIndexState>>>>,
+}
+
+impl SearchHistoryIndex {
+    fn state_for(&self, root: &Path) -> Arc<Mutex<SearchHistoryIndexState>> {
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Arc::clone(
+            roots
+                .entry(root.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(SearchHistoryIndexState::default()))),
+        )
+    }
+
+    fn ensure_worker(self: &Arc<Self>, root: &Path) -> Arc<Mutex<SearchHistoryIndexState>> {
+        let state = self.state_for(root);
+        let should_start = {
+            let mut state_guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            if state_guard.worker_running {
+                false
+            } else {
+                state_guard.worker_running = true;
+                true
+            }
+        };
+        if should_start {
+            let weak_index = Arc::downgrade(self);
+            let history_path = root.join(".membrick").join("mcp-call-history.jsonl");
+            let worker_state = Arc::clone(&state);
+            let spawn = std::thread::Builder::new()
+                .name("search-history-index".into())
+                .spawn(move || {
+                    search_history_index_worker(weak_index, history_path, worker_state);
+                });
+            if let Err(error) = spawn {
+                let mut state_guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+                state_guard.worker_running = false;
+                state_guard.last_error =
+                    Some(format!("failed to start search history index: {error}"));
+            }
+        }
+        state
+    }
+}
+
+#[cfg(unix)]
+fn search_history_generation(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("{}-{}", metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn search_history_generation(metadata: &std::fs::Metadata) -> String {
+    format!("{:?}", metadata.created().ok())
+}
+
+fn search_history_file_identity(path: &Path) -> anyhow::Result<(String, u64)> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok((search_history_generation(&metadata), metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(("missing".to_string(), 0))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn reset_search_history_index(state: &mut SearchHistoryIndexState, generation: String) {
+    state.initialized = false;
+    state.generation = Some(generation);
+    state.scanned_offset = 0;
+    state.captured_end = 0;
+    state.partial_start = 0;
+    state.partial_line.clear();
+    state.partial_oversized = false;
+    state.locations.clear();
+    state.ordered_searches.clear();
+    state.oversized_records = 0;
+    state.malformed_records = 0;
+    state.first_malformed_offset = None;
+    state.ambiguous_ids.clear();
+    state.last_error = None;
+}
+
+fn search_history_index_worker(
+    weak_index: std::sync::Weak<SearchHistoryIndex>,
+    history_path: PathBuf,
+    state: Arc<Mutex<SearchHistoryIndexState>>,
+) {
+    loop {
+        if weak_index.upgrade().is_none() {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = match std::fs::File::open(&history_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let mut state_guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+                    reset_search_history_index(&mut state_guard, "missing".to_string());
+                    state_guard.initialized = true;
+                    state_guard.last_error = None;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            let generation = search_history_generation(&metadata);
+            let end = metadata.len();
+            use std::io::{Read, Seek, SeekFrom};
+            let mut state_guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            if state_guard.generation.as_deref() != Some(generation.as_str())
+                || end < state_guard.scanned_offset
+            {
+                reset_search_history_index(&mut state_guard, generation);
+            }
+            state_guard.initialized = true;
+            state_guard.captured_end = end;
+            state_guard.last_error = None;
+            let remaining = end.saturating_sub(state_guard.scanned_offset);
+            if remaining == 0 {
+                return Ok(());
+            }
+            let take = remaining.min(SEARCH_HISTORY_INDEX_BATCH_BYTES as u64) as usize;
+            let batch_start = state_guard.scanned_offset;
+            file.seek(SeekFrom::Start(batch_start))?;
+            let mut bytes = vec![0u8; take];
+            file.read_exact(&mut bytes)?;
+            for (index, byte) in bytes.iter().copied().enumerate() {
+                let absolute = batch_start + index as u64;
+                if state_guard.partial_line.is_empty() && !state_guard.partial_oversized {
+                    state_guard.partial_start = absolute;
+                }
+                if !state_guard.partial_oversized {
+                    if state_guard.partial_line.len() < MAX_REVIEW_HISTORY_RECORD_BYTES {
+                        state_guard.partial_line.push(byte);
+                    } else {
+                        state_guard.partial_line.clear();
+                        state_guard.partial_oversized = true;
+                    }
+                }
+                if byte == b'\n' {
+                    if state_guard.partial_oversized {
+                        state_guard.oversized_records =
+                            state_guard.oversized_records.saturating_add(1);
+                    } else {
+                        let line = &state_guard.partial_line
+                            [..state_guard.partial_line.len().saturating_sub(1)];
+                        match serde_json::from_slice::<crate::telemetry::McpCallRecord>(line) {
+                            Ok(record) => {
+                                if record.tool == "search" {
+                                    let id = mcp_search_id(&record);
+                                    let location = SearchHistoryLocation {
+                                        offset: state_guard.partial_start,
+                                        length: absolute + 1 - state_guard.partial_start,
+                                    };
+                                    if let Some(previous) = state_guard.locations.get(&id) {
+                                        if previous.offset != location.offset
+                                            || previous.length != location.length
+                                        {
+                                            state_guard.ambiguous_ids.insert(id);
+                                        }
+                                    } else {
+                                        state_guard
+                                            .ordered_searches
+                                            .push((location.offset, id.clone()));
+                                        state_guard.locations.insert(id, location);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                state_guard.malformed_records =
+                                    state_guard.malformed_records.saturating_add(1);
+                                let malformed_offset = state_guard.partial_start;
+                                state_guard
+                                    .first_malformed_offset
+                                    .get_or_insert(malformed_offset);
+                            }
+                        }
+                    }
+                    state_guard.partial_line.clear();
+                    state_guard.partial_oversized = false;
+                    state_guard.partial_start = absolute + 1;
+                }
+            }
+            state_guard.scanned_offset = batch_start + bytes.len() as u64;
+            state_guard.last_error = None;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut state_guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            state_guard.last_error = Some(error.to_string());
+        }
+        std::thread::sleep(SEARCH_HISTORY_INDEX_POLL);
+    }
+}
+
+fn read_search_history_location(
+    history_path: &Path,
+    expected_generation: &str,
+    location: SearchHistoryLocation,
+    expected_id: &str,
+) -> anyhow::Result<crate::telemetry::McpCallRecord> {
+    use std::io::{Read, Seek, SeekFrom};
+    anyhow::ensure!(
+        location.length > 0 && location.length <= MAX_REVIEW_HISTORY_RECORD_BYTES as u64,
+        "indexed search record has an invalid length"
+    );
+    let mut file = std::fs::File::open(history_path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        search_history_generation(&metadata) == expected_generation
+            && location
+                .offset
+                .checked_add(location.length)
+                .is_some_and(|end| end <= metadata.len()),
+        "search history changed; the search index is being rebuilt"
+    );
+    file.seek(SeekFrom::Start(location.offset))?;
+    let mut bytes = vec![0; location.length as usize];
+    file.read_exact(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.last() == Some(&b'\n'),
+        "indexed search record is incomplete"
+    );
+    let record: crate::telemetry::McpCallRecord =
+        serde_json::from_slice(&bytes[..bytes.len() - 1])?;
+    anyhow::ensure!(
+        record.tool == "search" && mcp_search_id(&record) == expected_id,
+        "indexed search record no longer matches its search_id"
+    );
+    Ok(record)
+}
+
+enum SearchHistoryLookup {
+    Found(crate::telemetry::McpCallRecord),
+    Pending(serde_json::Value),
+    Incomplete {
+        malformed_records: usize,
+        oversized_records: usize,
+        first_malformed_offset: Option<u64>,
+    },
+    Absent,
+}
+const MAX_DASHBOARD_ROW_BYTES: usize = 512 * 1024;
+
+#[derive(Serialize)]
+struct ReviewSourceDocument<'a> {
+    doc_id: &'a str,
+    source: &'a str,
+    content: &'a str,
+    concept: &'a str,
+    group_id: &'a Option<String>,
+    headings: &'a [String],
+    links: &'a [String],
+    timestamp: &'a Option<String>,
+    doc_length: usize,
+    author_agent: &'a Option<String>,
+    filters: &'a BTreeMap<String, String>,
+    key_phrases: &'a [crate::source::KeyPhrase],
+    key_phrase_extraction_hash: &'a str,
+}
+
+/// Read one JSONL record without allowing a single telemetry response to
+/// allocate an unbounded buffer. Oversized records are drained to the next
+/// newline so later calls remain reviewable.
+fn read_bounded_history_line<R: std::io::BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<Option<(bool, bool)>> {
+    line.clear();
+    let mut oversized = false;
+    let mut consumed_any = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(consumed_any.then_some((oversized, false)));
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        let terminated = available[take - 1] == b'\n';
+        if !oversized {
+            if line.len().saturating_add(take) <= max_bytes {
+                line.extend_from_slice(&available[..take]);
+            } else {
+                oversized = true;
+                line.clear();
+            }
+        }
+        reader.consume(take);
+        consumed_any = true;
+        if terminated {
+            return Ok(Some((oversized, true)));
+        }
+    }
+}
+
+#[cfg(test)]
+fn find_mcp_search_record(
+    history_path: &Path,
+    search_id: &str,
+) -> anyhow::Result<crate::telemetry::McpCallRecord> {
+    find_mcp_search_record_with_limit(history_path, search_id, MAX_REVIEW_HISTORY_RECORD_BYTES)
+}
+
+#[cfg(test)]
+fn find_mcp_search_record_with_limit(
+    history_path: &Path,
+    search_id: &str,
+    max_record_bytes: usize,
+) -> anyhow::Result<crate::telemetry::McpCallRecord> {
+    let file = std::fs::File::open(history_path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut skipped_oversized = false;
+    while let Some((oversized, terminated)) =
+        read_bounded_history_line(&mut reader, &mut line, max_record_bytes)?
+    {
+        if oversized {
+            skipped_oversized = true;
+            continue;
+        }
+        if !terminated {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<crate::telemetry::McpCallRecord>(
+            &line[..line.len().saturating_sub(1)],
+        ) else {
+            continue;
+        };
+        if record.tool == "search" && mcp_search_id(&record) == search_id {
+            return Ok(record);
+        }
+    }
+    if skipped_oversized {
+        anyhow::bail!(
+            "search_id was not found in MCP call history; oversized history records were skipped"
+        );
+    }
+    anyhow::bail!("search_id was not found in MCP call history")
 }
 
 fn set_session_conclusion(document: &mut SourceDocument, conclusion: &str) {
@@ -155,6 +568,29 @@ fn source_content_fingerprint(document: &SourceDocument) -> String {
     crate::pipeline::key_phrase_content_hash(&document.content)
 }
 
+fn source_document_contains_term(document: &SourceDocument, term: &str) -> bool {
+    let term = term.to_lowercase();
+    let contains = |value: &str| value.to_lowercase().contains(&term);
+    contains(&document.doc_id)
+        || contains(&document.source)
+        || contains(&document.content)
+        || contains(&document.concept)
+        || document.group_id.as_deref().is_some_and(contains)
+        || document.headings.iter().any(|value| contains(value))
+        || document.links.iter().any(|value| contains(value))
+        || document.timestamp.as_deref().is_some_and(contains)
+        || document.author_agent.as_deref().is_some_and(contains)
+        || document
+            .filters
+            .iter()
+            .any(|(key, value)| contains(key) || contains(value))
+        || document
+            .key_phrases
+            .iter()
+            .any(|phrase| contains(&phrase.text) || contains(&phrase.kind))
+        || contains(&document.key_phrase_extraction_hash)
+}
+
 fn mcp_search_id(record: &crate::telemetry::McpCallRecord) -> String {
     record.trace_id.clone().unwrap_or_else(|| {
         let encoded = serde_json::to_vec(record).unwrap_or_default();
@@ -171,6 +607,7 @@ fn search_result_payload(record: &crate::telemetry::McpCallRecord) -> serde_json
         .unwrap_or(serde_json::Value::Null)
 }
 
+#[cfg(test)]
 fn search_feedback_evaluation(
     reviews: &serde_json::Map<String, serde_json::Value>,
     records: &HashMap<String, crate::telemetry::McpCallRecord>,
@@ -310,38 +747,74 @@ fn search_feedback_evaluation(
     })
 }
 
-fn search_history_cursor(history: &[u8], offset: usize) -> String {
-    let prefix_hash = format!("{:x}", Sha256::digest(&history[..offset]));
-    format!("v1:{offset}:{prefix_hash}")
+fn search_history_cursor(
+    path: &Path,
+    generation: &str,
+    offset: u64,
+    snapshot_end: u64,
+) -> anyhow::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        search_history_generation(&metadata) == generation
+            && offset <= snapshot_end
+            && snapshot_end <= metadata.len(),
+        "search history changed; restart review from the first page"
+    );
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset - 1))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)?;
+        anyhow::ensure!(
+            previous[0] == b'\n',
+            "search history changed; cursor is not on a record boundary"
+        );
+    }
+    Ok(format!("v2:{generation}:{offset}:{snapshot_end}"))
 }
 
-fn parse_search_history_cursor(history: &[u8], cursor: &str) -> anyhow::Result<usize> {
-    let mut parts = cursor.splitn(3, ':');
+fn parse_search_history_cursor(path: &Path, cursor: &str) -> anyhow::Result<(u64, u64)> {
+    let (generation, offset, snapshot_end) = parse_search_history_cursor_fields(cursor)?;
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
     anyhow::ensure!(
-        parts.next() == Some("v1"),
-        "unsupported search history cursor"
+        search_history_generation(&metadata) == generation
+            && offset <= snapshot_end
+            && snapshot_end <= metadata.len(),
+        "search history changed; restart review from the first page"
     );
+    if offset > 0 {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset - 1))?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous)?;
+        anyhow::ensure!(
+            previous[0] == b'\n',
+            "search history changed; cursor is not on a record boundary"
+        );
+    }
+    Ok((offset, snapshot_end))
+}
+
+fn parse_search_history_cursor_fields(cursor: &str) -> anyhow::Result<(&str, u64, u64)> {
+    let mut parts = cursor.rsplitn(3, ':');
+    let snapshot_end = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid search history cursor"))?;
     let offset = parts
         .next()
-        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| anyhow::anyhow!("invalid search history cursor"))?;
-    let expected_hash = parts
+    let generation = parts
         .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid search history cursor"))?;
-    anyhow::ensure!(
-        offset <= history.len(),
-        "search history changed; restart review from the first page"
-    );
-    anyhow::ensure!(
-        history.get(offset.saturating_sub(1)) == Some(&b'\n') || offset == 0,
-        "search history changed; restart review from the first page"
-    );
-    let actual_hash = format!("{:x}", Sha256::digest(&history[..offset]));
-    anyhow::ensure!(
-        actual_hash == expected_hash,
-        "search history changed; restart review from the first page"
-    );
-    Ok(offset)
+        .and_then(|value| value.strip_prefix("v2:"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported search history cursor; restart review from the first page")
+        })?;
+    Ok((generation, offset, snapshot_end))
 }
 
 fn is_workspace_markdown_document(document: &SourceDocument) -> bool {
@@ -632,6 +1105,12 @@ pub struct MemoryService {
     /// Agent bulletin-board state: per-board sequence counters and
     /// request-id dedup, all assigned under one lock by the single writer.
     board_state: Mutex<BoardState>,
+    /// Resident-local locator map reconstructed from the authoritative MCP
+    /// telemetry file. Read views share it; no query or result bodies live here.
+    search_history_index: Arc<SearchHistoryIndex>,
+    /// Resident-local feedback map reconstructed once from its durable file.
+    /// Pagination checks this map instead of rereading the full JSON file.
+    search_review_state: Arc<Mutex<SearchReviewStateIndex>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1070,7 +1549,8 @@ fn structured_fact_results_with_rules(
     // stays defensive against index/query skew.
     let by_id: HashMap<&str, &SourceDocument> =
         visible.iter().map(|d| (d.doc_id.as_str(), *d)).collect();
-    hits.into_iter()
+    let results = hits
+        .into_iter()
         .filter_map(|hit| {
             let doc = by_id.get(hit.doc_id.as_str())?;
             Some(crate::SearchResult {
@@ -1090,7 +1570,8 @@ fn structured_fact_results_with_rules(
                 comparison_operands: Vec::new(),
             })
         })
-        .collect()
+        .collect();
+    results
 }
 
 /// Return `Some(results)` when native claims support the query's personal
@@ -1304,6 +1785,77 @@ fn blend_structured_first(
             .take(room),
     );
     blended
+}
+
+/// Apply relative freshness after MemoryService has merged lexical and
+/// structured results and completed its other rerankers. Structured facts
+/// retain their established priority tier; freshness only reorders results
+/// within each tier.
+fn apply_relative_freshness(
+    store: &IndexStore,
+    prepared: &PreparedQuery,
+    mut results: Vec<crate::SearchResult>,
+) -> Vec<crate::SearchResult> {
+    let policy = store.options().freshness_policy;
+    let context = prepared.temporal_context();
+    let weight = policy.weight_for_intent(context.intent);
+    if policy.mode != crate::temporal::FreshnessMode::Relative
+        || context.has_explicit_temporal
+        || weight <= 0.0
+    {
+        return results;
+    }
+    let Some(as_of) = context
+        .freshness_as_of
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|date| Utc.from_utc_datetime(&date))
+    else {
+        return results;
+    };
+
+    for result in &mut results {
+        let timestamp = store
+            .record_by_id(&result.doc_id)
+            .and_then(|record| record.timestamp.as_deref());
+        if let Some(delta) = crate::temporal::relative_freshness_delta(
+            result.score,
+            timestamp,
+            as_of,
+            policy.half_life_days,
+            weight,
+        ) {
+            result.score += delta;
+            result.score_breakdown.recency_score += delta;
+        }
+    }
+
+    sort_by_adjusted_score_with_structured_priority(results)
+}
+
+fn sort_by_adjusted_score_with_structured_priority(
+    results: Vec<crate::SearchResult>,
+) -> Vec<crate::SearchResult> {
+    let mut structured = Vec::new();
+    let mut lexical = Vec::new();
+    for result in results {
+        if result.relation_evidence.is_empty() {
+            lexical.push(result);
+        } else {
+            structured.push(result);
+        }
+    }
+    // `sort_by` is stable: equal scores retain the preceding retrieval order.
+    // A secondary doc-ID ordering would reshuffle ties even at weight zero.
+    let by_adjusted_score = |a: &crate::SearchResult, b: &crate::SearchResult| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    structured.sort_by(by_adjusted_score);
+    lexical.sort_by(by_adjusted_score);
+    structured.extend(lexical);
+    structured
 }
 
 /// Merge independently ranked comparison sides while keeping both sides
@@ -1598,6 +2150,8 @@ impl MemoryService {
             enrichment: std::sync::Arc::new(Mutex::new(KeyPhraseEnrichment::default())),
             project_rules: None,
             board_state: Mutex::new(BoardState::default()),
+            search_history_index: Arc::new(SearchHistoryIndex::default()),
+            search_review_state: Arc::new(Mutex::new(SearchReviewStateIndex::default())),
         }
     }
 
@@ -2954,7 +3508,17 @@ impl MemoryService {
             session_id,
             query,
         );
-        let depth = if do_rerank {
+        let temporal_context = prepared.temporal_context();
+        let freshness_policy = self.store.options().freshness_policy;
+        let relative_freshness_enabled = freshness_policy.mode
+            == crate::temporal::FreshnessMode::Relative
+            && !temporal_context.has_explicit_temporal
+            && freshness_policy.weight_for_intent(temporal_context.intent) > 0.0
+            && temporal_context
+                .freshness_as_of
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+                .is_some();
+        let depth = if do_rerank || relative_freshness_enabled {
             top_k.max(RERANK_DEEP_TOP_K)
         } else {
             top_k
@@ -3059,7 +3623,11 @@ impl MemoryService {
                 filters,
                 RERANK_WEIGHTS,
             );
-            lexical.truncate(top_k);
+            lexical.truncate(if relative_freshness_enabled {
+                depth
+            } else {
+                top_k
+            });
         }
         // Structured-fact path: dependency-parse relation evidence blends
         // ahead of the lexical results. The ownership filter comes from the
@@ -3076,7 +3644,11 @@ impl MemoryService {
                     query: query.to_string(),
                     options: None,
                     user_id,
-                    top_k,
+                    top_k: if relative_freshness_enabled {
+                        depth
+                    } else {
+                        top_k
+                    },
                     session_id: session_id.map(String::from),
                     scope: Some(scope.to_string()),
                     filters: None,
@@ -3091,12 +3663,22 @@ impl MemoryService {
                 )
             }
         };
-        let results = blend_structured_first(structured, lexical, top_k);
+        let results = blend_structured_first(
+            structured,
+            lexical,
+            if relative_freshness_enabled {
+                depth
+            } else {
+                top_k
+            },
+        );
         // Session tag link expansion (Luyi 2026-10-07): when a doc is boosted
         // via its tags, other docs in the same session sharing those tags
         // get boosted too. Also handles question-type routing ("where"->venue,
         // "when"->temporal). Supplements (not replaces) per-document tag BM25.
         let results = self.apply_session_tag_link_boost(results, session_id, query);
+        let mut results = apply_relative_freshness(&self.store, &prepared, results);
+        results.truncate(top_k);
         observe_session_search(
             &self.conversation_states,
             scope,
@@ -3150,6 +3732,14 @@ impl MemoryService {
             .as_ref()
             .map(|service| Arc::clone(&service.conversation_states))
             .unwrap_or_else(|| Arc::clone(&workspace.conversation_states));
+        let search_history_index = provider_memory
+            .as_ref()
+            .map(|service| Arc::clone(&service.search_history_index))
+            .unwrap_or_else(|| Arc::clone(&workspace.search_history_index));
+        let search_review_state = provider_memory
+            .as_ref()
+            .map(|service| Arc::clone(&service.search_review_state))
+            .unwrap_or_else(|| Arc::clone(&workspace.search_review_state));
         let mut superseded_ids = workspace.superseded_ids.clone();
         let mut request_fingerprints = workspace.request_fingerprints.clone();
         let has_expiring_documents = workspace.has_expiring_documents
@@ -3193,6 +3783,8 @@ impl MemoryService {
             enrichment: Arc::new(Mutex::new(KeyPhraseEnrichment::default())),
             project_rules: workspace.project_rules,
             board_state: Mutex::new(BoardState::default()),
+            search_history_index,
+            search_review_state,
         })
     }
 
@@ -3862,6 +4454,136 @@ impl MemoryService {
         }
     }
 
+    pub(crate) fn start_search_history_index(&self, project_root: &Path) {
+        let _ = self.search_history_index.ensure_worker(project_root);
+    }
+
+    fn search_review_entry(
+        &self,
+        project_root: &Path,
+        search_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut state = self
+            .search_review_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Ok(state.load_project(project_root)?.get(search_id).cloned())
+    }
+
+    fn set_search_review_entry(
+        &self,
+        project_root: &Path,
+        search_id: &str,
+        entry: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .search_review_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let reviews = state.load_project(project_root)?;
+        let previous = reviews.insert(search_id.to_string(), entry);
+        let path = project_root
+            .join(".membrick")
+            .join("search-review-state.json");
+        std::fs::create_dir_all(path.parent().expect("review state path has parent"))?;
+        let persisted = serde_json::json!({
+            "schema_version": 1,
+            "reviews": reviews,
+        });
+        if let Err(error) = write_search_review_state(&path, &persisted) {
+            if let Some(previous) = previous {
+                reviews.insert(search_id.to_string(), previous);
+            } else {
+                reviews.remove(search_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn lookup_search_history_record(
+        &self,
+        project_root: &Path,
+        search_id: &str,
+    ) -> anyhow::Result<SearchHistoryLookup> {
+        let history_path = project_root
+            .join(".membrick")
+            .join("mcp-call-history.jsonl");
+        let state = self.search_history_index.ensure_worker(project_root);
+        let (
+            generation,
+            location,
+            ambiguous,
+            malformed_records,
+            oversized_records,
+            first_malformed_offset,
+            ready,
+            scanned,
+            captured,
+            error,
+        ) = {
+            let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            (
+                state.generation.clone(),
+                state.locations.get(search_id).copied(),
+                state.ambiguous_ids.contains(search_id),
+                state.malformed_records,
+                state.oversized_records,
+                state.first_malformed_offset,
+                state.initialized
+                    && state.scanned_offset >= state.captured_end
+                    && state.partial_line.is_empty()
+                    && !state.partial_oversized
+                    && state.last_error.is_none(),
+                state.scanned_offset,
+                state.captured_end,
+                state.last_error.clone(),
+            )
+        };
+        let (current_generation, latest_len) = search_history_file_identity(&history_path)?;
+        let ready = ready
+            && latest_len == captured
+            && generation.as_deref() == Some(current_generation.as_str());
+        if ambiguous {
+            anyhow::bail!("search_id is ambiguous in recorded MCP history")
+        }
+        if let (Some(generation), Some(location)) = (generation.as_deref(), location) {
+            match read_search_history_location(&history_path, generation, location, search_id) {
+                Ok(record) => return Ok(SearchHistoryLookup::Found(record)),
+                Err(_) => {
+                    let state = self.search_history_index.state_for(project_root);
+                    let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+                    state.generation = None;
+                    state.initialized = false;
+                    return Ok(SearchHistoryLookup::Pending(serde_json::json!({
+                        "status": "indexing",
+                        "search_id": search_id,
+                        "indexed_bytes": scanned,
+                        "history_bytes": latest_len.max(captured),
+                        "message": "Search history changed; the resident is rebuilding the lookup index. Retry shortly."
+                    })));
+                }
+            }
+        }
+        if ready {
+            if malformed_records > 0 || oversized_records > 0 {
+                return Ok(SearchHistoryLookup::Incomplete {
+                    malformed_records,
+                    oversized_records,
+                    first_malformed_offset,
+                });
+            }
+            return Ok(SearchHistoryLookup::Absent);
+        }
+        Ok(SearchHistoryLookup::Pending(serde_json::json!({
+            "status": "indexing",
+            "search_id": search_id,
+            "indexed_bytes": scanned,
+            "history_bytes": captured,
+            "message": error.unwrap_or_else(|| "The resident is rebuilding the search history lookup index. Retry shortly.".to_string())
+        })))
+    }
+
     /// Return either a page of unreviewed MCP searches or one exact search.
     /// Review state is keyed by the stable MCP trace ID and is owned by this
     /// project service, while the append-only telemetry ledger remains intact.
@@ -3883,37 +4605,45 @@ impl MemoryService {
         let history_path = project_root
             .join(".membrick")
             .join("mcp-call-history.jsonl");
-        let history = match std::fs::read(&history_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let state_path = project_root
-            .join(".membrick")
-            .join("search-review-state.json");
-        let state = read_search_review_state(&state_path)?;
-        let reviews = state
-            .get("reviews")
-            .and_then(serde_json::Value::as_object)
-            .expect("validated search review state contains reviews");
-        let entries = parse_mcp_search_history(&history)?;
-
         if let Some(search_id) = args.get("search_id").and_then(serde_json::Value::as_str) {
             anyhow::ensure!(!search_id.trim().is_empty(), "search_id must not be blank");
-            let (_, record) = entries
-                .iter()
-                .find(|(_, record)| mcp_search_id(record) == search_id)
-                .ok_or_else(|| anyhow::anyhow!("search_id was not found in MCP call history"))?;
-            let result = search_result_payload(record);
-            let documents = self.documents_for_review(record, &result)?;
-            return Ok(serde_json::json!({
+            let prior_feedback = self.search_review_entry(project_root, search_id)?;
+            let record = match self.lookup_search_history_record(project_root, search_id)? {
+                SearchHistoryLookup::Found(record) => record,
+                SearchHistoryLookup::Pending(progress) => return Ok(progress),
+                SearchHistoryLookup::Incomplete {
+                    malformed_records,
+                    oversized_records,
+                    first_malformed_offset,
+                } => {
+                    return Ok(serde_json::json!({
+                        "status": "history_incomplete",
+                        "search_id": search_id,
+                        "malformed_records_skipped": malformed_records,
+                        "oversized_records_skipped": oversized_records,
+                        "first_malformed_offset": first_malformed_offset,
+                        "message": "The search ID was not found, but malformed or oversized history records mean its absence cannot be confirmed."
+                    }));
+                }
+                SearchHistoryLookup::Absent => anyhow::bail!(
+                    "search_id was not found in recorded MCP history after the resident caught up"
+                ),
+            };
+            let result = search_result_payload(&record);
+            let documents = self.documents_for_review(&result)?;
+            let response = serde_json::json!({
                 "search_id": search_id,
-                "reviewed": reviews.contains_key(search_id),
+                "reviewed": prior_feedback.is_some(),
                 "search": record,
                 "result": result,
                 "documents": documents,
-                "prior_feedback": reviews.get(search_id).and_then(|v| v.get("feedback")),
-            }));
+                "prior_feedback": prior_feedback.as_ref().and_then(|v| v.get("feedback")),
+            });
+            anyhow::ensure!(
+                serde_json::to_vec(&response)?.len() <= MAX_REVIEW_PAGE_RESPONSE_BYTES,
+                "search review exceeds the response byte limit; the recorded result is too large to return safely"
+            );
+            return Ok(response);
         }
 
         let page_size = args
@@ -3921,120 +4651,270 @@ impl MemoryService {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(10)
             .clamp(1, 100) as usize;
-        let mut cursor = args
-            .get("cursor")
-            .and_then(serde_json::Value::as_str)
-            .map(|value| parse_search_history_cursor(&history, value))
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("invalid continuation cursor: {error}"))?
-            .unwrap_or(0);
+        let state = self.search_history_index.ensure_worker(project_root);
+        let (
+            generation,
+            captured_end,
+            indexed_end,
+            ready,
+            oversized,
+            malformed,
+            first_malformed_offset,
+            last_error,
+        ) = {
+            let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            (
+                state.generation.clone(),
+                state.captured_end,
+                state.scanned_offset,
+                state.initialized
+                    && state.scanned_offset >= state.captured_end
+                    && state.partial_line.is_empty()
+                    && !state.partial_oversized
+                    && state.last_error.is_none(),
+                state.oversized_records,
+                state.malformed_records,
+                state.first_malformed_offset,
+                state.last_error.clone(),
+            )
+        };
+        let (start_offset, snapshot_end) =
+            match args.get("cursor").and_then(serde_json::Value::as_str) {
+                Some(value) => parse_search_history_cursor(&history_path, value)
+                    .map_err(|error| anyhow::anyhow!("invalid continuation cursor: {error}"))?,
+                None => (0, captured_end),
+            };
+        let (current_generation, current_history_end) =
+            search_history_file_identity(&history_path)?;
+        let ready = ready
+            && current_history_end == captured_end
+            && generation.as_deref() == Some(current_generation.as_str());
+        if !ready {
+            return Ok(serde_json::json!({
+                "status": "indexing",
+                "searches": [],
+                "indexed_bytes": indexed_end,
+                "history_bytes": current_history_end.max(captured_end),
+                "message": last_error.unwrap_or_else(|| "The resident is rebuilding the search history lookup index. Retry shortly.".to_string())
+            }));
+        }
+        let generation = match generation {
+            Some(generation) => generation,
+            None => {
+                return Ok(serde_json::json!({
+                    "searches": [],
+                    "next_cursor": null,
+                    "has_more": false,
+                    "oversized_records_skipped": 0,
+                    "malformed_records_skipped": 0,
+                    "first_malformed_offset": null,
+                    "ambiguous_searches_skipped": 0,
+                }));
+            }
+        };
         anyhow::ensure!(
-            cursor <= history.len(),
-            "cursor is beyond the search history"
+            snapshot_end <= captured_end,
+            "search history index has not caught up to this cursor; retry shortly"
         );
-        if cursor > 0 && history.get(cursor - 1) != Some(&b'\n') {
-            anyhow::bail!("cursor does not point to a search-history record boundary");
+        let candidates = {
+            let state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            let start_index = state
+                .ordered_searches
+                .partition_point(|(offset, _)| *offset < start_offset);
+            state
+                .ordered_searches
+                .iter()
+                .skip(start_index)
+                .take(MAX_REVIEW_PAGE_RECORDS_SCANNED + 1)
+                .take_while(|(offset, _)| *offset < snapshot_end)
+                .map(|(offset, search_id)| {
+                    (
+                        *offset,
+                        search_id.clone(),
+                        state.locations.get(search_id).copied(),
+                        state.ambiguous_ids.contains(search_id),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut page = Vec::new();
+        let mut page_history_bytes = 0usize;
+        let mut page_response_bytes = 0usize;
+        let mut position = start_offset;
+        let mut has_more = false;
+        let mut ambiguous_searches_skipped = 0usize;
+        for (candidate_index, (offset, search_id, location, ambiguous)) in
+            candidates.iter().enumerate()
+        {
+            if candidate_index == MAX_REVIEW_PAGE_RECORDS_SCANNED {
+                position = *offset;
+                has_more = true;
+                break;
+            }
+            if page.len() >= page_size {
+                position = *offset;
+                has_more = true;
+                break;
+            }
+            let Some(location) = *location else {
+                if *ambiguous {
+                    ambiguous_searches_skipped += 1;
+                }
+                continue;
+            };
+            position = location.offset.saturating_add(location.length);
+            if *ambiguous {
+                ambiguous_searches_skipped += 1;
+                continue;
+            }
+            if self.search_review_entry(project_root, search_id)?.is_some() {
+                continue;
+            }
+            if page.len() >= page_size
+                || page_history_bytes.saturating_add(location.length as usize)
+                    > MAX_REVIEW_PAGE_HISTORY_BYTES
+            {
+                anyhow::ensure!(
+                    !page.is_empty(),
+                    "one search record exceeds the review page byte limit; use its search_id for exact review"
+                );
+                position = *offset;
+                has_more = true;
+                break;
+            }
+            let record =
+                read_search_history_location(&history_path, &generation, location, search_id)?;
+            let result = search_result_payload(&record);
+            let item = serde_json::json!({
+                "search_id": search_id,
+                "search": record,
+                "result": result,
+                "documents": self.documents_for_review(&result)?,
+            });
+            let item_bytes = serde_json::to_vec(&item)?.len();
+            if page_response_bytes.saturating_add(item_bytes) > MAX_REVIEW_PAGE_RESPONSE_BYTES {
+                anyhow::ensure!(
+                    !page.is_empty(),
+                    "one search review exceeds the response byte limit; use its search_id for exact review"
+                );
+                position = *offset;
+                has_more = true;
+                break;
+            }
+            page.push(item);
+            page_history_bytes = page_history_bytes.saturating_add(location.length as usize);
+            page_response_bytes = page_response_bytes.saturating_add(item_bytes);
         }
 
-        let mut page = Vec::new();
-        let mut position = cursor;
-        while position < history.len() && page.len() < page_size {
-            let Some(relative_end) = history[position..].iter().position(|byte| *byte == b'\n')
-            else {
-                break;
-            };
-            let end = position + relative_end + 1;
-            if let Ok(record) = serde_json::from_slice::<crate::telemetry::McpCallRecord>(
-                &history[position..end - 1],
-            ) {
-                if record.tool == "search" {
-                    let search_id = mcp_search_id(&record);
-                    if !reviews.contains_key(&search_id) {
-                        let result = search_result_payload(&record);
-                        page.push(serde_json::json!({
-                            "search_id": search_id,
-                            "search": record,
-                            "result": result,
-                            "documents": self.documents_for_review(&record, &result)?,
-                        }));
-                    }
-                }
-            }
-            position = end;
-        }
-        cursor = position;
-        let has_more_records = history[cursor..].iter().any(|byte| *byte == b'\n');
-        let next_cursor = has_more_records.then(|| search_history_cursor(&history, cursor));
+        let next_cursor = if has_more {
+            Some(search_history_cursor(
+                &history_path,
+                &generation,
+                position,
+                snapshot_end,
+            )?)
+        } else {
+            None
+        };
         Ok(serde_json::json!({
             "searches": page,
             "next_cursor": next_cursor,
-            "has_more": has_more_records,
+            "has_more": has_more,
+            "oversized_records_skipped": oversized,
+            "malformed_records_skipped": malformed,
+            "first_malformed_offset": first_malformed_offset,
+            "ambiguous_searches_skipped": ambiguous_searches_skipped,
         }))
     }
 
-    /// Return reviewed MCP searches for the local dashboard. Feedback remains
-    /// owned by MemoryService; the append-only MCP history supplies query and
-    /// provider details without being rewritten.
-    pub(crate) fn dashboard_search_feedback_reviews(
-        &self,
+    /// Return one page from the latest offline dashboard snapshot. This reads
+    /// neither source history nor review state and does not need a service
+    /// instance or resident lock.
+    pub fn dashboard_search_feedback_reviews(
         project_root: &Path,
         offset: usize,
         page_size: usize,
     ) -> anyhow::Result<serde_json::Value> {
         let directory = project_root.join(".membrick");
-        let state = read_search_review_state(&directory.join("search-review-state.json"))?;
-        let history = match std::fs::read(directory.join("mcp-call-history.jsonl")) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        let snapshot_path = directory.join("search-feedback-dashboard.jsonl");
+        let file = match std::fs::File::open(&snapshot_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(serde_json::json!({
+                    "reviews": [],
+                    "evaluation": null,
+                    "total": 0,
+                    "offset": 0,
+                    "page_size": page_size.clamp(1, 100),
+                    "next_offset": null,
+                    "evaluation_status": "not_run",
+                }));
+            }
             Err(error) => return Err(error.into()),
         };
-        let records = parse_mcp_search_history(&history)?
-            .into_iter()
-            .map(|(_, record)| (mcp_search_id(&record), record))
-            .collect::<HashMap<_, _>>();
-        let reviews = state["reviews"]
-            .as_object()
-            .expect("validated search review state contains reviews");
-        let evaluation = search_feedback_evaluation(reviews, &records);
-        let mut rows = reviews
-            .iter()
-            .filter_map(|(search_id, entry)| {
-                let feedback = entry.get("feedback")?;
-                let record = records.get(search_id);
-                let searched_at = record.map(|record| record.timestamp_ms).unwrap_or_default();
-                let submitted_at = entry
-                    .get("submitted_at_ms")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(searched_at);
-                Some((
-                    submitted_at,
-                    serde_json::json!({
-                        "search_id": search_id,
-                        "submitted_at_ms": submitted_at,
-                        "provider": record.map(|record| record.provider.as_str()),
-                        "query": record.and_then(|record| record.arguments.get("query")).and_then(serde_json::Value::as_str),
-                        "status": entry.get("status").and_then(serde_json::Value::as_str).unwrap_or("pending"),
-                        "label": feedback.get("label"),
-                        "feedback": feedback.get("feedback"),
-                        "document_judgments": feedback.get("document_judgments").cloned().unwrap_or_else(|| serde_json::json!([])),
-                    }),
-                ))
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|left, right| right.0.cmp(&left.0));
-        let total = rows.len();
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = Vec::new();
+        let Some((oversized, terminated)) =
+            read_bounded_history_line(&mut reader, &mut line, MAX_DASHBOARD_ROW_BYTES)?
+        else {
+            anyhow::bail!("offline search dashboard snapshot is empty");
+        };
+        anyhow::ensure!(
+            terminated,
+            "offline search dashboard header is unterminated"
+        );
+        anyhow::ensure!(
+            !oversized,
+            "offline search dashboard header exceeds the 512 KiB limit"
+        );
+        let header: serde_json::Value = serde_json::from_slice(&line[..line.len() - 1])?;
+        let report = header
+            .get("_snapshot")
+            .ok_or_else(|| anyhow::anyhow!("offline search dashboard snapshot has no header"))?;
+        anyhow::ensure!(
+            report
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1),
+            "unsupported offline search evaluation report"
+        );
+        let total = report
+            .get("reviewed_searches")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("offline search dashboard header has no row count"))?;
+        let total = usize::try_from(total)
+            .map_err(|_| anyhow::anyhow!("offline search dashboard row count is too large"))?;
         let page_size = page_size.clamp(1, 100);
         let offset = offset.min(total);
-        let page = rows
-            .into_iter()
-            .skip(offset)
-            .take(page_size)
-            .map(|(_, review)| review)
-            .collect::<Vec<_>>();
+        let mut page = Vec::with_capacity(page_size);
+        let mut row_index = 0usize;
+        while row_index < total && page.len() < page_size {
+            let Some((oversized, terminated)) =
+                read_bounded_history_line(&mut reader, &mut line, MAX_DASHBOARD_ROW_BYTES)?
+            else {
+                anyhow::bail!("offline search dashboard has fewer rows than its header declares");
+            };
+            anyhow::ensure!(
+                terminated,
+                "offline search dashboard has an unterminated row"
+            );
+            anyhow::ensure!(
+                !oversized,
+                "offline search dashboard row exceeds the 512 KiB limit"
+            );
+            if row_index >= offset {
+                page.push(serde_json::from_slice::<serde_json::Value>(
+                    &line[..line.len().saturating_sub(1)],
+                )?);
+            }
+            row_index += 1;
+        }
         let next_offset = (offset + page.len() < total).then_some(offset + page.len());
         Ok(serde_json::json!({
             "reviews": page,
-            "evaluation": evaluation,
+            "evaluation": report.get("evaluation"),
+            "evaluation_generated_at": report.get("generated_at"),
+            "evaluation_status": "ready",
             "total": total,
             "offset": offset,
             "page_size": page_size,
@@ -4042,12 +4922,12 @@ impl MemoryService {
         }))
     }
 
-    fn documents_for_review(
-        &self,
-        record: &crate::telemetry::McpCallRecord,
+    fn source_documents_for_review<'a>(
+        &'a self,
         result: &serde_json::Value,
-    ) -> anyhow::Result<Vec<serde_json::Value>> {
-        let mut wanted = HashSet::<String>::new();
+    ) -> anyhow::Result<Vec<&'a SourceDocument>> {
+        let mut wanted = Vec::<String>::new();
+        let mut seen = HashSet::<String>::new();
         if let Some(hits) = result.get("results").and_then(serde_json::Value::as_array) {
             for hit in hits {
                 if let Some(id) = hit
@@ -4055,47 +4935,73 @@ impl MemoryService {
                     .or_else(|| hit.get("doc_id"))
                     .and_then(serde_json::Value::as_str)
                 {
-                    wanted.insert(id.to_string());
+                    if seen.insert(id.to_string()) {
+                        wanted.push(id.to_string());
+                    }
                 }
             }
         }
-        if matches!(record.session_attribution.as_str(), "explicit" | "inferred") {
-            let Some(session_id) = record.session_id.as_deref() else {
-                return Err(anyhow::anyhow!(
-                    "MCP history marks a session as explicit but has no session ID"
-                ));
-            };
-            for document in self.all_source_documents_for_review() {
-                if document.filters.get("session_id").map(String::as_str) == Some(session_id) {
-                    wanted.insert(document.doc_id.clone());
-                }
-            }
-        }
-        let documents = self.all_source_documents_for_review();
-        documents
+        wanted
             .into_iter()
-            .filter(|document| wanted.contains(&document.doc_id))
-            .map(|document| {
-                Ok(serde_json::json!({
-                    "doc_id": document.doc_id,
-                    "source_hash": crate::source::source_document_hash(&document)?,
-                    "document": document,
-                }))
+            .filter_map(|doc_id| {
+                let captured = self.store.source_document_by_id(&doc_id);
+                let workspace = self
+                    .workspace_store
+                    .as_deref()
+                    .and_then(|store| store.store.source_document_by_id(&doc_id));
+                Some((doc_id, captured, workspace))
             })
+            .filter_map(|(doc_id, captured, workspace)| {
+                match (captured, workspace) {
+                    (Some(document), None) | (None, Some(document)) => Some(Ok(document)),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => Some(Err(anyhow::anyhow!(
+                        "review result document ID is ambiguous across MemoryService stores: {doc_id}"
+                    ))),
+                }
+            })
+            .map(|document| document)
             .collect()
     }
 
-    fn all_source_documents_for_review(&self) -> Vec<SourceDocument> {
-        let mut documents = self
-            .store
-            .source_documents()
+    fn documents_for_review(
+        &self,
+        result: &serde_json::Value,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.source_documents_for_review(result)?
             .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(workspace) = self.workspace_store.as_deref() {
-            documents.extend(workspace.store.source_documents().into_iter().cloned());
-        }
-        documents
+            .map(|document| {
+                let source_hash = crate::source::source_document_hash(document)?;
+                let content_bytes = document.content.len();
+                let mut preview_end = content_bytes.min(MAX_REVIEW_DOCUMENT_CONTENT_BYTES);
+                while !document.content.is_char_boundary(preview_end) {
+                    preview_end -= 1;
+                }
+                let content_truncated = preview_end < content_bytes;
+                let preview = ReviewSourceDocument {
+                    doc_id: &document.doc_id,
+                    source: &document.source,
+                    content: &document.content[..preview_end],
+                    concept: &document.concept,
+                    group_id: &document.group_id,
+                    headings: &document.headings,
+                    links: &document.links,
+                    timestamp: &document.timestamp,
+                    doc_length: document.doc_length,
+                    author_agent: &document.author_agent,
+                    filters: &document.filters,
+                    key_phrases: &document.key_phrases,
+                    key_phrase_extraction_hash: &document.key_phrase_extraction_hash,
+                };
+                Ok(serde_json::json!({
+                    "doc_id": document.doc_id,
+                    "source_hash": source_hash,
+                    "content_bytes": content_bytes,
+                    "content_truncated": content_truncated,
+                    "document": preview,
+                }))
+            })
+            .collect()
     }
 
     /// Enrich one selected source document through MemoryService. The target
@@ -4277,15 +5183,24 @@ impl MemoryService {
             .transpose()?
             .unwrap_or_default();
 
-        let history_path = project_root
-            .join(".membrick")
-            .join("mcp-call-history.jsonl");
-        let history = std::fs::read(&history_path)?;
-        let record = parse_mcp_search_history(&history)?
-            .into_iter()
-            .map(|(_, record)| record)
-            .find(|record| mcp_search_id(record) == search_id)
-            .ok_or_else(|| anyhow::anyhow!("search_id was not found in MCP call history"))?;
+        let record = match self.lookup_search_history_record(project_root, search_id)? {
+            SearchHistoryLookup::Found(record) => record,
+            SearchHistoryLookup::Pending(progress) => anyhow::bail!(
+                "search history index is still building ({} of {} bytes indexed); retry shortly",
+                progress["indexed_bytes"].as_u64().unwrap_or(0),
+                progress["history_bytes"].as_u64().unwrap_or(0)
+            ),
+            SearchHistoryLookup::Incomplete {
+                malformed_records,
+                oversized_records,
+                first_malformed_offset,
+            } => anyhow::bail!(
+                "search history is incomplete: skipped {malformed_records} malformed and {oversized_records} oversized records; first malformed record offset is {first_malformed_offset:?}; search absence cannot be confirmed"
+            ),
+            SearchHistoryLookup::Absent => anyhow::bail!(
+                "search_id was not found in recorded MCP history after the resident caught up"
+            ),
+        };
         let result = search_result_payload(&record);
         let result_hits = result
             .get("results")
@@ -4378,12 +5293,8 @@ impl MemoryService {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&(&review, &query_rule_additions))?)
         );
-        let state_path = project_root
-            .join(".membrick")
-            .join("search-review-state.json");
-        std::fs::create_dir_all(state_path.parent().expect("state path has parent"))?;
-        let mut state = read_search_review_state(&state_path)?;
-        let retrying_pending = if let Some(prior) = state["reviews"].get(search_id) {
+        let prior_entry = self.search_review_entry(project_root, search_id)?;
+        let retrying_pending = if let Some(prior) = prior_entry.as_ref() {
             anyhow::ensure!(
                 prior
                     .get("request_hash")
@@ -4398,27 +5309,27 @@ impl MemoryService {
         } else {
             false
         };
+        let mut review_entry = prior_entry.unwrap_or(serde_json::Value::Null);
 
         if !query_rule_additions.is_empty() {
-            let context_documents = self.documents_for_review(&record, &result)?;
+            let context_documents = self.source_documents_for_review(&result)?;
             let query = record
                 .arguments
                 .get("query")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let mut grounded_text = query.to_lowercase();
-            for value in &context_documents {
-                if let Some(document) = value.get("document") {
-                    grounded_text.push(' ');
-                    grounded_text.push_str(&document.to_string().to_lowercase());
-                }
-            }
+                .unwrap_or_default()
+                .to_lowercase();
             for terms in query_rule_additions.values() {
                 for term in terms {
                     let term = term.trim();
                     anyhow::ensure!(!term.is_empty(), "query rule additions cannot be empty");
-                    anyhow::ensure!(grounded_text.contains(&term.to_lowercase()),
-                        "query rule addition {term:?} must appear in the reviewed query or source documents");
+                    anyhow::ensure!(
+                        query.contains(&term.to_lowercase())
+                            || context_documents
+                                .iter()
+                                .any(|document| source_document_contains_term(document, term)),
+                        "query rule addition {term:?} must appear in the reviewed query or source documents"
+                    );
                 }
             }
             let rules = self.project_rules.as_deref().ok_or_else(|| {
@@ -4430,13 +5341,13 @@ impl MemoryService {
         }
 
         if !retrying_pending {
-            state["reviews"][search_id] = serde_json::json!({
+            review_entry = serde_json::json!({
                 "request_hash": request_hash,
                 "feedback": review,
                 "status": "pending",
                 "submitted_at_ms": unix_time_ms(),
             });
-            write_search_review_state(&state_path, &state)?;
+            self.set_search_review_entry(project_root, search_id, review_entry.clone())?;
         }
         let accepted_query_rules = if query_rule_additions.is_empty() {
             0
@@ -4456,9 +5367,9 @@ impl MemoryService {
             "accepted_query_rules": accepted_query_rules,
             "publication_status": "not_required",
         });
-        state["reviews"][search_id]["status"] = serde_json::json!("reviewed");
-        state["reviews"][search_id]["receipt"] = receipt.clone();
-        write_search_review_state(&state_path, &state)?;
+        review_entry["status"] = serde_json::json!("reviewed");
+        review_entry["receipt"] = receipt.clone();
+        self.set_search_review_entry(project_root, search_id, review_entry)?;
         Ok(receipt)
     }
 
@@ -5704,6 +6615,27 @@ mod tests {
     use super::*;
     use crate::PipelineOptions;
 
+    impl MemoryService {
+        fn review_search_ready(
+            &self,
+            root: &Path,
+            arguments: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let response = self.review_search_mcp(root, arguments)?;
+                if response["status"] != "indexing" {
+                    return Ok(response);
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "search history index did not become ready: {response}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+
     #[test]
     fn search_feedback_evaluation_uses_complete_ranked_judgments_only() {
         let record = crate::telemetry::McpCallRecord {
@@ -5745,6 +6677,87 @@ mod tests {
 
     fn service() -> MemoryService {
         MemoryService::in_memory(PipelineOptions::default())
+    }
+
+    #[test]
+    fn relative_freshness_runs_once_after_memoryservice_result_merge() {
+        let policy = crate::temporal::FreshnessPolicy {
+            mode: crate::temporal::FreshnessMode::Relative,
+            ..crate::temporal::FreshnessPolicy::default()
+        };
+        let mut service = MemoryService::in_memory(PipelineOptions {
+            freshness_policy: policy,
+            structured_fact_retrieval: false,
+            conversational_rerank: false,
+            ..PipelineOptions::default()
+        });
+        for (doc_id, timestamp) in [
+            ("freshness-old", "2024-05-02T12:00:00Z"),
+            ("freshness-latest", "2024-07-01T12:00:00Z"),
+        ] {
+            let mut document = direct_doc(doc_id, "Aurora release policy uses staged rollout.");
+            document.timestamp = Some(timestamp.to_string());
+            document
+                .filters
+                .insert(USER_FILTER.into(), "freshness-test-user".into());
+            service.upsert(document);
+        }
+        service.refresh_index().unwrap();
+
+        let hits = service
+            .search_with_filters(
+                "latest Aurora release policy",
+                "user",
+                None,
+                2,
+                &BTreeMap::from([(USER_FILTER.into(), "freshness-test-user".into())]),
+                Some("2024-07-01"),
+            )
+            .unwrap();
+        assert_eq!(
+            hits.first().map(|hit| hit.doc_id.as_str()),
+            Some("freshness-latest"),
+            "MemoryService should apply relative freshness after candidate retrieval"
+        );
+        assert!(hits[0].score_breakdown.recency_score > hits[1].score_breakdown.recency_score);
+    }
+
+    #[test]
+    fn relative_freshness_sort_preserves_order_for_equal_scores() {
+        let result = |doc_id: &str, score: f32, structured: bool| crate::SearchResult {
+            doc_id: doc_id.into(),
+            source: String::new(),
+            group_id: None,
+            score,
+            score_breakdown: crate::index::ScoreBreakdown::default(),
+            matched_entities: Vec::new(),
+            matched_terms: Vec::new(),
+            probable_topic: None,
+            doc_type_guess: None,
+            semantic_status: None,
+            superseded_by: None,
+            relation_confidence: None,
+            relation_evidence: structured
+                .then(|| "claim".to_string())
+                .into_iter()
+                .collect(),
+            comparison_operands: Vec::new(),
+        };
+
+        let sorted = sort_by_adjusted_score_with_structured_priority(vec![
+            result("z-first", 3.0, false),
+            result("a-second", 3.0, false),
+            result("structured", 1.0, true),
+        ]);
+
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            ["structured", "z-first", "a-second"],
+            "equal-score results must retain the retrieval order within each tier"
+        );
     }
 
     #[test]
@@ -8552,46 +9565,75 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
     }
 
     #[test]
-    fn dashboard_search_reviews_join_feedback_and_paginate_newest_first() {
-        let root = search_feedback_temp_dir("dashboard-feedback");
-        std::fs::create_dir_all(&root).unwrap();
+    fn resident_search_review_state_loads_once_and_survives_restart() {
+        let root = search_feedback_temp_dir("review-state-cache");
+        let state_path = root.join(".membrick/search-review-state.json");
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        write_search_review_state(
+            &state_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "reviews": {"existing-search": {"status": "reviewed"}}
+            }),
+        )
+        .unwrap();
+
         let service = MemoryService::in_memory(PipelineOptions::default());
-        for (request, timestamp, query) in [
-            ("dashboard-old", 10, "older query"),
-            ("dashboard-new", 20, "newer query"),
-        ] {
-            crate::telemetry::record_mcp_call(
+        assert_eq!(
+            service
+                .search_review_entry(&root, "existing-search")
+                .unwrap()
+                .unwrap()["status"],
+            "reviewed"
+        );
+
+        // Once loaded, page lookups use the resident snapshot instead of
+        // rereading the file. The resident remains the sole state owner.
+        write_search_review_state(
+            &state_path,
+            &serde_json::json!({"schema_version": 1, "reviews": {}}),
+        )
+        .unwrap();
+        assert!(service
+            .search_review_entry(&root, "existing-search")
+            .unwrap()
+            .is_some());
+        service
+            .set_search_review_entry(
                 &root,
-                "codex",
-                "search",
-                Some(serde_json::json!(request)),
-                &serde_json::json!({"query":query}),
-                1,
-                false,
-                serde_json::json!({"result":{"content":[{"text":"{}"}]}}),
+                "new-search",
+                serde_json::json!({"status": "reviewed"}),
             )
             .unwrap();
-            let history = std::fs::read(root.join(".membrick/mcp-call-history.jsonl")).unwrap();
-            let mut record = parse_mcp_search_history(&history).unwrap().pop().unwrap().1;
-            record.timestamp_ms = timestamp;
-            let search_id = mcp_search_id(&record);
-            let state_path = root.join(".membrick/search-review-state.json");
-            let mut state = read_search_review_state(&state_path).unwrap();
-            state["reviews"][&search_id] = serde_json::json!({
-                "status":"reviewed",
-                "submitted_at_ms":timestamp + 100,
-                "feedback":{
-                    "label":"helpful",
-                    "feedback":format!("review for {query}"),
-                    "document_judgments":[{"doc_id":"doc:one","relevance":"relevant"}]
-                }
-            });
-            write_search_review_state(&state_path, &state).unwrap();
-        }
 
-        let first = service
-            .dashboard_search_feedback_reviews(&root, 0, 1)
-            .unwrap();
+        let persisted = read_search_review_state(&state_path).unwrap();
+        assert!(persisted["reviews"].get("existing-search").is_some());
+        assert!(persisted["reviews"].get("new-search").is_some());
+
+        let restarted = MemoryService::in_memory(PipelineOptions::default());
+        assert!(restarted
+            .search_review_entry(&root, "new-search")
+            .unwrap()
+            .is_some());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dashboard_search_reviews_join_feedback_and_paginate_newest_first() {
+        let root = search_feedback_temp_dir("dashboard-feedback");
+        let directory = root.join(".membrick");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("mcp-call-history.jsonl"),
+            vec![b'x'; 4_000_000],
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("search-feedback-dashboard.jsonl"),
+            "{\"_snapshot\":{\"schema_version\":1,\"generated_at\":123,\"reviewed_searches\":2,\"evaluation\":{\"sample_status\":\"small\"}}}\n{\"query\":\"newer query\",\"provider\":\"codex\",\"label\":\"helpful\",\"document_judgments\":[{\"doc_id\":\"doc:one\",\"relevance\":\"relevant\"}]}\n{\"query\":\"older query\",\"provider\":\"codex\",\"label\":\"helpful\",\"document_judgments\":[{\"doc_id\":\"doc:two\",\"relevance\":\"relevant\"}]}\n",
+        ).unwrap();
+
+        let first = MemoryService::dashboard_search_feedback_reviews(&root, 0, 1).unwrap();
         assert_eq!(first["total"], 2);
         assert_eq!(first["next_offset"], 1);
         assert_eq!(first["reviews"][0]["query"], "newer query");
@@ -8602,14 +9644,10 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
             "doc:one"
         );
 
-        let second = service
-            .dashboard_search_feedback_reviews(&root, 1, 1)
-            .unwrap();
+        let second = MemoryService::dashboard_search_feedback_reviews(&root, 1, 1).unwrap();
         assert_eq!(second["reviews"][0]["query"], "older query");
         assert_eq!(second["next_offset"], serde_json::Value::Null);
-        let past_end = service
-            .dashboard_search_feedback_reviews(&root, 20, 10)
-            .unwrap();
+        let past_end = MemoryService::dashboard_search_feedback_reviews(&root, 20, 10).unwrap();
         assert_eq!(past_end["offset"], 2);
         assert!(past_end["reviews"].as_array().unwrap().is_empty());
 
@@ -8617,13 +9655,54 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
     }
 
     #[test]
-    fn dashboard_search_reviews_handles_missing_history_and_review_files() {
+    fn dashboard_search_reviews_rejects_oversized_snapshot_rows_instead_of_skipping_them() {
+        let root = search_feedback_temp_dir("dashboard-feedback-oversized-row");
+        let directory = root.join(".membrick");
+        std::fs::create_dir_all(&directory).unwrap();
+        let oversized = serde_json::json!({"query":"x".repeat(600 * 1024)});
+        let rows = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"_snapshot":{"schema_version":1,"generated_at":123,"reviewed_searches":2,"evaluation":{}}}),
+            oversized,
+            serde_json::json!({"query":"second row"})
+        );
+        std::fs::write(directory.join("search-feedback-dashboard.jsonl"), rows).unwrap();
+
+        let result = MemoryService::dashboard_search_feedback_reviews(&root, 0, 1);
+        assert!(
+            result.is_err(),
+            "oversized snapshot row must be reported, not silently skipped"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dashboard_search_reviews_rejects_truncated_snapshot_instead_of_repeating_cursor() {
+        let root = search_feedback_temp_dir("dashboard-feedback-truncated");
+        let directory = root.join(".membrick");
+        std::fs::create_dir_all(&directory).unwrap();
+        let snapshot = format!(
+            "{}\n{}\n",
+            serde_json::json!({"_snapshot":{"schema_version":1,"generated_at":123,"reviewed_searches":2,"evaluation":{}}}),
+            serde_json::json!({"query":"only row"})
+        );
+        std::fs::write(directory.join("search-feedback-dashboard.jsonl"), snapshot).unwrap();
+
+        let result = MemoryService::dashboard_search_feedback_reviews(&root, 1, 1);
+        assert!(
+            result.is_err(),
+            "truncated snapshot must not return a repeated next offset"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dashboard_search_reviews_reports_missing_offline_snapshot() {
         let root = search_feedback_temp_dir("dashboard-feedback-empty");
-        std::fs::create_dir_all(&root).unwrap();
-        let service = MemoryService::in_memory(PipelineOptions::default());
-        let result = service
-            .dashboard_search_feedback_reviews(&root, 0, 25)
-            .unwrap();
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let result = MemoryService::dashboard_search_feedback_reviews(&root, 0, 25).unwrap();
         assert_eq!(result["total"], 0);
         assert_eq!(result["reviews"], serde_json::json!([]));
         assert_eq!(result["next_offset"], serde_json::Value::Null);
@@ -9333,7 +10412,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         let record = parse_mcp_search_history(&history).unwrap().remove(0).1;
         let search_id = mcp_search_id(&record);
         let page = service
-            .review_search_mcp(&root, &serde_json::json!({"page_size":1}))
+            .review_search_ready(&root, &serde_json::json!({"page_size":1}))
             .unwrap();
         assert_eq!(page["searches"].as_array().unwrap().len(), 1);
         assert_eq!(page["searches"][0]["search_id"], search_id);
@@ -9343,7 +10422,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         );
 
         let exact = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
             .unwrap();
         assert_eq!(exact["documents"][0]["doc_id"], document.doc_id);
         let source_hash = exact["documents"][0]["source_hash"].as_str().unwrap();
@@ -9485,7 +10564,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
             "search_feedback should activate the accepted rule in this service immediately"
         );
         let reviewed = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
             .unwrap();
         assert_eq!(
             reviewed["prior_feedback"]["document_judgments"][0]["rank"],
@@ -9532,7 +10611,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
             .to_string()
             .contains("already has different feedback"));
         let reviewed = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
             .unwrap();
         assert_eq!(reviewed["reviewed"], true);
 
@@ -9589,7 +10668,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
     }
 
     #[test]
-    fn review_search_includes_attributed_session_history_but_not_absent_sessions() {
+    fn review_search_returns_only_documents_from_the_search_result() {
         let root = search_feedback_temp_dir("review-session-scope");
         std::fs::create_dir_all(&root).unwrap();
         let mut service = MemoryService::in_memory(PipelineOptions::default());
@@ -9661,7 +10740,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
             .unwrap();
 
         let explicit = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":explicit_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":explicit_id}))
             .unwrap();
         let explicit_document_ids = explicit["documents"]
             .as_array()
@@ -9669,12 +10748,15 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
             .iter()
             .filter_map(|entry| entry["doc_id"].as_str())
             .collect::<HashSet<_>>();
-        assert!(explicit_document_ids.contains(earlier.doc_id.as_str()));
-        assert!(explicit_document_ids.contains(result_hit.doc_id.as_str()));
+        assert_eq!(
+            explicit_document_ids,
+            HashSet::from([result_hit.doc_id.as_str()])
+        );
+        assert!(!explicit_document_ids.contains(earlier.doc_id.as_str()));
         assert!(!explicit_document_ids.contains(other_session.doc_id.as_str()));
 
         let absent = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":absent_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":absent_id}))
             .unwrap();
         let absent_document_ids = absent["documents"]
             .as_array()
@@ -9686,6 +10768,458 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
             absent_document_ids,
             HashSet::from([result_hit.doc_id.as_str()])
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_search_lookup_skips_oversized_unrelated_history_records() {
+        let root = search_feedback_temp_dir("review-oversized-history");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("oversized-history-search")),
+            &serde_json::json!({"query":"find the bounded history record"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":"{\\\"results\\\":[]}"}]}}),
+        )
+        .unwrap();
+        let history_path = root.join(".membrick/mcp-call-history.jsonl");
+        let search_line = std::fs::read(&history_path).unwrap();
+        let search_id = parse_mcp_search_history(&search_line)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1
+            .trace_id
+            .unwrap();
+        let mut history = vec![b'x'; 2048];
+        history.push(b'\n');
+        history.extend(search_line);
+        std::fs::write(&history_path, history).unwrap();
+
+        let record = find_mcp_search_record_with_limit(&history_path, &search_id, 1024).unwrap();
+        assert_eq!(mcp_search_id(&record), search_id);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_search_reports_indexing_while_history_rebuild_is_incomplete() {
+        let root = search_feedback_temp_dir("review-index-pending");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("index-pending-search")),
+            &serde_json::json!({"query":"pending while lookup index builds"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":serde_json::json!({"results":[]}).to_string()}]}}),
+        )
+        .unwrap();
+        let history = std::fs::read(root.join(".membrick/mcp-call-history.jsonl")).unwrap();
+        let search_id = mcp_search_id(&parse_mcp_search_history(&history).unwrap()[0].1);
+        let state = service.search_history_index.state_for(&root);
+        state.lock().unwrap().worker_running = true;
+
+        let response = service
+            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap();
+
+        assert_eq!(response["status"], "indexing");
+        assert_eq!(response["search_id"], search_id);
+        assert!(response["search"].is_null());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_search_keeps_partial_history_tail_pending() {
+        let root = search_feedback_temp_dir("review-partial-history-tail");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("partial-tail-search")),
+            &serde_json::json!({"query":"partially appended search"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":"{\"results\":[]}"}]}}),
+        )
+        .unwrap();
+        let history_path = root.join(".membrick/mcp-call-history.jsonl");
+        let history = std::fs::read(&history_path).unwrap();
+        let search_id = mcp_search_id(&parse_mcp_search_history(&history).unwrap()[0].1);
+        std::fs::write(&history_path, &history[..history.len() - 1]).unwrap();
+        let state = service.search_history_index.state_for(&root);
+        {
+            let mut state = state.lock().unwrap();
+            let metadata = std::fs::metadata(&history_path).unwrap();
+            state.generation = Some(search_history_generation(&metadata));
+            state.initialized = true;
+            state.scanned_offset = metadata.len();
+            state.captured_end = metadata.len();
+            state.partial_line = history[..history.len() - 1].to_vec();
+            state.worker_running = true;
+        }
+
+        let response = service
+            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap();
+
+        assert_eq!(response["status"], "indexing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_search_absence_stays_pending_after_history_replacement() {
+        let root = search_feedback_temp_dir("review-replaced-history");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("replaced-history-search")),
+            &serde_json::json!({"query":"original history"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":"{\"results\":[]}"}]}}),
+        )
+        .unwrap();
+        let history_path = root.join(".membrick/mcp-call-history.jsonl");
+        let original = std::fs::read(&history_path).unwrap();
+        let state = service.search_history_index.state_for(&root);
+        {
+            let mut state = state.lock().unwrap();
+            let metadata = std::fs::metadata(&history_path).unwrap();
+            state.generation = Some(search_history_generation(&metadata));
+            state.initialized = true;
+            state.scanned_offset = metadata.len();
+            state.captured_end = metadata.len();
+            state.worker_running = true;
+        }
+
+        let replacement_path = root.join(".membrick/replacement.jsonl");
+        let replacement = original
+            .iter()
+            .map(|byte| if *byte == b'o' { b'x' } else { *byte })
+            .collect::<Vec<_>>();
+        assert_eq!(replacement.len(), original.len());
+        std::fs::write(&replacement_path, replacement).unwrap();
+        std::fs::rename(&replacement_path, &history_path).unwrap();
+
+        let response = service
+            .review_search_mcp(
+                &root,
+                &serde_json::json!({"search_id":"not-in-replacement"}),
+            )
+            .unwrap();
+
+        assert_eq!(response["status"], "indexing");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn paginated_review_streams_past_oversized_history_records() {
+        let root = search_feedback_temp_dir("review-streaming-page");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("streaming-page-search")),
+            &serde_json::json!({"query":"bounded page fixture"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":serde_json::json!({"results":[]}).to_string()}]}}),
+        )
+        .unwrap();
+        let history_path = root.join(".membrick/mcp-call-history.jsonl");
+        let search_line = std::fs::read(&history_path).unwrap();
+        let mut history = vec![b'x'; MAX_REVIEW_HISTORY_RECORD_BYTES + 1];
+        history.push(b'\n');
+        history.extend(search_line);
+        std::fs::write(&history_path, history).unwrap();
+
+        let response = service
+            .review_search_ready(&root, &serde_json::json!({"page_size":1}))
+            .unwrap();
+        assert_eq!(response["oversized_records_skipped"], 1);
+        assert_eq!(response["searches"].as_array().unwrap().len(), 1);
+        assert_eq!(response["has_more"], false);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_search_history_rows_are_reported_and_make_absence_uncertain() {
+        let root = search_feedback_temp_dir("review-malformed-history-row");
+        std::fs::create_dir_all(&root).unwrap();
+        for request_id in ["before-corruption", "after-corruption"] {
+            crate::telemetry::record_mcp_call(
+                &root,
+                "codex",
+                "search",
+                Some(serde_json::json!(request_id)),
+                &serde_json::json!({"query":format!("query {request_id}")}),
+                1,
+                false,
+                serde_json::json!({"result":{"content":[{"text":"{\"results\":[]}"}]}}),
+            )
+            .unwrap();
+        }
+        let history_path = root.join(".membrick/mcp-call-history.jsonl");
+        let original = std::fs::read(&history_path).unwrap();
+        let lines = original
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let mut corrupted = lines[0].to_vec();
+        corrupted.extend_from_slice(b"{not-json}\n");
+        corrupted.extend_from_slice(lines[1]);
+        std::fs::write(&history_path, corrupted).unwrap();
+
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        let page = service
+            .review_search_ready(&root, &serde_json::json!({"page_size":10}))
+            .unwrap();
+        assert_eq!(page["searches"].as_array().unwrap().len(), 2);
+        assert_eq!(page["malformed_records_skipped"], 1);
+        assert_eq!(page["first_malformed_offset"], lines[0].len());
+
+        let exact = service
+            .review_search_mcp(&root, &serde_json::json!({"search_id":"never-recorded"}))
+            .unwrap();
+        assert_eq!(exact["status"], "history_incomplete");
+        assert_eq!(exact["malformed_records_skipped"], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_search_ids_do_not_block_later_review_page_entries() {
+        let root = search_feedback_temp_dir("review-duplicate-search-id");
+        std::fs::create_dir_all(&root).unwrap();
+        for request_id in ["duplicated-search", "later-search"] {
+            crate::telemetry::record_mcp_call(
+                &root,
+                "codex",
+                "search",
+                Some(serde_json::json!(request_id)),
+                &serde_json::json!({"query":format!("query {request_id}")}),
+                1,
+                false,
+                serde_json::json!({"result":{"content":[{"text":"{\"results\":[]}"}]}}),
+            )
+            .unwrap();
+        }
+        let history_path = root.join(".membrick/mcp-call-history.jsonl");
+        let original = std::fs::read(&history_path).unwrap();
+        let lines = original
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let later_search_id = mcp_search_id(&parse_mcp_search_history(&original).unwrap()[1].1);
+        let mut duplicated = lines[0].to_vec();
+        duplicated.extend_from_slice(lines[0]);
+        duplicated.extend_from_slice(lines[1]);
+        std::fs::write(&history_path, duplicated).unwrap();
+
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        let page = service
+            .review_search_ready(&root, &serde_json::json!({"page_size":10}))
+            .unwrap();
+        assert_eq!(page["searches"].as_array().unwrap().len(), 1);
+        assert_eq!(page["searches"][0]["search_id"], later_search_id);
+        assert_eq!(page["ambiguous_searches_skipped"], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_search_review_rejects_responses_over_the_output_budget() {
+        let root = search_feedback_temp_dir("review-output-budget");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let service = MemoryService::in_memory(PipelineOptions::default());
+        let result = serde_json::json!({
+            "results": [{"id":"large-result", "content":"x".repeat(MAX_REVIEW_PAGE_RESPONSE_BYTES + 128 * 1024)}]
+        });
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("large-search-result")),
+            &serde_json::json!({"query":"large result"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":serde_json::to_string(&result).unwrap()}]}}),
+        )
+        .unwrap();
+        let history = std::fs::read(root.join(".membrick/mcp-call-history.jsonl")).unwrap();
+        let search_id = mcp_search_id(&parse_mcp_search_history(&history).unwrap()[0].1);
+
+        let error = service
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("exceeds the response byte limit"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_feedback_can_ground_terms_beyond_the_document_preview() {
+        let root = search_feedback_temp_dir("feedback-full-document-grounding");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        service.project_rules = Some(Arc::new(
+            crate::reasoning_rules::ProjectReasoningRules::open(&root),
+        ));
+        let content = format!(
+            "{} trailing-grounding-needle",
+            "ordinary report text ".repeat(600)
+        );
+        let document = direct_doc("feedback-long-document", &content);
+        service.upsert(document.clone());
+        let indexed = service.source_document_by_id(&document.doc_id).unwrap();
+        let result = serde_json::json!({
+            "results": [{
+                "id": document.doc_id,
+                "source_hash": crate::source::source_document_hash(indexed).unwrap(),
+                "content": "ordinary report text"
+            }]
+        });
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("long-document-grounding-search")),
+            &serde_json::json!({"query":"ordinary report text"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":serde_json::to_string(&result).unwrap()}]}}),
+        )
+        .unwrap();
+        let history = std::fs::read(root.join(".membrick/mcp-call-history.jsonl")).unwrap();
+        let search_id = mcp_search_id(&parse_mcp_search_history(&history).unwrap()[0].1);
+        let reviewed = service
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap();
+        assert_eq!(reviewed["documents"][0]["content_truncated"], true);
+
+        let feedback = serde_json::json!({
+            "search_id": search_id,
+            "label": "helpful",
+            "feedback": "The term is supported by the complete source document.",
+            "document_judgments": [{"doc_id":document.doc_id, "relevance":"relevant"}],
+            "query_rule_additions": {
+                "query_explanation_terms": ["trailing-grounding-needle"]
+            }
+        });
+        let receipt = service.search_feedback_mcp(&root, &feedback).unwrap();
+
+        assert_eq!(receipt["status"], "reviewed");
+        assert_eq!(receipt["accepted_query_rules"], 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_exact_search_reviews_share_the_index_safely() {
+        let root = search_feedback_temp_dir("review-concurrent-index");
+        std::fs::create_dir_all(root.join(".membrick")).unwrap();
+        let service = Arc::new(MemoryService::in_memory(PipelineOptions::default()));
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("concurrent-review-search")),
+            &serde_json::json!({"query":"concurrent lookup"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":"{\"results\":[]}"}]}}),
+        )
+        .unwrap();
+        let history = std::fs::read(root.join(".membrick/mcp-call-history.jsonl")).unwrap();
+        let search_id = mcp_search_id(&parse_mcp_search_history(&history).unwrap()[0].1);
+
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let service = Arc::clone(&service);
+                    let root = root.clone();
+                    let search_id = search_id.clone();
+                    scope.spawn(move || {
+                        service
+                            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap()["search_id"], search_id);
+            }
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_search_bounds_each_returned_source_document_preview() {
+        let root = search_feedback_temp_dir("review-source-preview");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        let large_content = format!("Relevant source text. {}", "x".repeat(24 * 1024));
+        let document = direct_doc("review-large-hit", &large_content);
+        service.upsert(document.clone());
+        let result = serde_json::json!({
+            "results": [{"id": document.doc_id, "content":"Relevant source text."}]
+        });
+        crate::telemetry::record_mcp_call(
+            &root,
+            "codex",
+            "search",
+            Some(serde_json::json!("large-source-preview")),
+            &serde_json::json!({"query":"Relevant source text"}),
+            1,
+            false,
+            serde_json::json!({"result":{"content":[{"text":serde_json::to_string(&result).unwrap()}]}}),
+        )
+        .unwrap();
+        let history = std::fs::read(root.join(".membrick/mcp-call-history.jsonl")).unwrap();
+        let search_id = parse_mcp_search_history(&history)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1
+            .trace_id
+            .unwrap();
+
+        let response = service
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap();
+        let returned_document = &response["documents"][0];
+        let excerpt = returned_document["document"]["content"].as_str().unwrap();
+        assert!(excerpt.len() <= MAX_REVIEW_DOCUMENT_CONTENT_BYTES);
+        assert_eq!(returned_document["content_truncated"], true);
+        assert_eq!(returned_document["content_bytes"], document.content.len());
+        assert_eq!(
+            returned_document["source_hash"],
+            crate::source::source_document_hash(
+                &service
+                    .store
+                    .source_document_by_id(&document.doc_id)
+                    .unwrap(),
+            )
+            .unwrap()
+        );
+        assert!(serde_json::to_vec(&response).unwrap().len() < 20_000);
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -9727,7 +11261,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         let record = parse_mcp_search_history(&history).unwrap().remove(0).1;
         let search_id = mcp_search_id(&record);
         let reviewed = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
             .unwrap();
         let hashes = reviewed["documents"]
             .as_array()
@@ -9826,7 +11360,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         let record = parse_mcp_search_history(&history).unwrap().remove(0).1;
         let search_id = mcp_search_id(&record);
         let reviewed = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
             .unwrap();
         let hashes = reviewed["documents"]
             .as_array()
@@ -9897,7 +11431,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         let record = parse_mcp_search_history(&history).unwrap().remove(0).1;
         let search_id = mcp_search_id(&record);
         let reviewed = service
-            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .review_search_ready(&root, &serde_json::json!({"search_id":search_id}))
             .unwrap();
         let hashes = reviewed["documents"]
             .as_array()
@@ -9972,7 +11506,7 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
     }
 
     #[test]
-    fn review_search_cursor_pages_and_rejects_a_changed_history_prefix() {
+    fn review_search_cursor_pages_and_rejects_a_replaced_history_file() {
         let root = search_feedback_temp_dir("review-pagination");
         std::fs::create_dir_all(&root).unwrap();
         let service = MemoryService::in_memory(PipelineOptions::default());
@@ -9991,15 +11525,15 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         }
 
         let first_page = service
-            .review_search_mcp(&root, &serde_json::json!({"page_size":1}))
+            .review_search_ready(&root, &serde_json::json!({"page_size":1}))
             .unwrap();
         assert_eq!(first_page["searches"].as_array().unwrap().len(), 1);
         assert_eq!(first_page["has_more"], true);
         let cursor = first_page["next_cursor"].as_str().unwrap().to_string();
-        assert!(cursor.starts_with("v1:"));
+        assert!(cursor.starts_with("v2:"));
 
         let second_page = service
-            .review_search_mcp(&root, &serde_json::json!({"page_size":1,"cursor":cursor}))
+            .review_search_ready(&root, &serde_json::json!({"page_size":1,"cursor":cursor}))
             .unwrap();
         assert_eq!(second_page["searches"].as_array().unwrap().len(), 1);
         assert_eq!(second_page["has_more"], false);
@@ -10018,14 +11552,28 @@ json.dump({"relations": [], "key_phrases": []}, sys.stdout)
         let mut changed_history = std::fs::read_to_string(&history_path).unwrap();
         changed_history = changed_history.replacen("pagination query 0", "replaced query 0", 1);
         assert_ne!(first_line, changed_history.lines().next().unwrap());
-        std::fs::write(&history_path, changed_history).unwrap();
+        let replacement_path = history_path.with_extension("replacement");
+        std::fs::write(&replacement_path, changed_history).unwrap();
+        std::fs::rename(&replacement_path, &history_path).unwrap();
         assert!(service
-            .review_search_mcp(&root, &serde_json::json!({"page_size":1,"cursor":cursor}))
+            .review_search_ready(&root, &serde_json::json!({"page_size":1,"cursor":cursor}))
             .unwrap_err()
             .to_string()
             .contains("search history changed"));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_history_cursor_parses_generations_containing_colons() {
+        let (generation, offset, snapshot_end) = parse_search_history_cursor_fields(
+            "v2:SystemTime { tv_sec: 123, tv_nsec: 456 }:17:901",
+        )
+        .unwrap();
+
+        assert_eq!(generation, "SystemTime { tv_sec: 123, tv_nsec: 456 }");
+        assert_eq!(offset, 17);
+        assert_eq!(snapshot_end, 901);
     }
 
     #[test]

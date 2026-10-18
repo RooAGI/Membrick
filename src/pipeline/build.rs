@@ -274,6 +274,14 @@ pub fn build_doc_records(
     source_docs: &[SourceDocument],
     options: &PipelineOptions,
 ) -> Result<Vec<DocRecord>> {
+    // Keep direct/in-memory builders consistent with IndexStore::upsert.
+    // These paths are used by benchmarks and integrations that build a
+    // snapshot without first inserting documents into a store.
+    let mut normalized_source_docs = source_docs.to_vec();
+    for document in &mut normalized_source_docs {
+        document.normalize_timestamp_metadata();
+    }
+    let source_docs = normalized_source_docs.as_slice();
     let docs = source_documents_to_tier1_inputs(source_docs);
 
     // Luyi 2026-09-29: provider-selected NER; spaCy failures fall back to the
@@ -547,8 +555,13 @@ fn assemble_doc_record(
             chunk.timestamp = source_doc.timestamp.clone();
         }
     }
-    let temporal_terms =
-        extract_temporal_terms(source_doc.timestamp.as_deref(), &doc.content, &doc.headings);
+    let temporal_terms = extract_temporal_terms(
+        (source_doc.timestamp_kind() != crate::source::TimestampKind::SourceModified)
+            .then_some(source_doc.timestamp.as_deref())
+            .flatten(),
+        &doc.content,
+        &doc.headings,
+    );
     // Synthetic semantic tags (Luyi 2026-10-07): bekind's canonical
     // judgments computed once at write time (MemoryService is the single
     // write path). Stored in DocRecord, read by the index builder.
@@ -687,6 +700,7 @@ pub fn build_query_snapshot_from_source_documents(
         conversational_rerank: true,
         structured_fact_retrieval: true,
         key_phrase_enrichment: false,
+        freshness_policy: crate::temporal::FreshnessPolicy::default(),
         extractor_script: None,
     };
     build_query_snapshot(source_docs, &options)
@@ -703,7 +717,32 @@ pub fn build_index_store(
 
 #[cfg(test)]
 mod tests {
-    use super::head_noun_phrase;
+    use super::{build_doc_records, head_noun_phrase};
+    use crate::pipeline::{PipelineOptions, Tier1NerProvider};
+    use crate::source::SourceDocument;
+
+    #[test]
+    fn direct_record_build_normalizes_timestamps_and_preserves_timestamp_kind() {
+        let document = SourceDocument::with_stable_doc_id_from_source(
+            "codex://project/session/s1/outcome".into(),
+            "We deployed the fix.".into(),
+            "outcome".into(),
+            Some("codex-session:project:s1".into()),
+            vec![],
+            vec![],
+            Some("1792220974000".into()),
+            None,
+        );
+        let mut options = PipelineOptions::default();
+        options.ner_provider = Tier1NerProvider::Heuristic;
+
+        let record = build_doc_records(&[document], &options).unwrap().remove(0);
+        assert_eq!(record.timestamp.as_deref(), Some("2026-10-17T07:09:34Z"));
+        assert_eq!(
+            record.filters.get("timestamp_kind").map(String::as_str),
+            Some("session")
+        );
+    }
 
     #[test]
     fn possessive_phrase_reduces_to_head_noun() {

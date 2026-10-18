@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "membrick"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "Inflector",
  "aho-corasick",
@@ -1818,6 +1818,7 @@ dependencies = [
  "comrak",
  "console 0.16.6",
  "deunicode",
+ "fs4",
  "fuzzydate",
  "http-body-util",
  "hyper",
@@ -1845,6 +1846,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "toml",
+ "toml_edit",
  "tower",
  "unicode-normalization",
  "walkdir",
@@ -1852,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "membrick-node"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "membrick",

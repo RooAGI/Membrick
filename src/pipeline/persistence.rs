@@ -221,6 +221,7 @@ pub(crate) fn execute_prepared_on_snapshot_parts(
                     }
                 };
             let mut context = prepared.temporal_context();
+            context.freshness_policy = options.freshness_policy;
             context.allowed_doc_ids = allowed_doc_ids.as_ref();
             context.allowed_doc_bitmap = filter_bitmap.as_ref();
             context.allowed_segment_doc_bitmaps = filter_segment_bitmaps.as_ref();
@@ -345,17 +346,18 @@ pub(crate) fn execute_prepared_on_snapshot_parts(
             )
         }
         MemoryIndexSnapshot::Single(index) => {
-            let (results, timings, diagnostics) = if effective_filter_bitmap.is_some() {
-                prepared.execute_on_index_with_bitmap(
-                    index,
-                    top_k,
-                    effective_filter_bitmap.as_ref(),
-                )
-            } else if filter_bitmap.is_some() && allowed_doc_ids.is_none() {
-                prepared.execute_on_index_with_bitmap(index, top_k, filter_bitmap.as_ref())
-            } else {
-                prepared.execute_on_index(index, top_k, allowed_doc_ids.as_ref())
-            };
+            let mut context = prepared.temporal_context();
+            context.freshness_policy = options.freshness_policy;
+            context.allowed_doc_ids = allowed_doc_ids.as_ref();
+            context.allowed_doc_bitmap = effective_filter_bitmap
+                .as_ref()
+                .or_else(|| filter_bitmap.as_ref().filter(|_| allowed_doc_ids.is_none()));
+            let (results, timings, diagnostics) = index.query_with_temporal_context_at(
+                prepared.search_query(),
+                top_k,
+                context,
+                prepared.reference_date(),
+            );
             (
                 prepared.annotate_semantic_results(results, semantic_relations, top_k),
                 timings,

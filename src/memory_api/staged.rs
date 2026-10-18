@@ -66,6 +66,8 @@ impl MemoryService {
             enrichment: Arc::new(Mutex::new(KeyPhraseEnrichment::default())),
             project_rules: self.project_rules.as_ref().map(Arc::clone),
             board_state: Mutex::new(BoardState::default()),
+            search_history_index: Arc::clone(&self.search_history_index),
+            search_review_state: Arc::clone(&self.search_review_state),
         }
     }
 

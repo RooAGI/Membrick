@@ -20,14 +20,14 @@ function renderLabelCounts(counts) {
     .join(' · ');
 }
 
-export function renderSearchEvaluationHtml(evaluation = {}) {
+export function renderSearchEvaluationHtml(evaluation = {}, generatedAt = null) {
   const smallSample = evaluation.sample_status !== 'usable';
   const overallLabels = renderLabelCounts(evaluation.overall_labels);
   const relevanceLabels = renderLabelCounts(evaluation.relevance_labels);
   return `<section class="review-evaluation__panel">
     <div class="review-evaluation__head"><div><p class="eyebrow">Offline ranking evaluation</p><h3>Feedback summary</h3></div>
       <span class="review-label ${smallSample ? 'review-label--pending' : 'review-label--relevant'}">${smallSample ? 'Small sample' : '30+ judged searches'}</span></div>
-    <p class="muted">${formatCount(evaluation.reviewed_searches || 0)} reviewed searches · ${formatCount(evaluation.complete_judged_searches || 0)} complete ranked judgments · ${formatCount(evaluation.judged_documents || 0)} document judgments</p>
+    <p class="muted">${formatCount(evaluation.reviewed_searches || 0)} reviewed searches · ${formatCount(evaluation.complete_judged_searches || 0)} complete ranked judgments · ${formatCount(evaluation.judged_documents || 0)} document judgments${generatedAt ? ` · Snapshot generated ${new Date(Number(generatedAt)).toLocaleString()}` : ''}</p>
     <div class="review-evaluation__metrics">
       <div><span>NDCG@5</span><strong>${renderMetric(evaluation.ndcg_at_5)}</strong></div>
       <div><span>NDCG@10</span><strong>${renderMetric(evaluation.ndcg_at_10)}</strong></div>

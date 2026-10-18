@@ -29,6 +29,7 @@ use std::sync::Arc;
 pub struct PreparedQuery {
     analysis: QueryAnalysis,
     reference_date: Option<String>,
+    freshness_as_of: String,
     resolved_anchor_date: Option<String>,
     resolved_start: Option<String>,
     resolved_end: Option<String>,
@@ -72,6 +73,7 @@ impl PreparedQuery {
             .as_deref()
             .and_then(parse_reference_date)
             .unwrap_or_else(|| Utc::now().date_naive());
+        let freshness_as_of = resolution_date.format("%Y-%m-%d").to_string();
         let resolved = analysis.temporal.as_ref().and_then(|temporal| {
             if temporal.source == "session-anchor" {
                 return None;
@@ -100,6 +102,7 @@ impl PreparedQuery {
         Self {
             analysis,
             reference_date,
+            freshness_as_of,
             resolved_anchor_date,
             resolved_start,
             resolved_end,
@@ -188,6 +191,9 @@ impl PreparedQuery {
             query_routing_intent: self.analysis.query_routing_intent,
             evidence_requirements: self.analysis.evidence_requirements,
             has_explicit_temporal: self.analysis.temporal.is_some(),
+            intent: self.analysis.intent,
+            freshness_as_of: Some(&self.freshness_as_of),
+            freshness_policy: crate::temporal::FreshnessPolicy::default(),
             anchor_date,
             anchor_window,
             allowed_doc_ids: None,

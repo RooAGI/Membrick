@@ -144,12 +144,10 @@ impl TemporalFactStore {
         let mut ordered = records.into_iter().collect::<Vec<_>>();
         ordered.sort_by(|a, b| {
             let a_date = a
-                .timestamp
-                .as_deref()
+                .timestamp_for_temporal_evidence()
                 .and_then(|value| parse_temporal_date(Some(value)));
             let b_date = b
-                .timestamp
-                .as_deref()
+                .timestamp_for_temporal_evidence()
                 .and_then(|value| parse_temporal_date(Some(value)));
             a_date.cmp(&b_date).then_with(|| a.doc_id.cmp(&b.doc_id))
         });
@@ -243,7 +241,7 @@ impl TemporalFactStore {
             scope: record.group_id.clone(),
             valid_from: chunk_timestamp
                 .map(str::to_string)
-                .or_else(|| record.timestamp.clone()),
+                .or_else(|| record.timestamp_for_temporal_evidence().map(str::to_string)),
             valid_to: None,
             recorded_at: record.filters.get("membrick_recorded_at").cloned(),
             source_doc_id: record.doc_id.clone(),
@@ -251,7 +249,7 @@ impl TemporalFactStore {
             source_chunk_version,
             chunk_timestamp: chunk_timestamp
                 .map(str::to_string)
-                .or_else(|| record.timestamp.clone()),
+                .or_else(|| record.timestamp_for_temporal_evidence().map(str::to_string)),
             confidence: claim.confidence,
             is_latest: true,
         };
@@ -524,11 +522,18 @@ fn parse_recorded_at(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 fn record_order_key(record: &DocRecord) -> (Option<NaiveDate>, String) {
     (
         record
-            .timestamp
-            .as_deref()
+            .timestamp_for_temporal_evidence()
             .and_then(|value| parse_temporal_date(Some(value))),
         record.doc_id.clone(),
     )
+}
+
+impl DocRecord {
+    fn timestamp_for_temporal_evidence(&self) -> Option<&str> {
+        (self.filters.get("timestamp_kind").map(String::as_str) != Some("source_modified"))
+            .then(|| self.timestamp.as_deref())
+            .flatten()
+    }
 }
 
 fn normalize_range(start: &str, end: &str) -> Option<(NaiveDate, NaiveDate)> {
@@ -589,13 +594,24 @@ fn best_source_chunk(
         .find(|chunk| chunk.timestamp.is_some())
         .or_else(|| record.section_chunks.first());
     let Some(chunk) = chosen else {
-        return (None, 1, record.timestamp.clone());
+        return (
+            None,
+            1,
+            record.timestamp_for_temporal_evidence().map(str::to_string),
+        );
     };
     let version = chunk_lifecycle
         .get(&chunk.chunk_id)
         .map(|meta| meta.version)
         .unwrap_or(1);
-    let timestamp = chunk.timestamp.clone().or_else(|| record.timestamp.clone());
+    let timestamp = record
+        .timestamp_for_temporal_evidence()
+        .map(|record_timestamp| {
+            chunk
+                .timestamp
+                .clone()
+                .unwrap_or_else(|| record_timestamp.to_string())
+        });
     (Some(chunk.chunk_id.clone()), version, timestamp)
 }
 
@@ -657,6 +673,28 @@ mod tests {
             content_hash: String::new(),
             semantic_tags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn source_modified_time_does_not_become_fact_validity_time() {
+        let mut record = sample_record(
+            "file-doc",
+            Some("2026-10-17T07:09:34Z"),
+            vec![Claim {
+                subject: "Alice".to_string(),
+                predicate: "works_at".to_string(),
+                object: "Acme".to_string(),
+                confidence: 0.9,
+                ..Default::default()
+            }],
+        );
+        record
+            .filters
+            .insert("timestamp_kind".into(), "source_modified".into());
+        let store = TemporalFactStore::from_records([&record], &HashMap::new());
+        assert_eq!(store.facts().len(), 1);
+        assert_eq!(store.facts()[0].valid_from, None);
+        assert_eq!(store.facts()[0].chunk_timestamp, None);
     }
 
     #[test]

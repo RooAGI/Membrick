@@ -1176,7 +1176,9 @@ fn make_claim_in_scope(
         object,
         source_doc_id: doc.doc_id.clone(),
         evidence: evidence.trim().to_string(),
-        effective_at: doc.timestamp.clone(),
+        effective_at: (doc.timestamp_kind() != crate::source::TimestampKind::SourceModified)
+            .then(|| doc.timestamp.clone())
+            .flatten(),
         scope,
         confidence: 0.85,
     }

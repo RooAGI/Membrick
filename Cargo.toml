@@ -1,7 +1,7 @@
 [package]
 autobins = false
 name = "membrick"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 description = "Persistent memory layer for AI coding agents — MCP server with current-state retrieval and supersession tracking"
 license = "Apache-2.0"
@@ -70,6 +70,7 @@ temps = { version = "3", features = ["chrono"] }
 fuzzydate = "0.4.1"
 console = { version = "0.16.3", features = ["std"] }
 sha2 = "0.10"
+fs4 = "0.13.1"
 rayon = "1.11"
 libflate = "1.4"
 pyo3 = { version = "0.29", optional = true }

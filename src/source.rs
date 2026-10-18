@@ -4,6 +4,43 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::stable_doc_id_from_source;
 
+const TIMESTAMP_KIND_FILTER: &str = "timestamp_kind";
+
+/// Describes what a source document's timestamp means. The serialized value
+/// lives in the existing document filters so persisted records remain
+/// backward-compatible and provider adapters keep using `SourceDocument`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampKind {
+    Session,
+    SourceModified,
+    WorkspaceEvent,
+    UserSupplied,
+    Unknown,
+}
+
+impl TimestampKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::SourceModified => "source_modified",
+            Self::WorkspaceEvent => "workspace_event",
+            Self::UserSupplied => "user_supplied",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "session" => Some(Self::Session),
+            "source_modified" => Some(Self::SourceModified),
+            "workspace_event" => Some(Self::WorkspaceEvent),
+            "user_supplied" => Some(Self::UserSupplied),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceDocument {
     pub doc_id: String,
@@ -105,6 +142,54 @@ pub fn source_document_hash(document: &SourceDocument) -> anyhow::Result<String>
 }
 
 impl SourceDocument {
+    /// Normalize timestamp units and annotate legacy documents with the
+    /// timestamp meaning that can be inferred from their existing provenance.
+    pub fn normalize_timestamp_metadata(&mut self) {
+        if let Some(value) = self.timestamp.as_deref() {
+            if let Some(normalized) = crate::temporal::normalize_timestamp(value) {
+                self.timestamp = Some(normalized);
+            }
+        }
+        if !self.filters.contains_key(TIMESTAMP_KIND_FILTER) {
+            let kind = self.inferred_timestamp_kind();
+            if kind != TimestampKind::Unknown {
+                self.filters
+                    .insert(TIMESTAMP_KIND_FILTER.to_string(), kind.as_str().to_string());
+            }
+        }
+    }
+
+    pub fn timestamp_kind(&self) -> TimestampKind {
+        self.filters
+            .get(TIMESTAMP_KIND_FILTER)
+            .and_then(|value| TimestampKind::parse(value))
+            .unwrap_or_else(|| self.inferred_timestamp_kind())
+    }
+
+    fn inferred_timestamp_kind(&self) -> TimestampKind {
+        if self
+            .filters
+            .get("source_type")
+            .is_some_and(|value| value == "workspace-file-change")
+        {
+            return TimestampKind::WorkspaceEvent;
+        }
+        if self.source.starts_with("memory://") {
+            return TimestampKind::UserSupplied;
+        }
+        if crate::provider_sources::is_provider_session(&self.source, self.group_id.as_deref())
+            || (self.source.starts_with("membrick://") && self.source.contains("/session/"))
+            || (self.source.starts_with("lint-ai://")
+                && self
+                    .group_id
+                    .as_deref()
+                    .is_some_and(|group| group.contains("session")))
+        {
+            return TimestampKind::Session;
+        }
+        TimestampKind::Unknown
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_stable_doc_id_from_source(
         source: String,
@@ -216,6 +301,41 @@ mod tests {
         assert_eq!(decoded.doc_length, doc.doc_length);
         assert_eq!(decoded.author_agent, doc.author_agent);
         assert_eq!(decoded.filters, doc.filters);
+    }
+
+    #[test]
+    fn timestamp_normalization_preserves_meaning_and_rejects_ambiguous_years() {
+        let mut session = SourceDocument::with_stable_doc_id_from_source(
+            "codex://project/session/s1/outcome".into(),
+            "Outcome".into(),
+            "session outcome".into(),
+            Some("codex-session:s1".into()),
+            vec![],
+            vec![],
+            Some("1792220974000".into()),
+            None,
+        );
+        session.normalize_timestamp_metadata();
+        assert_eq!(session.timestamp.as_deref(), Some("2026-10-17T07:09:34Z"));
+        assert_eq!(session.timestamp_kind(), TimestampKind::Session);
+
+        let mut file = SourceDocument::with_stable_doc_id_from_source(
+            "docs/guide.md".into(),
+            "Guide".into(),
+            "guide".into(),
+            None,
+            vec![],
+            vec![],
+            Some("2026".into()),
+            None,
+        );
+        file.filters.insert(
+            TIMESTAMP_KIND_FILTER.into(),
+            TimestampKind::SourceModified.as_str().into(),
+        );
+        file.normalize_timestamp_metadata();
+        assert_eq!(file.timestamp.as_deref(), Some("2026"));
+        assert_eq!(file.timestamp_kind(), TimestampKind::SourceModified);
     }
 
     #[test]

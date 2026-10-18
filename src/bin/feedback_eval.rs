@@ -1,14 +1,19 @@
-//! Read-only offline evaluation of previously submitted MCP search feedback.
+//! Offline evaluation of previously submitted MCP search feedback.
 //!
-//! This binary deliberately does not import the Membrick library, open a
-//! workspace, or write any files. Pass copied telemetry files explicitly.
+//! This binary does not import the Membrick library or open a workspace. It
+//! reads the supplied telemetry files and writes page-ready dashboard
+//! snapshots to the selected output directory.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+const MAX_DASHBOARD_ROW_BYTES: usize = 512 * 1024;
+const MAX_DASHBOARD_DOCUMENT_JUDGMENTS: usize = 50;
 
 #[derive(Default)]
 struct Counts {
@@ -23,18 +28,20 @@ struct Counts {
 }
 
 fn usage() -> &'static str {
-    "Usage: cargo run --features experimental --bin feedback_eval -- --history PATH --reviews PATH [--k 5,10]\n\nReads copied MCP history and search-review state files and prints aggregate, read-only evaluation results."
+    "Usage: cargo run --features experimental --bin feedback_eval -- --history PATH --reviews PATH [--output-dir PATH] [--k 5,10]\n\nReads MCP history and search-review state files offline, then writes dashboard snapshots to the output directory (defaults to the review file's parent)."
 }
 
-fn arguments() -> Result<(PathBuf, PathBuf, Vec<usize>), String> {
+fn arguments() -> Result<(PathBuf, PathBuf, PathBuf, Vec<usize>), String> {
     let mut history = None;
     let mut reviews = None;
+    let mut output_dir = None;
     let mut cutoffs = vec![5, 10];
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--history" => history = args.next().map(PathBuf::from),
             "--reviews" => reviews = args.next().map(PathBuf::from),
+            "--output-dir" => output_dir = args.next().map(PathBuf::from),
             "--k" => {
                 let raw = args
                     .next()
@@ -55,11 +62,15 @@ fn arguments() -> Result<(PathBuf, PathBuf, Vec<usize>), String> {
             _ => return Err(format!("unknown argument: {arg}\n\n{}", usage())),
         }
     }
-    Ok((
-        history.ok_or_else(|| format!("--history is required\n\n{}", usage()))?,
-        reviews.ok_or_else(|| format!("--reviews is required\n\n{}", usage()))?,
-        cutoffs,
-    ))
+    let history = history.ok_or_else(|| format!("--history is required\n\n{}", usage()))?;
+    let reviews = reviews.ok_or_else(|| format!("--reviews is required\n\n{}", usage()))?;
+    let output_dir = output_dir.unwrap_or_else(|| {
+        reviews
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf()
+    });
+    Ok((history, reviews, output_dir, cutoffs))
 }
 
 fn mcp_result(record: &Value) -> Option<Value> {
@@ -67,6 +78,42 @@ fn mcp_result(record: &Value) -> Option<Value> {
         .pointer("/response/result/content/0/text")?
         .as_str()?;
     serde_json::from_str(text).ok()
+}
+
+fn dashboard_document_judgment(judgment: &Value) -> Value {
+    serde_json::json!({
+        "doc_id": judgment.get("doc_id").and_then(Value::as_str).map(|id| truncate_utf8(id, 512)),
+        "rank": judgment.get("rank").and_then(Value::as_u64),
+        "source_hash": judgment.get("source_hash").and_then(Value::as_str).map(|hash| truncate_utf8(hash, 128)),
+        "relevance": judgment.get("relevance").and_then(Value::as_str).map(|label| truncate_utf8(label, 64)),
+        "feedback": judgment.get("feedback").and_then(Value::as_str).map(|text| truncate_utf8(text, 512)),
+    })
+}
+
+fn dashboard_review_row(
+    search_id: &str,
+    submitted_at: u64,
+    provider: Option<&Value>,
+    query: &str,
+    status: &str,
+    label: Option<&Value>,
+    feedback: Option<&Value>,
+    judgments: &[Value],
+) -> Value {
+    serde_json::json!({
+        "search_id": truncate_utf8(search_id, 256),
+        "submitted_at_ms": submitted_at,
+        "provider": provider.and_then(Value::as_str).map(|value| truncate_utf8(value, 128)),
+        "query": truncate_utf8(query, 4096),
+        "status": status,
+        "label": label.and_then(Value::as_str).map(|value| truncate_utf8(value, 64)),
+        "feedback": feedback.and_then(Value::as_str).map(|value| truncate_utf8(value, 8192)),
+        "document_judgments": judgments
+            .iter()
+            .take(MAX_DASHBOARD_DOCUMENT_JUDGMENTS)
+            .map(dashboard_document_judgment)
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn relevance_gain(value: &str) -> Option<f64> {
@@ -107,7 +154,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let (history_path, reviews_path, cutoffs) = arguments()?;
+    let (history_path, reviews_path, output_dir, cutoffs) = arguments()?;
     let history_text = fs::read_to_string(&history_path)
         .map_err(|error| format!("cannot read {}: {error}", history_path.display()))?;
     let state_text = fs::read_to_string(&reviews_path)
@@ -140,6 +187,7 @@ fn run() -> Result<(), String> {
     let mut ndcg_totals = BTreeMap::<usize, (f64, usize)>::new();
     let mut reciprocal_rank_total = 0.0;
     let mut reciprocal_rank_count = 0;
+    let mut dashboard_rows = Vec::<(u64, String, Value)>::new();
     for (search_id, entry) in reviews {
         if entry.get("status").and_then(Value::as_str) != Some("reviewed") {
             continue;
@@ -148,10 +196,43 @@ fn run() -> Result<(), String> {
             continue;
         };
         counts.reviews += 1;
+        let record = search_by_id.get(search_id);
+        let submitted_at = entry
+            .get("submitted_at_ms")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                record
+                    .and_then(|item| item.get("timestamp_ms"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or_default();
+        let query = record
+            .and_then(|item| item.pointer("/arguments/query"))
+            .and_then(Value::as_str)
+            .unwrap_or("Search query unavailable");
+        let judgments = feedback
+            .get("document_judgments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let row = dashboard_review_row(
+            search_id,
+            submitted_at,
+            record.and_then(|item| item.get("provider")),
+            query,
+            entry
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("reviewed"),
+            feedback.get("label"),
+            feedback.get("feedback"),
+            &judgments,
+        );
+        dashboard_rows.push((submitted_at, search_id.clone(), row));
         if let Some(label) = feedback.get("label").and_then(Value::as_str) {
             *counts.overall_labels.entry(label.to_string()).or_default() += 1;
         }
-        let Some(record) = search_by_id.get(search_id) else {
+        let Some(record) = record else {
             counts.excluded_reviews += 1;
             continue;
         };
@@ -253,9 +334,60 @@ fn run() -> Result<(), String> {
         counts.judged_documents += judgments.len();
     }
 
-    println!("Offline search-feedback evaluation (read-only)");
+    dashboard_rows.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let metric = |cutoff: usize| {
+        let (sum, n) = ndcg_totals.get(&cutoff).copied().unwrap_or_default();
+        serde_json::json!({ "value": if n == 0 { Value::Null } else { serde_json::json!(sum / n as f64) }, "n": n })
+    };
+    let evaluation = serde_json::json!({
+        "reviewed_searches": counts.reviews,
+        "complete_judged_searches": counts.usable_searches,
+        "judged_documents": counts.judged_documents,
+        "overall_labels": counts.overall_labels,
+        "relevance_labels": counts.relevance_labels,
+        "ndcg_at_5": metric(5),
+        "ndcg_at_10": metric(10),
+        "mrr": { "value": if reciprocal_rank_count == 0 { Value::Null } else { serde_json::json!(reciprocal_rank_total / reciprocal_rank_count as f64) }, "n": reciprocal_rank_count },
+        "sample_status": if counts.usable_searches < 30 { "small" } else { "usable" },
+        "excluded_reviews": counts.excluded_reviews,
+        "malformed_history_lines": counts.malformed_history_lines,
+    });
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
+        .as_millis() as u64;
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("cannot create {}: {error}", output_dir.display()))?;
+    let mut rows = Vec::new();
+    serde_json::to_writer(
+        &mut rows,
+        &serde_json::json!({
+            "_snapshot": {
+                "schema_version": 1,
+                "generated_at": generated_at_ms,
+                "reviewed_searches": dashboard_rows.len(),
+                "evaluation": evaluation,
+            }
+        }),
+    )
+    .map_err(|error| error.to_string())?;
+    rows.push(b'\n');
+    for (_, _, row) in &dashboard_rows {
+        let row_start = rows.len();
+        serde_json::to_writer(&mut rows, row).map_err(|error| error.to_string())?;
+        rows.push(b'\n');
+        if rows.len() - row_start > MAX_DASHBOARD_ROW_BYTES {
+            return Err("dashboard review row exceeds the 512 KiB limit".to_string());
+        }
+    }
+    // Header and rows are one snapshot: readers cannot pair rows from one run
+    // with summary metrics from another if publication is interrupted.
+    write_atomic(&output_dir.join("search-feedback-dashboard.jsonl"), &rows)?;
+
+    println!("Offline search-feedback evaluation");
     println!("History: {}", history_path.display());
     println!("Reviews: {}", reviews_path.display());
+    println!("Dashboard snapshots: {}", output_dir.display());
     println!("Reviewed searches: {}", counts.reviews);
     println!("Joined to search records: {}", counts.joined_searches);
     println!(
@@ -293,6 +425,30 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn write_atomic(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let mut temp = path.to_path_buf();
+    temp.set_extension(format!("tmp-{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| format!("cannot create {}: {error}", temp.display()))?;
+    file.write_all(contents)
+        .map_err(|error| format!("cannot write {}: {error}", temp.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot sync {}: {error}", temp.display()))?;
+    fs::rename(&temp, path).map_err(|error| format!("cannot publish {}: {error}", path.display()))
+}
+
 fn format_counts(counts: &BTreeMap<String, usize>) -> String {
     if counts.is_empty() {
         return "none".to_string();
@@ -302,4 +458,41 @@ fn format_counts(counts: &BTreeMap<String, usize>) -> String {
         .map(|(label, count)| format!("{label}={count}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_dashboard_review_fields_fit_the_pagination_row_limit() {
+        let judgments = (0..MAX_DASHBOARD_DOCUMENT_JUDGMENTS)
+            .map(|rank| {
+                serde_json::json!({
+                    "doc_id": "\u{0000}".repeat(2_000),
+                    "rank": rank + 1,
+                    "source_hash": "\u{0000}".repeat(1_000),
+                    "relevance": "\u{0000}".repeat(500),
+                    "feedback": "\u{0000}".repeat(2_000),
+                    "unexpected_unbounded_field": "\u{0000}".repeat(100_000),
+                })
+            })
+            .collect::<Vec<_>>();
+        let row = dashboard_review_row(
+            &"\u{0000}".repeat(2_000),
+            123,
+            Some(&Value::String("\u{0000}".repeat(1_000))),
+            &"\u{0000}".repeat(10_000),
+            "reviewed",
+            Some(&Value::String("helpful".to_string())),
+            Some(&Value::String("\u{0000}".repeat(20_000))),
+            &judgments,
+        );
+        let bytes = serde_json::to_vec(&row).unwrap();
+        assert!(bytes.len() < MAX_DASHBOARD_ROW_BYTES);
+        assert_eq!(row["document_judgments"].as_array().unwrap().len(), 50);
+        assert!(row["document_judgments"][0]
+            .get("unexpected_unbounded_field")
+            .is_none());
+    }
 }
