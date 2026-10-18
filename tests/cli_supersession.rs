@@ -92,7 +92,7 @@ fn cli_query_and_llm_context_suppress_explicitly_superseded_markdown() {
 }
 
 #[test]
-fn cli_uses_file_timeline_to_supersede_scalar_configuration_without_metadata() {
+fn source_modified_timestamps_do_not_resolve_conflicting_configuration_values() {
     let root = temp_dir();
     let old_path = root.join("decision-a.md");
     let new_path = root.join("decision-b.md");
@@ -138,11 +138,12 @@ fn cli_uses_file_timeline_to_supersede_scalar_configuration_without_metadata() {
     let results = payload["results"].as_array().unwrap();
     assert_eq!(
         results.len(),
-        1,
-        "older timeline value must be suppressed: {payload:#}"
+        2,
+        "file modification times must not be treated as factual chronology: {payload:#}"
     );
-    assert_eq!(results[0]["doc_id"], "decision-b.md");
-    assert_eq!(results[0]["semantic_status"], "current");
+    assert!(results
+        .iter()
+        .all(|result| result["semantic_status"] == "conflicted"));
     assert!(payload["aggregation"].is_null());
 
     let output = Command::new(bin)
@@ -166,12 +167,9 @@ fn cli_uses_file_timeline_to_supersede_scalar_configuration_without_metadata() {
     assert!(chunks
         .iter()
         .all(|chunk| chunk["doc_id"] != "decision-a.md"));
-    assert!(chunks.iter().any(|chunk| {
-        chunk["doc_id"] == "decision-b.md"
-            && chunk["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("retry attempts: 2")
-    }));
+    assert!(
+        chunks.is_empty(),
+        "automatic LLM context must not inject unresolved conflicting values: {payload:#}"
+    );
     let _ = fs::remove_dir_all(root);
 }

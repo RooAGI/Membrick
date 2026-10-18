@@ -158,6 +158,12 @@ pub(crate) fn build_llm_context_output(
     }
 
     for result in chunk_candidates {
+        // LLM context is an automatic injection path. Preserve conflicted
+        // evidence in explicit search results, but do not present competing
+        // claims as usable context without a caller resolving the conflict.
+        if result.semantic_status == Some(crate::semantic_relations::SemanticStatus::Conflicted) {
+            continue;
+        }
         let Some(doc) = index.docs.get(&result.doc_id) else {
             continue;
         };
