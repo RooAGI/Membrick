@@ -117,6 +117,44 @@ pub(crate) fn start_provider_session(root: &Path, provider: &str) -> Result<Prov
     Ok(lease)
 }
 
+/// Completes when the resident should stop: on `signal`, or for a managed
+/// resident once no provider holds a lease. Returns the provider lifecycle
+/// lock when one is held, so no new client registers until this resident has
+/// flushed and exited.
+pub(crate) async fn resident_shutdown(
+    root: &Path,
+    managed: bool,
+    signal: impl std::future::Future<Output = ()>,
+) -> Option<fs::File> {
+    if managed {
+        tokio::select! {
+            _ = signal => {}
+            gate = wait_for_no_provider_sessions(root, Duration::from_secs(3)) => return Some(gate),
+        }
+    } else {
+        signal.await;
+    }
+    // A client may be registering right now; wait for it, then hold the lock.
+    let root = root.to_owned();
+    let gate = tokio::task::spawn_blocking(move || {
+        let gate = open_lifecycle_gate(&root)?;
+        gate.lock()?;
+        anyhow::Ok(gate)
+    })
+    .await;
+    match gate {
+        Ok(Ok(gate)) => Some(gate),
+        Ok(Err(error)) => {
+            eprintln!("could not hold provider lifecycle lock during shutdown: {error:#}");
+            None
+        }
+        Err(error) => {
+            eprintln!("could not hold provider lifecycle lock during shutdown: {error}");
+            None
+        }
+    }
+}
+
 /// Wait until every provider MCP process and in-flight request has released
 /// its lease. Crashed clients release the OS lock; leftover lease files are
 /// removed here.
@@ -131,7 +169,9 @@ pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) 
                 if since.elapsed() >= grace {
                     match open_lifecycle_gate(root) {
                         Ok(gate) => match gate.try_lock() {
-                            Ok(()) => match provider_session_is_active(&directory) {
+                            Ok(()) => match remove_released_provider_leases(&directory)
+                                .and_then(|()| provider_session_is_active(&directory))
+                            {
                                 Ok(false) => return gate,
                                 Ok(true) => empty_since = None,
                                 Err(error) => {
@@ -174,49 +214,55 @@ fn open_lifecycle_gate(root: &Path) -> Result<fs::File> {
         .with_context(|| format!("could not open provider lifecycle lock {}", path.display()))
 }
 
+/// Whether any client holds a kernel-locked lease or registration marker.
+/// This never deletes: a file can be unlocked only because its owner is
+/// between creating and locking it.
 fn provider_session_is_active(directory: &Path) -> Result<bool> {
-    if !directory.exists() {
-        return Ok(false);
-    }
-    let paths = fs::read_dir(directory)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let mut has_starting = false;
-    for path in paths.iter().filter(|path| {
-        path.extension().and_then(|extension| extension.to_str()) == Some("starting")
-    }) {
-        let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    for path in provider_lease_files(directory)? {
+        // A file removed by its owner since the listing is simply gone.
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
         match file.try_lock() {
-            Err(std::fs::TryLockError::WouldBlock) => has_starting = true,
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(true),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-            Ok(()) => {
-                drop(file);
-                let _ = fs::remove_file(path);
-            }
+            Ok(()) => {}
         }
     }
-    // Do not inspect possibly-unlocked lease files while another client is
-    // still publishing its kernel-locked lease.
-    if has_starting {
-        return Ok(true);
-    }
+    Ok(false)
+}
 
-    let mut active = false;
-    for path in paths
-        .iter()
-        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("lease"))
-    {
-        let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-        match file.try_lock() {
-            Ok(()) => {
-                drop(file);
-                let _ = fs::remove_file(path);
-            }
-            Err(std::fs::TryLockError::WouldBlock) => active = true,
-            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+/// Remove lease files left by crashed clients. The caller must hold the
+/// lifecycle lock, which every client holds while it creates and locks its
+/// files, so an unlocked file here can only be stale.
+fn remove_released_provider_leases(directory: &Path) -> Result<()> {
+    for path in provider_lease_files(directory)? {
+        let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
+            drop(file);
+            let _ = fs::remove_file(&path);
         }
     }
-    Ok(active)
+    Ok(())
+}
+
+fn provider_lease_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("lease" | "starting")
+            )
+        })
+        .collect())
 }
 
 fn runtime_dir(root: &Path) -> Result<PathBuf> {
@@ -1453,6 +1499,67 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    /// Replays `ProviderSessionLease::acquire`, which creates each file and
+    /// only then locks it, against the resident's periodic lease scan, which
+    /// runs without the lifecycle lock.
+    #[test]
+    fn reveals_bug_lease_scan_deletes_a_lease_before_its_owner_locks_it() {
+        let directory = TempDir::new();
+        let leases = directory.0.join("provider-leases");
+        std::fs::create_dir_all(&leases).unwrap();
+        let open_new = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap()
+        };
+
+        let marker_path = leases.join("1-1-0.starting");
+        let marker = open_new(&marker_path);
+        provider_session_is_active(&leases).unwrap();
+        marker.try_lock().unwrap();
+        let lease = open_new(&leases.join("1-1-0.lease"));
+        provider_session_is_active(&leases).unwrap();
+        lease.try_lock().unwrap();
+        drop(marker);
+        let _ = std::fs::remove_file(&marker_path);
+
+        assert!(
+            provider_session_is_active(&leases).unwrap(),
+            "a provider holding a locked lease must keep the resident alive"
+        );
+    }
+
+    /// A signal-driven stop must hold the lifecycle lock through flush, as
+    /// the lease-driven stop does. Otherwise a client registers during the
+    /// flush and starts a replacement that loses the owner lock and exits.
+    #[test]
+    fn reveals_bug_signal_shutdown_does_not_hold_the_lifecycle_lock() {
+        let directory = TempDir::new();
+        let leases = directory.0.join(".membrick/runtime/provider-leases");
+        std::fs::create_dir_all(&leases).unwrap();
+        let provider = std::fs::File::create(leases.join("1-1-0.lease")).unwrap();
+        provider.try_lock().unwrap();
+
+        let gate = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(resident_shutdown(&directory.0, true, async {}));
+
+        assert!(
+            gate.is_some(),
+            "a signal stop must return the lifecycle lock"
+        );
+        let other = open_lifecycle_gate(&directory.0).unwrap();
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "no client may register while the resident flushes"
+        );
     }
 
     #[test]

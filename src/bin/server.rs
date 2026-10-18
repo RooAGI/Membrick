@@ -947,19 +947,9 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let app = app_router(state.clone());
     if args.resident_server {
         let root = state.project_root.clone();
+        let managed = args.managed_resident;
         let shutdown = async move {
-            if args.managed_resident {
-                tokio::select! {
-                    _ = shutdown_signal() => None,
-                    gate = crate::local_ipc::wait_for_no_provider_sessions(
-                        &root,
-                        Duration::from_secs(3),
-                    ) => Some(gate),
-                }
-            } else {
-                shutdown_signal().await;
-                None
-            }
+            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal()).await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(
             app,
