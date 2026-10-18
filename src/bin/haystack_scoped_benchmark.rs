@@ -65,6 +65,10 @@ struct Args {
     #[arg(long)]
     prf: bool,
 
+    /// Number of initial search results used to extract PRF expansion terms.
+    #[arg(long, default_value_t = 10)]
+    prf_feedback_docs: usize,
+
     /// Enable RM3: Relevance Model 3 query expansion.
     #[arg(long)]
     rm3: bool,
@@ -305,6 +309,7 @@ struct BenchmarkReport {
     combsum: bool,
     rrf: bool,
     prf: bool,
+    prf_feedback_docs: usize,
     rm3: bool,
     bo1: bool,
     text_rerank_ngram: bool,
@@ -434,13 +439,14 @@ fn rrf_search(
 }
 
 /// PRF (Luyi 2026-10-09): Pseudo-Relevance Feedback.
-/// 1. Search with original query, get top-10 docs
+/// 1. Search with original query, get the configured feedback documents
 /// 2. Extract top terms from those docs (by frequency, excluding stopwords/query terms)
 /// 3. Add top 20 terms to query, search again
 fn prf_search(
     service: &mut crate::MemoryService,
     question: &str,
     top_k: usize,
+    feedback_docs: usize,
     question_id: &str,
     _reference_date: Option<&str>,
 ) -> anyhow::Result<crate::SearchResponse> {
@@ -451,7 +457,7 @@ fn prf_search(
         .search(crate::SearchRequest {
             query: question.to_string(),
             user_id: BENCHMARK_USER_ID.to_string(),
-            top_k: 10,
+            top_k: feedback_docs.max(1),
             session_id: None,
             scope: None,
             filters: None,
@@ -587,7 +593,7 @@ fn rm3_search(
 }
 
 /// Bo1 (Luyi 2026-10-09): DFR Bose-Einstein query expansion.
-/// 1. Search with original query, get top-10 docs
+/// 1. Search with original query, get the configured feedback documents
 /// 2. For each term, compute Bo1 weight: tf * log2((1+Pn)/Pn) + log2(1+Pn)
 ///    where Pn = (docs containing term) / (total top docs)
 /// 3. Take top 20 by Bo1 weight, append to query, search again
@@ -744,6 +750,7 @@ pub(crate) fn main() -> Result<()> {
         args.combsum,
         args.rrf,
         args.prf,
+        args.prf_feedback_docs,
         args.rm3,
         args.bo1,
         args.structured_fact_retrieval && !args.no_structured_fact_retrieval,
@@ -779,6 +786,7 @@ fn run_scoped_benchmark(
     combsum: bool,
     rrf: bool,
     prf: bool,
+    prf_feedback_docs: usize,
     rm3: bool,
     bo1: bool,
     structured_fact_retrieval: bool,
@@ -944,6 +952,7 @@ fn run_scoped_benchmark(
                 &mut service,
                 &entry.question,
                 retrieval_depth,
+                prf_feedback_docs,
                 &entry.question_id,
                 Some(&entry.question_date),
             )?
@@ -1061,6 +1070,7 @@ fn run_scoped_benchmark(
         combsum,
         rrf,
         prf,
+        prf_feedback_docs,
         rm3,
         bo1,
         text_rerank_ngram,

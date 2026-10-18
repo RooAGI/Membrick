@@ -1,4 +1,10 @@
-# Session metrics
+# Metrics
+
+This directory defines metrics for recorded agent sessions. Retrieval benchmark
+aggregation is provided separately by
+[`scripts/aggregate_benchmark_metrics.py`](../scripts/aggregate_benchmark_metrics.py).
+
+## Session metrics
 
 This directory defines the user-facing metric report for recorded Claude and
 Codex sessions.
@@ -33,3 +39,24 @@ metrics/
 
 Missing provider measurements are represented as `null`, never as zero. This
 distinguishes “not observed” from “observed as zero.”
+
+## Aggregate repeated retrieval runs
+
+Use the aggregation script when comparing repeated LongMemEval or compatible
+retrieval benchmark reports. It requires identical benchmark settings and the
+same set of question IDs, then reports mean, population standard deviation,
+minimum, and maximum across runs for aggregate metrics, question types, and
+each question. This makes run-to-run variation visible without treating
+repetitions as additional questions. The source JSON files are not modified.
+
+```bash
+python3 scripts/aggregate_benchmark_metrics.py \
+  comparison/results/run-1.json \
+  comparison/results/run-2.json \
+  comparison/results/run-3.json \
+  --out comparison/results/repeated-runs.json
+```
+
+The generated JSON preserves the shared configuration and source report paths.
+It is an analysis artifact; it does not update the website or overwrite the
+single-run headline.

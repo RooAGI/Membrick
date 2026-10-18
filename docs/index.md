@@ -96,16 +96,17 @@ with their resident memory owner over local IPC; see the
 
 <h3>Benchmark highlights</h3>
 
-<section class="proof-grid proof-grid--six" aria-label="Membrick benchmark highlights">
-  <div><strong>89.78%</strong><span>fractional Recall@5 · 500 questions</span></div>
-  <div><strong>95.20%</strong><span>fractional Recall@10 · 500 questions</span></div>
-  <div><strong>98.34%</strong><span>fractional Recall@20 · 500 questions</span></div>
-  <div><strong>96.6%</strong><span>any-hit Recall@5 · 500 questions</span></div>
-  <div><strong>98.8%</strong><span>any-hit Recall@10 · 500 questions</span></div>
-  <div><strong>100%</strong><span>any-hit Recall@20 · 500 questions</span></div>
+<!-- BEGIN GENERATED LONGMEMEVAL-S 500-QUESTION HEADLINE -->
+<p><strong>Latest LongMemEval-S result · 500 questions · 2026-10-16</strong></p>
+<section class="proof-grid proof-grid--five" aria-label="Latest LongMemEval-S benchmark results">
+  <div><strong>89.78%</strong><span>fractional Recall@5</span></div>
+  <div><strong>98.8%</strong><span>any-hit Recall@10</span></div>
+  <div><strong>88.85%</strong><span>MRR</span></div>
+  <div><strong>87.91%</strong><span>NDCG@10</span></div>
+  <div><strong>3.48 ms</strong><span>mean search time</span></div>
 </section>
-
-<p class="benchmark-note">These are the latest release-candidate results across all 500 LongMemEval-S questions, using the heuristic NER backend, structured-fact retrieval, a single index, and no embeddings. Fractional Recall reports how many relevant sessions were recovered; any-hit Recall reports whether at least one relevant session appeared in the results. See the <a href="benchmark-results/">full benchmark results</a> for MRR, NDCG, search timing, methodology, and reports. HTTP throughput is measured separately and documented on the <a href="http-server-benchmarks/">HTTP server benchmarks</a> page.</p>
+<p class="benchmark-note">Single index · heuristic NER · structured-fact retrieval · no embeddings. <a href="benchmark-results/">Methods and report</a> · <a href="https://github.com/RooAGI/Membrick/blob/main/comparison/results/retrieval-longmemeval-500-2026-10-16-v0.6.1-32abbd6.json">Raw JSON</a>.</p>
+<!-- END GENERATED LONGMEMEVAL-S 500-QUESTION HEADLINE -->
 
 <p class="benchmark-note">Agent integration results and their limits are listed on the <a href="performance/">Performance page</a>. The latest Claude comparison covers three repetitions of one scenario in each of three arms; it reports a 75% drop in fresh input tokens, a 79.0% to 79.6% drop in overall tokens, and a 16.0% to 18.5% drop in overall tokens per fresh input token. This is diagnostic evidence for that fixture and scenario, not a general performance claim.</p>
 

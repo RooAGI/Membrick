@@ -10,8 +10,7 @@ The fair cross-system comparison and segmented route experiments below are
 different benchmark tracks and retain their own reports.
 
 <!-- BEGIN GENERATED LONGMEMEVAL-S 500-QUESTION HEADLINE -->
-**LongMemEval-S, 500 questions · 2026-10-15 · single index · heuristic NER · structured-fact retrieval · no embeddings**
-Working-tree run based on `b204b7e`; not a clean release measurement.
+**LongMemEval-S, 500 questions · 2026-10-16 · single index · heuristic NER · structured-fact retrieval · no embeddings**
 
 | Metric | Result |
 |---|---:|
@@ -19,9 +18,9 @@ Working-tree run based on `b204b7e`; not a clean release measurement.
 | Any-hit Recall@5 / @10 / @20 | 96.6% / 98.8% / 100.0% |
 | MRR | 88.85% |
 | NDCG@10 | 87.91% |
-| Mean search time | 3.39 ms |
+| Mean search time | 3.48 ms |
 
-Source report: [`retrieval-longmemeval-500-2026-10-15-v0.6.0-b204b7e-working-tree.json`](https://github.com/RooAGI/Membrick/blob/main/comparison/results/retrieval-longmemeval-500-2026-10-15-v0.6.0-b204b7e-working-tree.json).
+Source report: [`retrieval-longmemeval-500-2026-10-16-v0.6.1-32abbd6.json`](https://github.com/RooAGI/Membrick/blob/main/comparison/results/retrieval-longmemeval-500-2026-10-16-v0.6.1-32abbd6.json).
 <!-- END GENERATED LONGMEMEVAL-S 500-QUESTION HEADLINE -->
 
 ## Canonical LongMemEval-S comparison result

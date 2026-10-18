@@ -641,7 +641,7 @@ fn open_workspace_owner_at(
     options: PipelineOptions,
 ) -> anyhow::Result<MemoryService> {
     let ignore_paths = provider_memory_ignore_paths();
-    MemoryService::open_workspace_owner_with_options_at(
+    let owner = MemoryService::open_workspace_owner_with_options_at(
         root,
         workspace_root,
         crate::integrations::mcp_index::SHARED_MEMORY_DIR,
@@ -659,7 +659,9 @@ fn open_workspace_owner_at(
             let graph = crate::adapters::apply_ignore_paths(graph, &ignore_paths);
             Ok(crate::adapters::graph_to_source_documents(&graph))
         },
-    )
+    )?;
+    owner.start_search_history_index(root);
+    Ok(owner)
 }
 
 #[tokio::main]
