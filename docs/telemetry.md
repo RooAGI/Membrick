@@ -2,8 +2,8 @@
 
 Membrick telemetry is local operational data used to understand query behavior
 and provider activity. It is separate from indexed memory and session archives.
-Aggregate telemetry is bounded. Detailed MCP tool history retains complete
-arguments and responses.
+Aggregate telemetry is bounded. Each detailed MCP tool history entry is capped
+at 16 MiB; oversized arguments or responses are recorded as omission markers.
 
 ## Telemetry streams
 
@@ -33,10 +33,12 @@ request rate and latency summaries from these aggregates. Query strings,
 session IDs, and document contents are not stored in this aggregate stream.
 
 The detailed MCP tool history is an append-only JSON Lines file with no
-retention, entry-count, or payload-size limit. Each entry includes provider,
-tool name, complete arguments, timestamp, elapsed time, success or error
-status, a stable `trace_id`, and the complete response returned by the resident
-handler. `session_attribution` is `explicit` when the caller supplied a
+retention or entry-count limit. Each entry includes provider, tool name,
+arguments, timestamp, elapsed time, success or error status, a stable
+`trace_id`, and the response returned by the resident handler. An entry is
+capped at 16 MiB; when its serialized arguments and response exceed that limit,
+both are replaced with omission markers while the trace ID and call metadata
+are preserved. `session_attribution` is `explicit` when the caller supplied a
 session ID, `inferred` when the resident resolved the provider's active session,
 or `absent` when no session applies. The resident's internal attribution
 metadata is removed before the provider receives the search response. Review

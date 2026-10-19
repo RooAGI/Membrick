@@ -56,10 +56,20 @@ def percentile(values: list[float], p: float) -> float | None:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def socket_path_for(root: Path) -> Path:
-    identity = os.environ.get("USER", "")
-    digest = hashlib.sha256(identity.encode() + b"\0" + os.fsencode(root)).hexdigest()
-    return root / ".membrick" / "runtime" / f"mb-{digest[:24]}.sock"
+def socket_path_for(root: Path, timeout_s: float = 60.0) -> Path:
+    """The socket the resident recorded once it started listening.
+
+    Each resident binds a socket with a fresh name and writes it to
+    `.membrick/runtime/resident.json`, so the path is read, not derived.
+    """
+    record = root / ".membrick" / "runtime" / "resident.json"
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        try:
+            return Path(json.loads(record.read_text(encoding="utf-8"))["socket"])
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            time.sleep(0.02)
+    raise TimeoutError(f"resident did not record its socket in {record}")
 
 
 def request(
@@ -179,7 +189,8 @@ def start_server(
     ]
     if transport in {"ipc", "file-queue"}:
         command.append("--resident-server")
-        endpoint: str | Path = socket_path_for(root)
+        # Read from the resident's record once it is listening.
+        endpoint: str | Path = root
     else:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -196,6 +207,8 @@ def start_server(
         stderr=subprocess.STDOUT,
     )
     try:
+        if transport == "ipc":
+            endpoint = socket_path_for(root)
         startup_ms = wait_ready(transport, endpoint, root)
     except Exception:
         process.terminate()

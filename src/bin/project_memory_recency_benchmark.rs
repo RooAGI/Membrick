@@ -50,7 +50,7 @@ fn source_document(record: DocRecord) -> SourceDocument {
     SourceDocument {
         doc_id: record.doc_id,
         source: record.source,
-        content: record.content,
+        content: record.content.into(),
         concept: record.probable_topic.unwrap_or_default(),
         group_id: record.group_id,
         filters: record.filters,

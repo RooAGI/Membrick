@@ -258,7 +258,7 @@ pub fn source_documents_to_tier1_inputs(docs: &[SourceDocument]) -> Vec<Tier1Doc
         .map(|doc| Tier1DocInput {
             id: doc.doc_id.clone(),
             source: doc.source.clone(),
-            content: doc.content.clone(),
+            content: doc.content.to_string(),
             concept: doc.concept.clone(),
             headings: doc.headings.clone(),
         })
@@ -596,7 +596,12 @@ fn assemble_doc_record(
     let mut record = DocRecord {
         doc_id: doc.id.clone(),
         source: doc.source.clone(),
-        content: doc.content.clone(),
+        // Share the source document's text instead of copying it.
+        content: if source_doc.content == doc.content {
+            source_doc.content.clone()
+        } else {
+            doc.content.as_str().into()
+        },
         timestamp: source_doc.timestamp.clone(),
         doc_length: source_doc.doc_length,
         author_agent: source_doc.author_agent.clone(),
@@ -628,6 +633,7 @@ fn assemble_doc_record(
         content_hash: doc_record_content_hash(source_doc, options),
         semantic_tags,
     };
+    record.share_whole_record_chunks();
 
     // Native event relations are a core part of the write path, independent
     // of the optional generic claim extractor. They are cheap clause rules

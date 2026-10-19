@@ -78,7 +78,7 @@ pub mod semantic_audit;
 mod semantic_relations;
 mod session_prepare;
 mod source;
-mod state_paths;
+pub mod state_paths;
 mod telemetry;
 mod temporal_fact;
 

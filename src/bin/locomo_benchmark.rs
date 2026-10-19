@@ -190,7 +190,7 @@ fn build_conversation_docs(conv: &LocomoConversation) -> Result<Vec<SourceDocume
             docs.push(SourceDocument {
                 doc_id: format!("{group_id}::turn{turn_idx}"),
                 source: format!("locomo/{}/session/{n}/turn/{turn_idx}", conv.sample_id),
-                content: format!("{}: {}", turn.speaker, turn.text),
+                content: format!("{}: {}", turn.speaker, turn.text).into(),
                 concept: "locomo-turn".to_string(),
                 group_id: Some(group_id.clone()),
                 filters: BTreeMap::new(),

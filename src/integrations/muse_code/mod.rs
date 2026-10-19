@@ -293,7 +293,7 @@ pub fn install_memory_policy(root: &Path) -> Result<PathBuf> {
 }
 
 pub fn run_server(root: &Path, options: MuseServerOptions<'_>) -> Result<()> {
-    let _resident_lease = crate::local_ipc::start_provider_session(root, "muse")?;
+    crate::local_ipc::ensure_provider_resident(root, "muse")?;
     tracing::debug!("MCP server starting");
     let mcp = MuseMcp {
         root: root.to_path_buf(),
@@ -1341,8 +1341,7 @@ mod tests {
             vec![SourceDocument {
                 doc_id: "doc-1".to_string(),
                 source: "decisions.md".to_string(),
-                content: "We dropped embeddings because the heuristic backend was faster."
-                    .to_string(),
+                content: "We dropped embeddings because the heuristic backend was faster.".into(),
                 concept: "Decisions".to_string(),
                 group_id: None,
                 headings: Vec::new(),
@@ -1373,8 +1372,7 @@ mod tests {
             vec![SourceDocument {
                 doc_id: "doc-1".to_string(),
                 source: "decisions.md".to_string(),
-                content: "We dropped embeddings because the heuristic backend was faster."
-                    .to_string(),
+                content: "We dropped embeddings because the heuristic backend was faster.".into(),
                 concept: "Decisions".to_string(),
                 group_id: None,
                 headings: Vec::new(),

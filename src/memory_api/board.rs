@@ -138,7 +138,7 @@ impl MemoryService {
         let doc = crate::SourceDocument {
             doc_id: board_doc_id(&board_id),
             source: "board-registry".to_string(),
-            content: board_doc_content(&board),
+            content: board_doc_content(&board).into(),
             concept: format!("board {}", board.key),
             group_id: None,
             headings: vec![],
@@ -376,7 +376,7 @@ impl MemoryService {
         let doc = crate::SourceDocument {
             doc_id: post.post_id.clone(),
             source: "board-post".to_string(),
-            content: post.content.clone(),
+            content: post.content.as_str().into(),
             concept: format!("board post {}:{}", board_id, sequence),
             group_id: Some(board_id.clone()),
             headings: vec![],
@@ -476,7 +476,7 @@ impl MemoryService {
                 board_id: board_id.clone(),
                 author_agent_id: f.get(BOARD_AUTHOR_FILTER).cloned().unwrap_or_default(),
                 provider: f.get(BOARD_PROVIDER_FILTER).cloned().unwrap_or_default(),
-                content: doc.content.clone(),
+                content: doc.content.to_string(),
                 sequence,
                 created_at: doc.timestamp.clone().unwrap_or_default(),
             });
@@ -524,7 +524,7 @@ impl MemoryService {
                     board_id: board_id.clone(),
                     author_agent_id: f.get(BOARD_AUTHOR_FILTER).cloned().unwrap_or_default(),
                     provider: f.get(BOARD_PROVIDER_FILTER).cloned().unwrap_or_default(),
-                    content: d.content.clone(),
+                    content: d.content.to_string(),
                     sequence,
                     created_at: d.timestamp.clone().unwrap_or_default(),
                 }))
@@ -582,7 +582,7 @@ impl MemoryService {
                 board_id: board_id.clone(),
                 author_agent_id: f.get(BOARD_AUTHOR_FILTER).cloned().unwrap_or_default(),
                 provider: f.get(BOARD_PROVIDER_FILTER).cloned().unwrap_or_default(),
-                content: d.content.clone(),
+                content: d.content.to_string(),
                 sequence,
                 created_at: d.timestamp.clone().unwrap_or_default(),
             });

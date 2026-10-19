@@ -63,7 +63,7 @@ pub(crate) fn main() -> Result<()> {
             sessions.push(SourceDocument {
                 doc_id: id.clone(),
                 source: format!("longmemeval://{id}"),
-                content: content.clone(),
+                content: content.as_str().into(),
                 concept: "conversation".into(),
                 group_id: Some(id.clone()),
                 filters: Default::default(),

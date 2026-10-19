@@ -672,7 +672,11 @@ impl SegmentRoutingSummary {
         // Sorted: docs is a HashMap, and float weight accumulation is
         // order-sensitive at the last ULP. Deterministic input order keeps
         // summaries bit-identical across builds from the same records.
-        let mut records = index.docs.values().cloned().collect::<Vec<_>>();
+        let mut records = index
+            .docs
+            .values()
+            .map(|record| record.as_ref().clone())
+            .collect::<Vec<_>>();
         records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
         Self::from_records(&records)
     }

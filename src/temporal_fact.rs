@@ -1,7 +1,7 @@
 use crate::index::{Claim, DocRecord};
 use crate::pipeline::ChunkLifecycleMeta;
 use crate::temporal::parse_temporal_date;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -121,7 +121,7 @@ pub struct TemporalFactStore {
     #[serde(skip)]
     latest_by_key: HashMap<String, usize>,
     #[serde(skip)]
-    last_record_order: Option<(Option<NaiveDate>, String)>,
+    last_record_order: Option<(Option<DateTime<Utc>>, String)>,
     /// Fact IDs whose `valid_to` was inferred from a later fact during
     /// ingestion. As-known queries rebuild those boundaries from only the
     /// facts that had been recorded by their cutoff.
@@ -141,20 +141,17 @@ impl TemporalFactStore {
     where
         I: IntoIterator<Item = &'a DocRecord>,
     {
-        let mut ordered = records.into_iter().collect::<Vec<_>>();
-        ordered.sort_by(|a, b| {
-            let a_date = a
-                .timestamp_for_temporal_evidence()
-                .and_then(|value| parse_temporal_date(Some(value)));
-            let b_date = b
-                .timestamp_for_temporal_evidence()
-                .and_then(|value| parse_temporal_date(Some(value)));
-            a_date.cmp(&b_date).then_with(|| a.doc_id.cmp(&b.doc_id))
-        });
+        // Parse each timestamp once. Parsing inside the sort comparator repeats
+        // the date work O(n log n) times for the same records.
+        let mut ordered = records
+            .into_iter()
+            .map(|record| (record_order_key(record), record))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let mut store = Self::default();
-        for record in ordered {
-            store.last_record_order = Some(record_order_key(record));
+        for (order_key, record) in ordered {
+            store.last_record_order = Some(order_key);
             let (source_chunk_id, source_chunk_version, chunk_timestamp) =
                 best_source_chunk(record, chunk_lifecycle);
             for claim in &record.top_claims {
@@ -519,13 +516,24 @@ fn parse_recorded_at(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     ))
 }
 
-fn record_order_key(record: &DocRecord) -> (Option<NaiveDate>, String) {
+fn record_order_key(record: &DocRecord) -> (Option<DateTime<Utc>>, String) {
     (
         record
             .timestamp_for_temporal_evidence()
-            .and_then(|value| parse_temporal_date(Some(value))),
+            .and_then(parse_record_order_timestamp),
         record.doc_id.clone(),
     )
+}
+
+fn parse_record_order_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.with_timezone(&Utc));
+    }
+    let date = parse_temporal_date(Some(value))?;
+    Some(DateTime::from_naive_utc_and_offset(
+        date.and_hms_opt(0, 0, 0)?,
+        Utc,
+    ))
 }
 
 impl DocRecord {
@@ -625,7 +633,7 @@ mod tests {
         DocRecord {
             doc_id: doc_id.to_string(),
             source: format!("source://{}", doc_id),
-            content: "dummy".to_string(),
+            content: "dummy".into(),
             timestamp: timestamp.map(|v| v.to_string()),
             doc_length: 5,
             author_agent: None,
@@ -654,7 +662,7 @@ mod tests {
             section_chunks: vec![SectionChunk {
                 chunk_id: format!("{}::chunk-0", doc_id),
                 heading: "Overview".to_string(),
-                content: "Alice works at Acme".to_string(),
+                content: "Alice works at Acme".into(),
                 start_line: 1,
                 end_line: 1,
                 timestamp: timestamp.map(|v| v.to_string()),

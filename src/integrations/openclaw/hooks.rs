@@ -278,8 +278,8 @@ fn resolve_root(
     let path = candidate
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback_root.to_path_buf());
-    path.canonicalize()
-        .with_context(|| format!("failed to canonicalize OpenClaw root {}", path.display()))
+    crate::state_paths::find_project_root(&path)?
+        .context("no installed Membrick project covers OpenClaw workspace")
 }
 
 /// Best-effort session identity for telemetry and registry keys.
@@ -662,7 +662,9 @@ mod tests {
             id
         ));
         fs::create_dir_all(&root).unwrap();
-        fs::canonicalize(root).unwrap()
+        let root = fs::canonicalize(root).unwrap();
+        crate::state_paths::record_install_settings(&root).unwrap();
+        root
     }
 
     fn test_publish(root: &Path, document: crate::SourceDocument) -> Result<()> {

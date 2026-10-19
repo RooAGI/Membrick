@@ -140,7 +140,13 @@ fn publish_owner(
     schedules: &mut [StoreSchedule; 2],
     targets: &[MemoryStore],
 ) -> anyhow::Result<()> {
-    let mut view = owner.published_read_view()?;
+    let previous = {
+        let current = published
+            .read()
+            .map_err(|_| anyhow::anyhow!("published view poisoned"))?;
+        Arc::clone(&current)
+    };
+    let mut view = owner.published_read_view_with_previous(Some(&previous))?;
     *generation = generation.saturating_add(1);
     view.set_published_generation(*generation);
     publish_view(published, view)?;

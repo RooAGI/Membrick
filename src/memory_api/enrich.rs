@@ -725,11 +725,11 @@ fn set_session_conclusion(document: &mut SourceDocument, conclusion: &str) {
     if let Some(previous) = document.filters.get(CONCLUSION_FILTER) {
         let previous_block = format!("\n\n{CONCLUSION_HEADING}\n{previous}");
         if let Some(base) = document.content.strip_suffix(&previous_block) {
-            document.content = base.to_string();
+            document.content = base.into();
         }
     }
     let base = document.content.trim_end();
-    document.content = format!("{base}\n\n{CONCLUSION_HEADING}\n{conclusion}");
+    document.content = format!("{base}\n\n{CONCLUSION_HEADING}\n{conclusion}").into();
     document
         .filters
         .insert(CONCLUSION_FILTER.to_string(), conclusion.to_string());
@@ -742,7 +742,7 @@ fn remove_session_conclusion(document: &mut SourceDocument) {
     if let Some(previous) = document.filters.remove(CONCLUSION_FILTER) {
         let previous_block = format!("\n\n{CONCLUSION_HEADING}\n{previous}");
         if let Some(base) = document.content.strip_suffix(&previous_block) {
-            document.content = base.to_string();
+            document.content = base.into();
             document.doc_length = document.content.len();
         }
     }

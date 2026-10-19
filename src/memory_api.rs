@@ -1071,7 +1071,7 @@ impl MemoryService {
             new_docs.push(SourceDocument {
                 doc_id: memory_document_id(&request.user_id, &request.request_id, message_index),
                 source,
-                content: format!("{}: {}", message.role, message.content),
+                content: format!("{}: {}", message.role, message.content).into(),
                 concept: "memory".to_string(),
                 group_id: Some(request.session_id.clone()),
                 headings: vec![],
@@ -1208,7 +1208,7 @@ impl MemoryService {
         if role != "user" && role != "assistant" {
             anyhow::bail!("role must be user or assistant");
         }
-        document.content = format!("{role}: {}", request.content);
+        document.content = format!("{role}: {}", request.content).into();
         document.author_agent = Some(role);
         document.timestamp = request
             .timestamp
@@ -1272,6 +1272,22 @@ impl MemoryService {
         workspace: Self,
         provider_memory: Option<Self>,
     ) -> anyhow::Result<Self> {
+        Self::compose_segmented_inner(workspace, provider_memory, None)
+    }
+
+    pub(crate) fn compose_segmented_read_view_with_previous(
+        workspace: Self,
+        provider_memory: Option<Self>,
+        previous: crate::IndexStore,
+    ) -> anyhow::Result<Self> {
+        Self::compose_segmented_inner(workspace, provider_memory, Some(previous))
+    }
+
+    fn compose_segmented_inner(
+        workspace: Self,
+        provider_memory: Option<Self>,
+        previous: Option<crate::IndexStore>,
+    ) -> anyhow::Result<Self> {
         let provider_generation = provider_memory
             .as_ref()
             .map(|service| service.store.inspection().snapshot_revision)
@@ -1314,10 +1330,17 @@ impl MemoryService {
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
-        let composed = crate::IndexStore::compose_segmented_read_view(
-            workspace.store,
-            provider_memory.map(|service| service.store),
-        )?;
+        let composed = match previous {
+            Some(previous) => crate::IndexStore::compose_segmented_read_view_with_previous(
+                workspace.store,
+                provider_memory.map(|service| service.store),
+                previous,
+            )?,
+            None => crate::IndexStore::compose_segmented_read_view(
+                workspace.store,
+                provider_memory.map(|service| service.store),
+            )?,
+        };
         let mut composed = composed;
         composed.set_published_generation(provider_generation);
         crate::preload_lexical_store();
@@ -1764,7 +1787,7 @@ impl MemoryService {
                     .filter(|doc| self.is_visible(doc))
                     .map(|doc| SearchMemory {
                         id: result.doc_id,
-                        content: doc.content.clone(),
+                        content: doc.content.to_string(),
                         score: result.score,
                         created_at: doc.timestamp.clone(),
                         role: doc.author_agent.clone(),
@@ -1913,7 +1936,7 @@ fn memory_record(doc: &SourceDocument) -> MemoryRecord {
     });
     MemoryRecord {
         id: doc.doc_id.clone(),
-        content: doc.content.clone(),
+        content: doc.content.to_string(),
         role: doc.author_agent.clone(),
         user_id: doc.filters.get(USER_FILTER).cloned().unwrap_or_default(),
         session_id: doc.group_id.clone(),

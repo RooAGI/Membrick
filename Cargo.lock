@@ -1798,6 +1798,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]

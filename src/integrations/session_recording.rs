@@ -558,7 +558,7 @@ pub fn promote_recorded_session(
             filters,
             group_id: Some(group_id.clone()),
             doc_id: doc_id.clone(),
-            content: body,
+            content: body.into(),
             key_phrases: Vec::new(),
             key_phrase_extraction_hash: String::new(),
         });
@@ -719,7 +719,7 @@ pub(crate) fn capture_workspace_file_changes(
                 source,
                 concept: format!("File change: {}", change.file_path),
                 doc_length: content.len(),
-                content,
+                content: content.into(),
                 group_id: Some("workspace-file-changes".to_string()),
                 headings: vec!["Workspace file change".to_string()],
                 links: Vec::new(),

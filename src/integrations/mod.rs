@@ -28,6 +28,7 @@ pub mod hermes;
 pub mod muse_code;
 #[cfg(feature = "openclaw")]
 pub mod openclaw;
+pub(crate) mod provider_lifecycle;
 #[cfg(feature = "roo-runtime")]
 pub mod roo_runtime;
 

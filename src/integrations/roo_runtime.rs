@@ -75,9 +75,17 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
             }
             (_, None) => anyhow::bail!("Roo memory hook payload is missing workspaceRoot"),
         };
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("cannot resolve Roo workspace {}", root.display()))?;
+        let root = match crate::state_paths::find_project_root(&root) {
+            Ok(Some(root)) => root,
+            Ok(None) => {
+                tracing::warn!("Membrick Roo hook skipped: no installed project covers workspace");
+                return Ok(HookResult::default());
+            }
+            Err(error) => {
+                tracing::warn!("Membrick Roo hook skipped: {error:#}");
+                return Ok(HookResult::default());
+            }
+        };
         // The host-managed memory search tool returns existing evidence;
         // indexing that view again would amplify retrieval copies as new facts.
         if matches!(
@@ -584,7 +592,7 @@ fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result
             chunk.source = format!("{}/chunk/{}", document.source, chunks.len());
             chunk.doc_id = crate::ids::stable_doc_id_from_source(&chunk.source);
         }
-        chunk.content = part;
+        chunk.content = part.into();
         chunk.doc_length = chunk.content.len();
         chunk
             .filters

@@ -1141,7 +1141,7 @@ impl MemoryIndex {
         let skip_sequence_rerank = query_routing_intent.is_some() && !has_explicit_temporal;
         if !skip_sequence_rerank && !q_terms.is_empty() {
             for doc_u32 in rerank_window {
-                let Some(candidate_tokens) = cached_doc_rerank_tokens(self, doc_u32) else {
+                let Some(candidate_token_ids) = cached_doc_rerank_tokens(self, doc_u32) else {
                     let Some(doc_id) = self.doc_u32_to_id.get(doc_u32) else {
                         continue;
                     };
@@ -1173,18 +1173,24 @@ impl MemoryIndex {
                     }
                     continue;
                 };
+                let candidate_tokens = candidate_token_ids
+                    .iter()
+                    .filter_map(|token_id| {
+                        self.rerank_token_lexicon.get(*token_id as usize).cloned()
+                    })
+                    .collect::<Vec<_>>();
                 if candidate_tokens.is_empty() {
                     continue;
                 }
-                let token_overlap = token_overlap_ratio(&q_terms, candidate_tokens);
+                let token_overlap = token_overlap_ratio(&q_terms, &candidate_tokens);
                 let mut delta = TEXT_RERANK_WEIGHT * token_overlap;
                 if self.text_rerank_ngram {
                     let ngram_overlap =
-                        ngram_overlap_ratio(&q_terms, candidate_tokens, TEXT_RERANK_NGRAM_SIZE);
+                        ngram_overlap_ratio(&q_terms, &candidate_tokens, TEXT_RERANK_NGRAM_SIZE);
                     delta += TEXT_RERANK_NGRAM_WEIGHT * ngram_overlap;
                 }
                 if self.text_rerank_lcs {
-                    let lcs_overlap = lcs_ratio(&q_terms, candidate_tokens);
+                    let lcs_overlap = lcs_ratio(&q_terms, &candidate_tokens);
                     delta += TEXT_RERANK_LCS_WEIGHT * lcs_overlap;
                 }
                 if delta <= 0.0 {
@@ -1713,7 +1719,14 @@ impl MemoryIndex {
         }
 
         let doc_terms: HashSet<String> = cached_doc_rerank_tokens(self, doc_u32)
-            .map(|tokens| tokens.iter().cloned().collect())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter_map(|token_id| {
+                        self.rerank_token_lexicon.get(*token_id as usize).cloned()
+                    })
+                    .collect()
+            })
             .unwrap_or_else(|| tokenize_query_terms(normalized).into_iter().collect());
         let matched_terms = content_terms
             .iter()

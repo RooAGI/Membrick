@@ -40,9 +40,24 @@ pub struct StagedAddResponse {
 
 impl MemoryService {
     pub(crate) fn published_read_view(&self) -> anyhow::Result<Self> {
+        self.published_read_view_with_previous(None)
+    }
+
+    pub(crate) fn published_read_view_with_previous(
+        &self,
+        previous: Option<&Self>,
+    ) -> anyhow::Result<Self> {
         let provider_view = self.read_view_with_store(self.store.published_read_view());
         if let Some(workspace) = &self.workspace_store {
-            return Self::compose_segmented(workspace.published_read_view()?, Some(provider_view));
+            let workspace_view = workspace.published_read_view()?;
+            if let Some(previous) = previous {
+                return Self::compose_segmented_read_view_with_previous(
+                    workspace_view,
+                    Some(provider_view),
+                    previous.store.published_read_view(),
+                );
+            }
+            return Self::compose_segmented(workspace_view, Some(provider_view));
         }
         Ok(provider_view)
     }

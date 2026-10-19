@@ -578,6 +578,7 @@ pub(crate) fn source_document_from_record(record: &DocRecord) -> SourceDocument 
     SourceDocument {
         doc_id: record.doc_id.clone(),
         source: record.source.clone(),
+        // A reopened store keeps one copy: the document shares the record's text.
         content: record.content.clone(),
         concept: reconstructed_concept(record).to_string(),
         group_id: record.group_id.clone(),
@@ -602,7 +603,7 @@ pub(crate) fn source_document_from_record(record: &DocRecord) -> SourceDocument 
 fn matches_reconstruction(doc: &SourceDocument, record: &DocRecord) -> bool {
     doc.doc_id == record.doc_id
         && doc.source == record.source
-        && doc.content == record.content
+        && record.content == doc.content
         && doc.concept == reconstructed_concept(record)
         && doc.group_id == record.group_id
         && doc.filters == record.filters
@@ -892,7 +893,8 @@ pub(crate) fn load_semantic_state(
 }
 
 pub(crate) struct PreparedSemanticState {
-    records: String,
+    // Internal transport only; records.json on disk remains ordinary JSON.
+    records: Vec<u8>,
     lifecycle: String,
     core: Option<Vec<u8>>,
 }
@@ -934,8 +936,15 @@ pub(crate) fn prepare_semantic_state(
     };
     let mut lifecycle = chunk_lifecycle_map.values().collect::<Vec<_>>();
     lifecycle.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
+    // Stream directly into the encoder: never materialize the uncompressed
+    // corpus JSON in a second heap buffer while the immutable records live.
+    let encoder = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
+    let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, encoder);
+    serde_json::to_writer(&mut buffered, &payload)?;
+    let encoder = buffered.into_inner().map_err(|error| error.into_error())?;
+    let records = encoder.finish()?;
     Ok(PreparedSemanticState {
-        records: serde_json::to_string(&payload)?,
+        records,
         lifecycle: serde_json::to_string(&lifecycle)?,
         core: snapshot.map(MemoryIndex::to_bytes).transpose()?,
     })
@@ -949,9 +958,14 @@ pub(crate) fn persist_prepared_semantic_state(
         return Ok(());
     };
     fs::create_dir_all(semantic_dir)?;
-    write_text_file_atomic(
+    write_file_atomic_with(
         &semantic_records_path(paths).expect("records path"),
-        &prepared.records,
+        false,
+        |file| {
+            let mut decoder = zstd::stream::read::Decoder::new(prepared.records.as_slice())?;
+            std::io::copy(&mut decoder, file)?;
+            Ok(())
+        },
     )?;
     write_text_file_atomic(
         &chunk_lifecycle_path(paths).expect("lifecycle path"),
@@ -1064,6 +1078,17 @@ fn write_bytes_file_atomic_with_permissions(
     content: &[u8],
     private: bool,
 ) -> Result<()> {
+    write_file_atomic_with(path, private, |file| {
+        file.write_all(content)?;
+        Ok(())
+    })
+}
+
+fn write_file_atomic_with(
+    path: &Path,
+    private: bool,
+    write: impl FnOnce(&mut fs::File) -> Result<()>,
+) -> Result<()> {
     ensure_safe_output_path(path)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1071,7 +1096,8 @@ fn write_bytes_file_atomic_with_permissions(
         }
     }
     let temp_path = atomic_temp_path(path)?;
-    {
+    let mut created = false;
+    let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
@@ -1082,10 +1108,17 @@ fn write_bytes_file_atomic_with_permissions(
         #[cfg(not(unix))]
         let _ = private;
         let mut file = options.open(&temp_path)?;
-        file.write_all(content)?;
+        created = true;
+        write(&mut file)?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() && created {
+        let _ = fs::remove_file(&temp_path);
     }
-    fs::rename(&temp_path, path)?;
+    result?;
     // Unix permits opening and syncing a directory to make the rename durable.
     // Windows does not expose directory fsync through `File::open`; doing so
     // fails with ERROR_ACCESS_DENIED after the destination was already replaced.
@@ -1094,4 +1127,80 @@ fn write_bytes_file_atomic_with_permissions(
         fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod checkpoint_buffer_tests {
+    use super::*;
+
+    /// Allocation regression: retained checkpoint bytes must compress repeated
+    /// captured text. Round-trip assertions cover the unchanged on-disk format.
+    #[test]
+    fn prepared_checkpoint_does_not_retain_another_full_json_copy() {
+        let content = "quoted \" text\n café ☃ ".repeat(200_000);
+        let record: DocRecord = serde_json::from_value(serde_json::json!({
+            "doc_id":"large", "source":"test://large", "content":content,
+            "timestamp":null, "doc_length":content.len(), "author_agent":null,
+            "group_id":null, "probable_topic":null, "doc_type_guess":null,
+            "headings":[], "key_entities":[], "important_terms":[],
+            "section_chunks":[], "embedding":null, "top_claims":[],
+            "provenance":{"source":"test://large", "timestamp":null,
+                "ner_provider":"heuristic", "term_ranker":"yake", "index_version":"test"}
+        }))
+        .unwrap();
+        let records = HashMap::from([("large".to_string(), Arc::new(record))]);
+        let mut prepared = prepare_semantic_state(None, &records, &HashMap::new()).unwrap();
+        assert!(
+            prepared.records.len() < content.len() / 10,
+            "checkpoint retained {} bytes for {} bytes of repeated source text",
+            prepared.records.len(),
+            content.len()
+        );
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mb-checkpoint-buffer-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        eprintln!(
+            "retained checkpoint bytes={}, source bytes={}",
+            prepared.records.len(),
+            content.len()
+        );
+        let paths = StorePaths {
+            root: Some(root.clone()),
+            semantic_dir: Some(root.clone()),
+            lexical_dir: None,
+            metadata_path: None,
+        };
+        persist_prepared_semantic_state(&paths, &prepared).unwrap();
+        let payload: serde_json::Value = serde_json::from_reader(
+            fs::File::open(semantic_records_path(&paths).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["records"][0]["content"].as_str(),
+            Some(content.as_str())
+        );
+        assert_eq!(payload["schema_version"], STORE_SCHEMA_VERSION);
+        assert_eq!(payload["layout_version"], STORE_LAYOUT_VERSION);
+        assert_eq!(
+            fs::read_to_string(chunk_lifecycle_path(&paths).unwrap()).unwrap(),
+            "[]"
+        );
+        let records_path = semantic_records_path(&paths).unwrap();
+        let prior = fs::read(&records_path).unwrap();
+        prepared.records.truncate(8);
+        assert!(persist_prepared_semantic_state(&paths, &prepared).is_err());
+        assert_eq!(
+            fs::read(&records_path).unwrap(),
+            prior,
+            "failed streaming write replaced a valid checkpoint"
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "failed streaming write left a temporary output file"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

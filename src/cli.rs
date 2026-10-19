@@ -484,6 +484,19 @@ pub struct Args {
     pub promote_session: Option<String>,
     #[arg(long, hide = true)]
     pub replay_session: Option<String>,
+    /// Rebuild one Claude Code or Codex session's documents from its transcript
+    /// under the current capture rules and print a report. Choose the provider
+    /// with `--session-provider` and give the transcript with
+    /// `--recapture-transcript`. Nothing is written unless `--recapture-apply`
+    /// is also given.
+    #[arg(long, hide = true)]
+    pub recapture_session: Option<String>,
+    #[arg(long, hide = true)]
+    pub recapture_transcript: Option<String>,
+    /// Swap the rebuilt documents in for the session's stored ones in one
+    /// durable write through the resident.
+    #[arg(long, requires = "recapture_session", hide = true)]
+    pub recapture_apply: bool,
     #[arg(long, hide = true)]
     pub replay_enable_membrick: bool,
     #[arg(long, conflicts_with = "replay_enable_membrick", hide = true)]

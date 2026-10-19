@@ -62,7 +62,15 @@ pub fn run_hook(kind: ClaudeHookKind, fallback_root: &Path) -> Result<()> {
         crate::integrations::read_bounded_json().context("failed to parse Claude hook input")?;
     let input: ClaudeHookInput =
         serde_json::from_value(raw).context("failed to decode Claude hook input")?;
-    let root = resolve_root(&input.cwd, fallback_root)?;
+    let root = match resolve_root(&input.cwd, fallback_root) {
+        Ok(Some(root)) => root,
+        // No Membrick install covers this folder: nothing to recall or capture.
+        Ok(None) => return write_output(&ClaudeHookOutput::default()),
+        Err(error) => {
+            tracing::warn!("Membrick Claude hook skipped: {error:#}");
+            return write_output(&ClaudeHookOutput::default());
+        }
+    };
     let started = Instant::now();
     let mut output = match run_with_budget(kind, input, fallback_root) {
         Ok(output) => output,
@@ -83,7 +91,11 @@ pub fn run_hook(kind: ClaudeHookKind, fallback_root: &Path) -> Result<()> {
         started.elapsed().as_secs_f64() * 1000.0,
         &output,
     );
-    serde_json::to_writer(std::io::stdout().lock(), &output)?;
+    write_output(&output)
+}
+
+fn write_output(output: &ClaudeHookOutput) -> Result<()> {
+    serde_json::to_writer(std::io::stdout().lock(), output)?;
     std::io::stdout().lock().write_all(b"\n")?;
     Ok(())
 }
@@ -165,7 +177,9 @@ fn handle_hook(
             input.hook_event_name
         );
     }
-    let root = resolve_root(&input.cwd, fallback_root)?;
+    let Some(root) = resolve_root(&input.cwd, fallback_root)? else {
+        return Ok(ClaudeHookOutput::default());
+    };
     // Keep every filesystem, resident IPC, and transcript operation inside
     // run_with_budget. Otherwise a stalled resident request can bypass the
     // hook timeout before capture/retrieval even starts.
@@ -612,27 +626,16 @@ fn memory_root(root: &Path) -> PathBuf {
     crate::integrations::mcp_index::shared_memory_root(root)
 }
 
-fn resolve_root(cwd: &Path, fallback_root: &Path) -> Result<PathBuf> {
-    let fallback = fallback_root.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve Claude fallback project root {}",
-            fallback_root.display()
-        )
-    })?;
-    let candidate = if cwd.as_os_str().is_empty() {
-        fallback.clone()
+/// The installed project root covering the hook's working directory, or
+/// `None` when no Membrick install covers it. A subdirectory, including one
+/// inside `.membrick`, resolves to the root, never to itself.
+fn resolve_root(cwd: &Path, fallback_root: &Path) -> Result<Option<PathBuf>> {
+    let start = if cwd.as_os_str().is_empty() {
+        fallback_root
     } else {
-        cwd.canonicalize()
-            .with_context(|| format!("failed to resolve Claude project root {}", cwd.display()))?
+        cwd
     };
-    if !candidate.starts_with(&fallback) {
-        anyhow::bail!(
-            "Claude hook cwd {} is outside configured project root {}",
-            candidate.display(),
-            fallback.display()
-        );
-    }
-    Ok(candidate)
+    crate::state_paths::find_project_root(start)
 }
 
 #[derive(Debug, Clone)]
@@ -843,7 +846,9 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("membrick-claude-{name}-{nanos}"));
         fs::create_dir_all(&path).unwrap();
-        path.canonicalize().unwrap()
+        let path = path.canonicalize().unwrap();
+        crate::state_paths::record_install_settings(&path).unwrap();
+        path
     }
 
     fn input(root: &Path, transcript: Option<PathBuf>, event: &str) -> ClaudeHookInput {

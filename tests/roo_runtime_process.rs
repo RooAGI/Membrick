@@ -20,6 +20,7 @@ impl Workspace {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
+        membrick::state_paths::record_install_settings(&root).unwrap();
         Self(root.canonicalize().unwrap())
     }
 }
@@ -184,5 +185,5 @@ fn invalid_workspace_fails_open_without_claiming_capture() {
         json!({"workspaceRoot":"/nonexistent/roo-memory-test-root","toolName":"fetch","toolUseId":"call","toolResponse":{"finding":"evidence"}}),
     );
     assert_eq!(response, json!({}));
-    assert!(stderr.contains("failed open"));
+    assert!(stderr.contains("Membrick Roo hook skipped"));
 }

@@ -117,13 +117,72 @@ pub fn write_response(
 pub fn serve_requests(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
+    handle_request: impl FnMut(JsonRpcRequest) -> Result<JsonRpcResponse>,
+    on_request: impl FnMut(&str),
+    on_handler_error: impl FnMut(&str, &anyhow::Error),
+    on_response: impl FnMut(),
+) -> Result<()> {
+    serve_incoming(
+        || read_request(reader),
+        writer,
+        handle_request,
+        on_request,
+        on_handler_error,
+        on_response,
+    )
+}
+
+/// Read stdin separately so a session end can interrupt an idle MCP connection
+/// even when the host daemon retains the write end of the input pipe.
+pub(crate) fn serve_stdin_until(
+    writer: &mut impl Write,
+    mut stopped: impl FnMut() -> bool,
+    handle_request: impl FnMut(JsonRpcRequest) -> Result<JsonRpcResponse>,
+) -> Result<()> {
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    let (sender, receiver) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("membrick-mcp-stdin".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = std::io::BufReader::new(stdin.lock());
+            loop {
+                let request = read_request(&mut reader);
+                let finished = !matches!(&request, Ok(Some(_)));
+                if sender.send(request).is_err() || finished {
+                    break;
+                }
+            }
+        })?;
+    serve_incoming(
+        || loop {
+            if stopped() {
+                return Ok(None);
+            }
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(request) => return request,
+                Err(RecvTimeoutError::Disconnected) => return Ok(None),
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        },
+        writer,
+        handle_request,
+        |_| {},
+        |_, _| {},
+        || {},
+    )
+}
+
+fn serve_incoming(
+    mut receive: impl FnMut() -> Result<Option<(JsonRpcRequest, bool)>>,
+    writer: &mut impl Write,
     mut handle_request: impl FnMut(JsonRpcRequest) -> Result<JsonRpcResponse>,
     mut on_request: impl FnMut(&str),
     mut on_handler_error: impl FnMut(&str, &anyhow::Error),
     mut on_response: impl FnMut(),
 ) -> Result<()> {
     crate::updater::schedule_daily_check();
-    while let Some((request, line_framed)) = read_request(reader)? {
+    while let Some((request, line_framed)) = receive()? {
         on_request(&request.method);
         if request.id.is_none() {
             continue;

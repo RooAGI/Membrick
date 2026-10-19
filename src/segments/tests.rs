@@ -72,7 +72,7 @@ fn record(doc_id: &str, group_id: &str, content: &str, terms: &[&str]) -> DocRec
     DocRecord {
         doc_id: doc_id.to_string(),
         source: format!("memory://{doc_id}"),
-        content: content.to_string(),
+        content: content.into(),
         timestamp: None,
         doc_length: content.len(),
         author_agent: None,

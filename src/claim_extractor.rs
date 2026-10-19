@@ -452,7 +452,7 @@ mod tests {
         DocRecord {
             doc_id: "doc-1".to_string(),
             source: "source://doc-1".to_string(),
-            content: "Alice works at Acme".to_string(),
+            content: "Alice works at Acme".into(),
             timestamp: Some("2024-05-01".to_string()),
             doc_length: 20,
             author_agent: None,
@@ -481,7 +481,7 @@ mod tests {
             section_chunks: vec![SectionChunk {
                 chunk_id: "doc-1::chunk-0".to_string(),
                 heading: "Overview".to_string(),
-                content: "Alice works at Acme".to_string(),
+                content: "Alice works at Acme".into(),
                 start_line: 1,
                 end_line: 1,
                 timestamp: Some("2024-05-01".to_string()),

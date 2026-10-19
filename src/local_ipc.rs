@@ -21,8 +21,8 @@ use tower::ServiceExt;
 #[derive(Clone, Copy)]
 pub(crate) struct LocalIpcRequest;
 
-/// A crash-safe lease held for the lifetime of a provider MCP process or one
-/// short-lived request. The resident stays up while any client owns a lease.
+/// A crash-safe lease held by a request or active provider session. The
+/// resident stays up while any request or session owns a lease.
 pub(crate) struct ProviderSessionLease {
     file: Option<fs::File>,
     path: PathBuf,
@@ -88,6 +88,21 @@ impl ProviderSessionLease {
     }
 }
 
+/// Keep a resident warm for the lifetime of a bound provider session.
+/// Tests use a lease without touching runtime state.
+pub(crate) fn acquire_provider_session_lease(
+    root: &Path,
+    provider: &str,
+) -> Result<ProviderSessionLease> {
+    if cfg!(test) {
+        return Ok(ProviderSessionLease {
+            file: None,
+            path: PathBuf::new(),
+        });
+    }
+    ProviderSessionLease::acquire(root, provider)
+}
+
 impl Drop for ProviderSessionLease {
     fn drop(&mut self) {
         drop(self.file.take());
@@ -95,18 +110,14 @@ impl Drop for ProviderSessionLease {
     }
 }
 
-/// Start or reuse the resident and hold its lifetime open until this provider
-/// MCP process exits. Short-lived hook requests use their own temporary lease.
-pub(crate) fn start_provider_session(root: &Path, provider: &str) -> Result<ProviderSessionLease> {
+/// Warm the resident when an MCP adapter starts. This request owns only a
+/// temporary lease; adapter process lifetime does not pin the resident open.
+pub(crate) fn ensure_provider_resident(root: &Path, provider: &str) -> Result<()> {
     if cfg!(test) {
-        return Ok(ProviderSessionLease {
-            file: None,
-            path: PathBuf::new(),
-        });
+        return Ok(());
     }
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let lease = ProviderSessionLease::acquire(&root, provider)?;
-    tracing::info!(provider, lease = %lease.path.display(), "provider session registered");
+    tracing::debug!(provider, "provider requested resident startup");
     let startup_root = root.clone();
     std::thread::Builder::new()
         .name("membrick-resident-startup".into())
@@ -115,23 +126,24 @@ pub(crate) fn start_provider_session(root: &Path, provider: &str) -> Result<Prov
                 tracing::warn!("provider resident startup failed: {error:#}");
             }
         })?;
-    Ok(lease)
+    Ok(())
 }
 
 /// Completes when the resident should stop: on `signal`, or for a managed
-/// resident once no provider holds a lease. Returns the provider lifecycle
+/// resident once no client request holds a lease through the idle timeout. Returns the lifecycle
 /// lock when one is held, so no new client registers until this resident has
 /// flushed and exited.
 pub(crate) async fn resident_shutdown(
     root: &Path,
     managed: bool,
+    idle_timeout: Duration,
     signal: impl std::future::Future<Output = ()>,
 ) -> Option<fs::File> {
     if managed {
         tokio::select! {
             _ = signal => {}
-            gate = wait_for_no_provider_sessions(root, Duration::from_secs(3)) => {
-                tracing::info!("no provider sessions remain; shutting down");
+            gate = wait_for_no_provider_sessions(root, idle_timeout) => {
+                tracing::info!(idle_timeout_seconds = idle_timeout.as_secs(), "resident idle timeout elapsed; shutting down");
                 return Some(gate);
             }
         }
@@ -160,9 +172,9 @@ pub(crate) async fn resident_shutdown(
     }
 }
 
-/// Wait until every provider MCP process and in-flight request has released
-/// its lease. Crashed clients release the OS lock; leftover lease files are
-/// removed here.
+/// Wait until every client request and provider session has released its
+/// lease for the idle timeout. Crashed clients release the OS lock; leftover
+/// lease files are removed here.
 pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) -> fs::File {
     let directory = root.join(".membrick/runtime/provider-leases");
     let mut empty_since = None;
@@ -286,23 +298,93 @@ fn runtime_dir(root: &Path) -> Result<PathBuf> {
     Ok(runtime)
 }
 
-#[cfg(unix)]
-pub(crate) fn socket_path(root: &Path) -> Result<PathBuf> {
+/// A stable per-user, per-project name for the files that coordinate startup.
+fn instance_name(root: &Path) -> String {
     use sha2::{Digest, Sha256};
-    let identity = std::env::var("USER").unwrap_or_default();
+    let identity =
+        std::env::var(if cfg!(windows) { "USERNAME" } else { "USER" }).unwrap_or_default();
     let mut hash = Sha256::new();
     hash.update(identity.as_bytes());
     hash.update([0]);
     hash.update(root.as_os_str().as_encoded_bytes());
     let digest = hash.finalize();
-    let name = format!(
-        "mb-{}.sock",
+    format!(
+        "mb-{}",
         digest[..12]
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
-    );
-    Ok(runtime_dir(root)?.join(name))
+    )
+}
+
+/// How clients reach the running resident. Like uWSGI, each resident binds a
+/// socket with a fresh name and records it in the project once it listens;
+/// clients read the record instead of deriving a path.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct ResidentRecord {
+    pid: u32,
+    socket: PathBuf,
+}
+
+/// Where the record lives. Reading or removing it never creates the runtime
+/// directory, so a client or a resident shutting down cannot recreate a
+/// project folder that is being deleted.
+fn resident_record_path(root: &Path) -> PathBuf {
+    root.join(".membrick").join("runtime").join("resident.json")
+}
+
+fn read_resident_record(root: &Path) -> Result<ResidentRecord> {
+    let path = resident_record_path(root);
+    let bytes =
+        fs::read(&path).with_context(|| format!("no resident record at {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("cannot parse {}", path.display()))
+}
+
+fn write_resident_record(root: &Path, record: &ResidentRecord) -> Result<()> {
+    let path = runtime_dir(root)?.join("resident.json");
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&temporary, serde_json::to_vec(record)?)?;
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Remove the record only while it still names this process, so a resident
+/// shutting down never erases its successor's.
+fn remove_resident_record(root: &Path) {
+    if read_resident_record(root).is_ok_and(|record| record.pid == std::process::id()) {
+        let _ = fs::remove_file(resident_record_path(root));
+    }
+}
+
+/// The socket the running resident recorded.
+#[cfg(unix)]
+pub(crate) fn socket_path(root: &Path) -> Result<PathBuf> {
+    Ok(read_resident_record(root)?.socket)
+}
+
+/// The longest Unix socket path the platform accepts, without its trailing NUL.
+#[cfg(unix)]
+const MAX_SOCKET_PATH: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+    107
+} else {
+    103
+};
+
+/// A fresh socket path for this resident process. It goes in the project's
+/// runtime directory when it fits the platform limit, and otherwise in the
+/// short system temp directory, so a long or non-English project path never
+/// costs the socket. The pid keeps names unique among running residents.
+#[cfg(unix)]
+fn new_socket_path(root: &Path) -> Result<PathBuf> {
+    let name = format!("mb-{}.sock", std::process::id());
+    let in_project = runtime_dir(root)?.join(&name);
+    if in_project.as_os_str().len() <= MAX_SOCKET_PATH {
+        return Ok(in_project);
+    }
+    Ok(std::env::temp_dir().join(name))
 }
 
 pub(crate) fn endpoint(root: &Path) -> Result<String> {
@@ -333,25 +415,11 @@ fn pipe_name(root: &Path) -> Result<String> {
     ))
 }
 
+/// The startup marker. Its lock sits beside it as `resident.startup.lock`. The
+/// project's own runtime directory already identifies the project, so the
+/// names are fixed.
 fn starting_path(root: &Path) -> Result<PathBuf> {
-    #[cfg(unix)]
-    {
-        return Ok(socket_path(root)?.with_extension("starting"));
-    }
-    #[cfg(windows)]
-    {
-        use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        hash.update(std::env::var("USERNAME").unwrap_or_default().as_bytes());
-        hash.update([0]);
-        hash.update(root.as_os_str().as_encoded_bytes());
-        let digest = hash.finalize();
-        let name = digest[..12]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        Ok(runtime_dir(root)?.join(format!("mb-{name}.starting")))
-    }
+    Ok(runtime_dir(root)?.join("resident.starting"))
 }
 
 fn starting_lock_path(marker: &Path) -> PathBuf {
@@ -369,7 +437,7 @@ pub(crate) fn post_json_with_transport(
 ) -> Result<(StatusCode, Value, &'static str)> {
     // Hooks and other one-shot clients also keep a resident alive for the
     // duration of their request. Long-lived MCP adapters hold an additional
-    // provider-session lease.
+    // request lease.
     let _request_lease = if cfg!(test) {
         None
     } else {
@@ -400,6 +468,10 @@ pub(crate) fn post_json_with_transport(
     match call() {
         Ok(response) => Ok(response),
         Err(first_error) => {
+            // Only an installed project root may get a resident. Anything
+            // else fails here, before a resident, a store or a queue request
+            // is created for the wrong folder.
+            crate::state_paths::validate_project_root(&root).context("not starting a resident")?;
             let marker = starting_path(&root)?;
             let mut startup_owner = start_server(&root).unwrap_or(None);
             // IPC sockets and loopback HTTP can both be unavailable in a
@@ -1152,7 +1224,22 @@ pub(crate) async fn serve(
     {
         use std::os::unix::fs::MetadataExt;
         use tokio::net::UnixListener;
-        let endpoint = socket_path(root)?;
+        // A previous resident's socket is stale once this process owns the
+        // workspace, unless that resident still answers.
+        if let Ok(previous) = read_resident_record(root) {
+            if previous.pid != std::process::id()
+                && tokio::net::UnixStream::connect(&previous.socket)
+                    .await
+                    .is_ok()
+            {
+                anyhow::bail!("a resident Membrick service already owns this workspace");
+            }
+            let _ = std::fs::remove_file(&previous.socket);
+        }
+        // Builds before per-start names used one fixed name per project.
+        let _ =
+            std::fs::remove_file(runtime_dir(root)?.join(format!("{}.sock", instance_name(root))));
+        let endpoint = new_socket_path(root)?;
         let mut listener = if endpoint.exists() {
             // Do not unlink a live owner's socket. Remove only a stale socket
             // path left behind after its process exited; bind below remains
@@ -1187,6 +1274,15 @@ pub(crate) async fn serve(
             .as_ref()
             .and_then(|_| std::fs::metadata(&endpoint).ok())
             .map(|metadata| metadata.ino());
+        if listener.is_some() {
+            let record = ResidentRecord {
+                pid: std::process::id(),
+                socket: endpoint.clone(),
+            };
+            if let Err(error) = write_resident_record(root, &record) {
+                tracing::warn!("could not record the resident socket; clients will use HTTP or the file queue: {error:#}");
+            }
+        }
         let _ = std::fs::remove_file(starting_path(root)?);
         if listener.is_some() {
             tracing::info!("Membrick resident IPC listening on {}", endpoint.display());
@@ -1256,6 +1352,7 @@ pub(crate) async fn serve(
         {
             let _ = std::fs::remove_file(&endpoint);
         }
+        remove_resident_record(root);
         tracing::info!("Membrick resident stopped on {}", endpoint.display());
         Ok(shutdown_gate)
     }
@@ -1466,6 +1563,20 @@ mod tests {
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }
+
+        /// A folder short enough that a socket fits inside its project
+        /// runtime directory. macOS `temp_dir()` is already too long.
+        #[cfg(unix)]
+        fn short() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = Path::new("/tmp").canonicalize().unwrap().join(format!(
+                "mbt-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
     }
 
     impl Drop for TempDir {
@@ -1476,6 +1587,9 @@ mod tests {
 
     #[test]
     fn resident_runtime_paths_are_project_local() {
+        #[cfg(unix)]
+        let directory = TempDir::short();
+        #[cfg(windows)]
         let directory = TempDir::new();
         let root = directory.0.join("project");
         std::fs::create_dir_all(&root).unwrap();
@@ -1496,7 +1610,7 @@ mod tests {
         );
         #[cfg(unix)]
         assert_eq!(
-            socket_path(&root).unwrap().parent(),
+            new_socket_path(&root).unwrap().parent(),
             Some(runtime.as_path())
         );
         #[cfg(unix)]
@@ -1557,7 +1671,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(resident_shutdown(&directory.0, true, async {}));
+            .block_on(resident_shutdown(
+                &directory.0,
+                true,
+                Duration::from_secs(3),
+                async {},
+            ));
 
         assert!(
             gate.is_some(),
@@ -1915,6 +2034,124 @@ mod tests {
             .contains("different workspace"));
         assert_eq!(handled.load(Ordering::SeqCst), 0);
         server.await.unwrap();
+    }
+
+    /// A project root long enough, in non-English characters, that a socket
+    /// inside its runtime directory would exceed the platform limit.
+    #[cfg(unix)]
+    fn long_non_english_root(directory: &TempDir) -> PathBuf {
+        let root = directory
+            .0
+            .join("项目记忆项目记忆项目记忆")
+            .join("メモリープロジェクトメモリー");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert!(
+            root.join(".membrick/runtime/mb-99999.sock")
+                .as_os_str()
+                .len()
+                > MAX_SOCKET_PATH,
+            "the fixture must be too long for a socket in the project"
+        );
+        root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_resident_gets_a_new_socket_that_fits_the_limit() {
+        let directory = TempDir::short();
+        let short = directory.0.join("short");
+        std::fs::create_dir_all(&short).unwrap();
+        let in_project = new_socket_path(&short).unwrap();
+        assert_eq!(
+            in_project.parent(),
+            Some(short.join(".membrick/runtime").as_path())
+        );
+        assert_eq!(
+            in_project.file_name().and_then(|name| name.to_str()),
+            Some(format!("mb-{}.sock", std::process::id()).as_str())
+        );
+
+        let long = long_non_english_root(&directory);
+        let relocated = new_socket_path(&long).unwrap();
+        assert!(relocated.as_os_str().len() <= MAX_SOCKET_PATH);
+        assert_eq!(relocated.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    #[test]
+    fn a_resident_removes_only_its_own_record() {
+        let directory = TempDir::new();
+        let own = ResidentRecord {
+            pid: std::process::id(),
+            socket: directory.0.join("own.sock"),
+        };
+        write_resident_record(&directory.0, &own).unwrap();
+        assert_eq!(read_resident_record(&directory.0).unwrap(), own);
+        #[cfg(unix)]
+        assert_eq!(socket_path(&directory.0).unwrap(), own.socket);
+        remove_resident_record(&directory.0);
+        assert!(read_resident_record(&directory.0).is_err());
+
+        let successor = ResidentRecord {
+            pid: std::process::id().wrapping_add(1),
+            socket: directory.0.join("successor.sock"),
+        };
+        write_resident_record(&directory.0, &successor).unwrap();
+        remove_resident_record(&directory.0);
+        assert_eq!(read_resident_record(&directory.0).unwrap(), successor);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resident_on_a_long_non_english_root_is_reachable_over_ipc() {
+        let directory = TempDir::new();
+        let root = long_non_english_root(&directory);
+        let app = Router::new().route(
+            "/echo",
+            post(|axum::Json(payload): axum::Json<Value>| async move { axum::Json(payload) }),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server_root = root.clone();
+        let server = tokio::spawn(async move {
+            serve(
+                app,
+                &server_root,
+                async move {
+                    let _ = stopped.await;
+                    None
+                },
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let mut socket = None;
+        for _ in 0..200 {
+            if let Ok(path) = socket_path(&root) {
+                socket = Some(path);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let socket = socket.expect("the resident records its socket once it listens");
+        assert!(socket.as_os_str().len() <= MAX_SOCKET_PATH);
+
+        let (status, body) = request(
+            &root,
+            "/echo",
+            serde_json::to_vec(&serde_json::json!({"value": "长路径"})).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["value"], "长路径");
+
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        assert!(!socket.exists(), "shutdown removes the socket");
+        assert!(read_resident_record(&root).is_err(), "and the record");
     }
 }
 

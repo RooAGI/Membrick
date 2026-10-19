@@ -24,7 +24,7 @@ pub fn chunk_document_sections(content: &str, doc_id: &str) -> Vec<SectionChunk>
                 chunks.push(SectionChunk {
                     chunk_id,
                     heading: current_heading.clone(),
-                    content: body.to_string(),
+                    content: body.into(),
                     start_line,
                     end_line,
                     timestamp: None,
@@ -49,7 +49,7 @@ pub fn chunk_document_sections(content: &str, doc_id: &str) -> Vec<SectionChunk>
         chunks.push(SectionChunk {
             chunk_id,
             heading: current_heading,
-            content: tail.to_string(),
+            content: tail.into(),
             start_line,
             end_line,
             timestamp: None,
@@ -69,7 +69,7 @@ pub fn chunk_document_sections(content: &str, doc_id: &str) -> Vec<SectionChunk>
         chunks.push(SectionChunk {
             chunk_id,
             heading: "(document)".to_string(),
-            content: content.to_string(),
+            content: content.into(),
             start_line: 1,
             end_line: content.lines().count().max(1),
             timestamp: None,
@@ -91,7 +91,7 @@ pub fn chunk_document_lines(
         return vec![SectionChunk {
             chunk_id: format!("{}::0", doc_id),
             heading: "(document)".to_string(),
-            content: content.to_string(),
+            content: content.into(),
             start_line: 1,
             end_line: 1,
             timestamp: None,
@@ -114,7 +114,7 @@ pub fn chunk_document_lines(
             chunks.push(SectionChunk {
                 chunk_id,
                 heading,
-                content: body,
+                content: body.into(),
                 start_line: start + 1,
                 end_line: end,
                 timestamp: None,
@@ -132,7 +132,7 @@ pub fn chunk_document_lines(
         chunks.push(SectionChunk {
             chunk_id,
             heading: "(document)".to_string(),
-            content: content.to_string(),
+            content: content.into(),
             start_line: 1,
             end_line: lines.len().max(1),
             timestamp: None,
@@ -242,7 +242,7 @@ pub fn chunk_document_hybrid(
                 out.push(SectionChunk {
                     chunk_id,
                     heading,
-                    content: body,
+                    content: body.into(),
                     start_line,
                     end_line,
                     timestamp: None,

@@ -77,9 +77,16 @@ fn strip_blocks(text: &str, start_marker: &str, end_marker: &str) -> String {
 
 /// Injected context written before it was marked, as Claude Code and Codex
 /// formatted it: a message made only of `- Source:` entries, each with
-/// `Type:` and `Captured:` lines.
+/// `Type:` and `Captured:` lines. Claude Code records hook output as a message
+/// that opens with a line such as `PreToolUse:Read hook additional context:`,
+/// so that line is skipped before looking for the entries.
 fn is_legacy_memory_entries(text: &str) -> bool {
-    let text = text.trim_start();
+    let mut text = text.trim_start();
+    if let Some((first, rest)) = text.split_once('\n') {
+        if first.trim_end().ends_with(" hook additional context:") {
+            text = rest.trim_start();
+        }
+    }
     text.starts_with("- Source: ") && text.contains("\n  Type: ") && text.contains("\n  Captured: ")
 }
 
@@ -281,6 +288,20 @@ mod tests {
         assert_eq!(strip_memory_context(hermes), "Real question\n");
         let plain = "- Source: a user list item that is not injected memory";
         assert_eq!(strip_memory_context(plain), plain);
+    }
+
+    #[test]
+    fn legacy_entries_after_claude_hook_context_header_are_removed() {
+        // Claude Code records hook output as a message that opens with the
+        // hook's name, and older sessions have unmarked entries after it.
+        let entries = "- Source: claude-code://a/b/outcome\n  Type: outcome\n  Captured: now\n  x";
+        let recorded = format!("PreToolUse:Read hook additional context: \n{entries}");
+        assert_eq!(strip_memory_context(&recorded), "");
+        let recorded = format!("UserPromptSubmit hook additional context:\n{entries}");
+        assert_eq!(strip_memory_context(&recorded), "");
+        // Hook output that is not memory entries is conversation, so it stays.
+        let other = "PreToolUse:Read hook additional context: \nUse the project style guide.";
+        assert_eq!(strip_memory_context(other), other);
     }
 
     #[test]

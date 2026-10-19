@@ -87,7 +87,13 @@ fn run_hook_inner(kind: MuseHookKind, fallback_root: &Path) -> Result<()> {
 /// Resolve the project root from the hook payload's `cwd` and record the
 /// event. Split out of `run_hook` so tests can exercise it without stdin.
 pub fn handle_hook(kind: MuseHookKind, input: &MuseHookInput, fallback_root: &Path) -> Result<()> {
-    let root = resolve_root(&input.cwd, fallback_root)?;
+    let start = if input.cwd.as_os_str().is_empty() {
+        fallback_root
+    } else {
+        &input.cwd
+    };
+    let root = crate::state_paths::find_project_root(start)?
+        .context("no installed Membrick project covers Muse working folder")?;
     let payload = serde_json::json!({
         "hook_event_name": input.hook_event_name,
         "model": input.model,
@@ -116,16 +122,6 @@ pub fn handle_hook(kind: MuseHookKind, input: &MuseHookInput, fallback_root: &Pa
     Ok(())
 }
 
-fn resolve_root(cwd: &Path, fallback_root: &Path) -> Result<PathBuf> {
-    if cwd.as_os_str().is_empty() {
-        return fallback_root
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", fallback_root.display()));
-    }
-    cwd.canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", cwd.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,7 +136,9 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("membrick-muse-hooks-{name}-{nanos}"));
         fs::create_dir_all(&path).unwrap();
-        path.canonicalize().unwrap()
+        let path = path.canonicalize().unwrap();
+        crate::state_paths::record_install_settings(&path).unwrap();
+        path
     }
 
     fn input(root: &Path, event: &str) -> MuseHookInput {

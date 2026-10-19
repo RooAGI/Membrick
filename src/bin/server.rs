@@ -119,6 +119,7 @@ struct ServerSettings {
     bind: Option<String>,
     resident_http_bind: Option<String>,
     resident_http_auto_port: Option<bool>,
+    resident_idle_timeout_seconds: Option<u64>,
     index: Option<PathBuf>,
     project_root: Option<PathBuf>,
     server_token: Option<String>,
@@ -679,6 +680,12 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let settings = load_server_settings(&settings_file)?;
     let resident_http_bind = settings.resident_http_bind.clone();
     let resident_http_auto_port = settings.resident_http_auto_port.unwrap_or(false);
+    let resident_idle_timeout = std::time::Duration::from_secs(
+        settings
+            .resident_idle_timeout_seconds
+            .unwrap_or(60)
+            .clamp(5, 3600),
+    );
     if !bind_was_set {
         if let Some(bind) = settings.bind {
             args.bind = bind;
@@ -687,7 +694,15 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     if args.index.is_none() {
         args.index = settings.index;
     }
-    if args.project_root.is_none() {
+    if args.resident_server {
+        // A resident owns exactly one installed project root and never
+        // creates state for any other folder.
+        let root = match &args.project_root {
+            Some(root) => root.clone(),
+            None => std::env::current_dir()?,
+        };
+        args.project_root = Some(crate::state_paths::validate_project_root(&root)?);
+    } else if args.project_root.is_none() {
         args.project_root = settings.project_root;
     }
     if args.server_token.is_none() {
@@ -746,6 +761,28 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         .project_root
         .unwrap_or(std::env::current_dir()?)
         .canonicalize()?;
+    // The effective settings after command-line flags and server.toml are
+    // merged, with where this process started from. Secrets are reported
+    // only as set or unset.
+    tracing::debug!(
+        startup_dir = %std::env::current_dir()?.display(),
+        executable = %std::env::current_exe()?.display(),
+        settings_file = %settings_file.display(),
+        project_root = %project_root.display(),
+        resident_server = args.resident_server,
+        managed_resident = args.managed_resident,
+        bind = %args.bind,
+        resident_http_bind = ?resident_http_bind,
+        resident_http_auto_port,
+        resident_idle_timeout_seconds = resident_idle_timeout.as_secs(),
+        index = ?args.index,
+        tenant_id = ?args.tenant_id,
+        adaptive_segment_max_n = ?args.adaptive_segment_max_n,
+        freshness = ?options.freshness_policy,
+        server_token = if args.server_token.is_some() { "set" } else { "unset" },
+        jwt_secret = if jwt_secret.is_some() { "set" } else { "unset" },
+        "server settings"
+    );
     let owner_lock = crate::memory_api::workspace::WorkspaceOwnerLock::acquire(&project_root)?;
     anyhow::ensure!(
         args.max_active_workspaces > 0,
@@ -948,14 +985,22 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     if args.resident_server {
         let root = state.project_root.clone();
         let managed = args.managed_resident;
+        let idle_timeout = resident_idle_timeout;
+        let (log_level, log_level_source) = crate::logging::active_level()
+            .map_or(("unset".to_owned(), "none"), |(level, source)| {
+                (level.to_string(), source)
+            });
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
             managed,
             root = %state.project_root.display(),
+            log_level,
+            log_level_source,
             "resident starting"
         );
         let shutdown = async move {
-            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal()).await
+            crate::local_ipc::resident_shutdown(&root, managed, idle_timeout, shutdown_signal())
+                .await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(
             app,
@@ -4371,7 +4416,7 @@ mod tests {
             doc_id: "resident-hook-document".to_string(),
             source: "codex://resident-hook/session-summary".to_string(),
             doc_length: content.len(),
-            content,
+            content: content.into(),
             concept: "session-summary".to_string(),
             group_id: Some("codex-session:resident-hook".to_string()),
             headings: vec!["session-summary".to_string()],
@@ -4473,7 +4518,7 @@ mod tests {
         let mut replacement = document;
         replacement.doc_id = "resident-hook-document-replacement".to_string();
         replacement.source = "codex://resident-hook/session-summary/replacement".to_string();
-        replacement.content = replacement_content.to_string();
+        replacement.content = replacement_content.into();
         replacement.doc_length = replacement.content.len();
         let response = app
             .clone()
@@ -4600,8 +4645,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn codex_resident_client_uses_workspace_backend_for_add_and_search() {
         let root = security_test_root().canonicalize().unwrap();
-        #[cfg(unix)]
-        let endpoint = crate::local_ipc::endpoint(&root).unwrap();
+        crate::state_paths::record_install_settings(&root).unwrap();
         let server_root = root.clone();
         let server = tokio::spawn(async move {
             crate::local_ipc::serve(
@@ -4664,10 +4708,6 @@ mod tests {
 
         server.abort();
         let _ = server.await;
-        #[cfg(unix)]
-        {
-            let _ = std::fs::remove_file(endpoint);
-        }
         let _ = std::fs::remove_dir_all(root);
     }
 

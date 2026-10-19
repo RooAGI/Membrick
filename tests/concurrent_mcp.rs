@@ -20,6 +20,20 @@ fn short_temp_root() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
+/// Register `root` as an installed project whose resident stops 5 s, the
+/// shortest allowed idle timeout, after its last provider session ends.
+fn install_test_project(root: &std::path::Path) {
+    membrick::state_paths::record_install_settings(root)
+        .expect("temporary project should be registered as installed");
+    let settings = root.join(".membrick/server.toml");
+    let text = fs::read_to_string(&settings).expect("install should write server.toml");
+    fs::write(
+        &settings,
+        format!("resident_idle_timeout_seconds = 5\n{text}"),
+    )
+    .expect("test idle timeout should be written");
+}
+
 fn send_request(stdin: &mut ChildStdin, request: &Value) {
     writeln!(stdin, "{}", request).expect("MCP request should be written");
     stdin.flush().expect("MCP request should be flushed");
@@ -43,6 +57,110 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Behavioural regression: a daemon may retain stdin after SessionEnd.
+#[test]
+#[cfg(feature = "codex")]
+fn session_end_stops_only_ended_codex_adapter_without_stdin_eof() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = short_temp_root().join(format!("mb-end-{}", nonce % 1_000_000_000));
+    fs::create_dir_all(&root).unwrap();
+    install_test_project(&root);
+    let executable = env!("CARGO_BIN_EXE_membrick");
+    let mut clients = Vec::new();
+    for session in ["ended-session", "remaining-session"] {
+        let mut child = Command::new(executable)
+            .args(["--codex-serve", root.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        let guard = ChildGuard(child);
+        send_request(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0", "id":1, "method":"initialize"}),
+        );
+        assert!(read_response(&mut reader)["result"].is_object());
+        if session == "remaining-session" {
+            // Installed MCP hooks bind even before a normal memory tool call.
+            send_request(
+                &mut stdin,
+                &json!({"jsonrpc":"2.0","id":10,"method":"tools/call",
+                "params":{"name":"membrick_session","arguments":{"session_id":session}}}),
+            );
+            assert!(read_response(&mut reader)["error"].is_null());
+        }
+        send_request(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0", "id":2, "method":"tools/call",
+            "params":{"name":"info", "arguments":{}, "_meta":{"threadId":session}}}),
+        );
+        let response = read_response(&mut reader);
+        assert!(response["error"].is_null(), "{response}");
+        clients.push((guard, stdin, reader));
+    }
+    let end_session = |session: &str| {
+        let mut hook = Command::new(executable)
+            .args(["--codex-hook", "session-end", root.to_str().unwrap()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        writeln!(
+            hook.stdin.take().unwrap(),
+            "{}",
+            json!({
+                "session_id":session, "cwd":root, "hook_event_name":"SessionEnd"
+            })
+        )
+        .unwrap();
+        assert!(hook.wait().unwrap().success());
+    };
+    end_session("ended-session");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Keep stdin open, exactly as the retained daemon connection does.
+    loop {
+        if let Some(status) = clients[0].0 .0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ended Codex adapter stayed alive while daemon kept stdin open"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let (_, stdin, reader) = &mut clients[1];
+    send_request(
+        stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+        "params":{"name":"info","arguments":{}}}),
+    );
+    assert!(read_response(reader)["error"].is_null());
+    end_session("remaining-session");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let log =
+            fs::read_to_string(root.join(".membrick/runtime/resident.log")).unwrap_or_default();
+        if log.contains("shutdown complete") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resident did not stop after final SessionEnd: {log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(clients);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 #[cfg(feature = "codex")]
 fn concurrent_codex_mcp_clients_initialize_and_open_shared_index() {
@@ -55,6 +173,7 @@ fn concurrent_codex_mcp_clients_initialize_and_open_shared_index() {
         .join("target")
         .join(format!("concurrent-mcp-{nonce}"));
     fs::create_dir_all(&root).expect("temporary project should be created");
+    install_test_project(&root);
     fs::write(root.join("README.md"), "shared MCP startup test\n")
         .expect("temporary project should contain a document");
 
@@ -119,10 +238,36 @@ fn concurrent_codex_mcp_clients_initialize_and_open_shared_index() {
         assert!(response["result"]["tools"].is_array());
     }
 
+    // Await resident startup before teardown; tools/list is adapter-local.
+    for (_, stdin, _) in &mut clients {
+        send_request(
+            stdin,
+            &json!({"jsonrpc":"2.0", "id":3, "method":"tools/call",
+            "params":{"name":"info", "arguments":{}}}),
+        );
+    }
+    for (_, _, reader) in &mut clients {
+        let response = read_response(reader);
+        assert!(response["error"].is_null(), "{response}");
+    }
+
     for (mut child, _, _) in clients {
         let _ = child.kill();
         let status = child.wait().expect("MCP child should be reaped");
         assert!(status.success() || status.code().is_none());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let log_path = root.join(".membrick/runtime/resident.log");
+    loop {
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("shutdown complete") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resident did not finish fixture teardown: {log}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
     fs::remove_dir_all(root).expect("temporary project should be removed");
 }
@@ -137,6 +282,7 @@ fn concurrent_codex_mcp_clients_share_one_resident_workspace_owner() {
     let temp = short_temp_root().join(format!("mbr-{}", nonce % 1_000_000_000));
     let root = temp.join("project");
     fs::create_dir_all(&root).expect("temporary project should be created");
+    install_test_project(&root);
     // A regular file at HOME makes home-based runtime creation fail. The
     // resident must use the writable project runtime directory instead.
     let home = temp.join("unavailable-home");
@@ -167,7 +313,8 @@ fn concurrent_codex_mcp_clients_share_one_resident_workspace_owner() {
         }
         assert!(
             std::time::Instant::now() < startup_deadline,
-            "resident server did not become ready"
+            "resident server did not become ready: {}",
+            fs::read_to_string(&resident_log).unwrap_or_default()
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -256,6 +403,8 @@ fn concurrent_codex_lifecycle_hooks_record_all_events() {
         .expect("test directory should be available")
         .join("target")
         .join(format!("concurrent-hook-recording-{nonce}"));
+    fs::create_dir_all(&root).expect("temporary project should be created");
+    install_test_project(&root);
     let session_root = root.join(".membrick").join("codex-sessions");
     fs::create_dir_all(&session_root).expect("recording directory should be created");
     fs::write(session_root.join("recording.json"), r#"{"enabled":true}"#)

@@ -69,13 +69,10 @@ pub struct MemoryIndexSegment {
     pub(crate) lexical_dir: Option<Arc<SegmentLexicalDir>>,
 }
 
-/// One hold on a segment's folder under `segment-lexical`. Folder names are
-/// content hashes, so segments with the same content share one folder; the
-/// holds are counted per folder across the whole process. A folder is deleted
-/// when its last hold drops, but only once a newer snapshot has replaced it
-/// (see [`retire_replaced_segment_lexical_dirs`]) and only under a root whose
-/// owner enabled that with [`remove_segment_lexical_dirs_when_unused`]. The
-/// folders of the current snapshot therefore survive the process exiting.
+/// One hold on a stable logical segment folder under `segment-lexical`.
+/// Multiple generations share the folder; Tantivy commits provide the reader
+/// generations. A folder is deleted only when its segment disappears and the
+/// last snapshot that references it is released.
 pub(crate) struct SegmentLexicalDir {
     path: PathBuf,
 }
@@ -311,12 +308,28 @@ pub(crate) fn build_memory_index_segment(
     segment_id: String,
     segment_records: Vec<DocRecord>,
 ) -> MemoryIndexSegment {
-    build_memory_index_segment_with_lexical_root(segment_id, segment_records, None)
+    build_memory_index_segment_with_shared_records(
+        segment_id,
+        segment_records.into_iter().map(Arc::new).collect(),
+        None,
+    )
 }
 
 pub(crate) fn build_memory_index_segment_with_lexical_root(
     segment_id: String,
-    mut segment_records: Vec<DocRecord>,
+    segment_records: Vec<DocRecord>,
+    lexical_root: Option<&Path>,
+) -> MemoryIndexSegment {
+    build_memory_index_segment_with_shared_records(
+        segment_id,
+        segment_records.into_iter().map(Arc::new).collect(),
+        lexical_root,
+    )
+}
+
+pub(crate) fn build_memory_index_segment_with_shared_records(
+    segment_id: String,
+    mut segment_records: Vec<Arc<DocRecord>>,
     lexical_root: Option<&Path>,
 ) -> MemoryIndexSegment {
     segment_records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
@@ -324,11 +337,10 @@ pub(crate) fn build_memory_index_segment_with_lexical_root(
         .iter()
         .map(|record| record.doc_id.clone())
         .collect::<Vec<_>>();
-    let lexical_dir = lexical_root.map(|root| {
-        SegmentLexicalDir::hold(segment_lexical_dir(root, &segment_id, &segment_records))
-    });
+    let lexical_dir =
+        lexical_root.map(|root| SegmentLexicalDir::hold(segment_lexical_dir(root, &segment_id)));
     let index = Arc::new(if let Some(lexical_dir) = lexical_dir.as_deref() {
-        MemoryIndex::from_records_with_lexical_dir(
+        MemoryIndex::from_shared_records_with_lexical_dir(
             segment_records,
             Some(lexical_dir.path()),
             false,
@@ -336,7 +348,13 @@ pub(crate) fn build_memory_index_segment_with_lexical_root(
             false,
         )
     } else {
-        MemoryIndex::from_records(segment_records)
+        MemoryIndex::from_shared_records_with_lexical_dir(
+            segment_records,
+            None,
+            false,
+            false,
+            false,
+        )
     });
     MemoryIndexSegment {
         segment_id,
@@ -347,22 +365,46 @@ pub(crate) fn build_memory_index_segment_with_lexical_root(
     }
 }
 
-fn segment_lexical_dir(root: &Path, segment_id: &str, records: &[DocRecord]) -> PathBuf {
-    // Include the segment's complete record identity in the cache path. The
-    // lexical index is immutable once built; writes produce a new directory
-    // for the changed content while existing readers keep their old snapshot.
-    let mut hasher = Sha256::new();
-    // Preserve the legacy schema tag so existing segment IDs remain stable.
-    hasher.update(b"lint-ai-segment-lexical-v1");
-    hasher.update(segment_id.as_bytes());
-    for record in records {
-        hasher.update(record.doc_id.as_bytes());
-        hasher.update(record.content_hash.as_bytes());
-        for tag in &record.semantic_tags {
-            hasher.update(tag.as_bytes());
-            hasher.update(&[0]);
-        }
+pub(crate) fn build_memory_index_segment_with_lexical_delta(
+    segment_id: String,
+    mut segment_records: Vec<Arc<DocRecord>>,
+    lexical_root: Option<&Path>,
+    changed_doc_ids: HashSet<String>,
+    removed_doc_ids: HashSet<String>,
+    rebuild: bool,
+) -> MemoryIndexSegment {
+    segment_records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+    let doc_ids = segment_records
+        .iter()
+        .map(|record| record.doc_id.clone())
+        .collect::<Vec<_>>();
+    let lexical_dir =
+        lexical_root.map(|root| SegmentLexicalDir::hold(segment_lexical_dir(root, &segment_id)));
+    let index = Arc::new(MemoryIndex::from_shared_records_with_lexical_delta(
+        segment_records,
+        lexical_dir.as_deref().map(SegmentLexicalDir::path),
+        changed_doc_ids,
+        removed_doc_ids,
+        rebuild,
+        false,
+        false,
+        false,
+    ));
+    MemoryIndexSegment {
+        segment_id,
+        doc_ids,
+        index,
+        record_dates: OnceLock::new(),
+        lexical_dir,
     }
+}
+
+fn segment_lexical_dir(root: &Path, segment_id: &str) -> PathBuf {
+    // The directory identifies the logical segment. Document changes are
+    // committed inside this stable Tantivy index instead of changing paths.
+    let mut hasher = Sha256::new();
+    hasher.update(b"membrick-segment-lexical-v2");
+    hasher.update(segment_id.as_bytes());
     root.join(format!("{:x}", hasher.finalize()))
 }
 

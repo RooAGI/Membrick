@@ -1693,7 +1693,7 @@ mod tests {
         SourceDocument {
             doc_id: id.to_string(),
             source: source.to_string(),
-            content: content.to_string(),
+            content: content.into(),
             concept: "decision".to_string(),
             group_id: None,
             headings: vec!["Decision".to_string()],
@@ -2179,7 +2179,7 @@ mod scalar_configuration_supersession_tests {
         SourceDocument {
             doc_id: id.to_string(),
             source: format!("docs/{id}.md"),
-            content: content.to_string(),
+            content: content.into(),
             concept: "gateway retry policy".to_string(),
             group_id: None,
             filters: BTreeMap::new(),
@@ -2754,7 +2754,7 @@ mod incremental_update_tests {
         SourceDocument {
             doc_id: id.to_string(),
             source: format!("docs/{id}.md"),
-            content: content.to_string(),
+            content: content.into(),
             concept: "decision".to_string(),
             group_id: None,
             headings: vec![],
@@ -2981,7 +2981,7 @@ mod incremental_update_tests {
         // Retarget the link to c.
         let mut x = docs.get("x").unwrap().clone();
         x.filters.insert("supersedes_id".into(), "c".into());
-        x.content = "Completely new direction v2.".to_string();
+        x.content = "Completely new direction v2.".into();
         docs.insert("x".to_string(), x);
         check(&mut store, &docs, &["x"], &[], ids);
         assert_eq!(

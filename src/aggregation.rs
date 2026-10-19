@@ -392,7 +392,7 @@ fn aggregate_text(doc: &crate::index::DocRecord) -> String {
     parts.push(doc.probable_topic.clone().unwrap_or_default());
     parts.push(doc.doc_type_guess.clone().unwrap_or_default());
     parts.push(doc.temporal_terms.join(" "));
-    parts.push(doc.content.clone());
+    parts.push(doc.content.to_string());
     parts.join("\n")
 }
 
@@ -436,7 +436,7 @@ mod tests {
         DocRecord {
             doc_id: doc_id.to_string(),
             source: format!("source://{}", doc_id),
-            content: content.to_string(),
+            content: content.into(),
             timestamp: Some("2024-05-10".to_string()),
             doc_length: content.len(),
             author_agent: None,
@@ -465,7 +465,7 @@ mod tests {
             section_chunks: vec![SectionChunk {
                 chunk_id: format!("{}::chunk0", doc_id),
                 heading: "Overview".to_string(),
-                content: content.to_string(),
+                content: content.into(),
                 start_line: 1,
                 end_line: 1,
                 timestamp: Some("2024-05-10".to_string()),

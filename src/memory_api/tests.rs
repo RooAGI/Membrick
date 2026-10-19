@@ -1871,7 +1871,7 @@ fn session_temporal_anchor_carries_into_follow_up_retrieval() {
         service.store.upsert(SourceDocument {
             doc_id: doc_id.to_string(),
             source: format!("artifact://{doc_id}"),
-            content: content.to_string(),
+            content: content.into(),
             concept: doc_id.to_string(),
             group_id: Some(group_id.to_string()),
             headings: vec![],
@@ -1965,7 +1965,7 @@ fn add_quartz_fixture(service: &mut MemoryService) {
             service.store.upsert(SourceDocument {
                 doc_id: doc_id.to_string(),
                 source: format!("artifact://{doc_id}"),
-                content: content.to_string(),
+                content: content.into(),
                 concept: doc_id.to_string(),
                 group_id: Some(doc_id.to_string()),
                 headings: vec![],
@@ -2322,7 +2322,7 @@ fn structured_doc(
     SourceDocument {
         doc_id: doc_id.to_string(),
         source: format!("test/{doc_id}"),
-        content: content.to_string(),
+        content: content.into(),
         concept: "test".to_string(),
         group_id: Some("sess-a".to_string()),
         headings: Vec::new(),
@@ -3012,7 +3012,7 @@ fn direct_doc(doc_id: &str, content: &str) -> SourceDocument {
     SourceDocument {
         doc_id: doc_id.to_string(),
         source: format!("test://{doc_id}"),
-        content: content.to_string(),
+        content: content.into(),
         concept: String::new(),
         group_id: None,
         headings: vec![],

@@ -1,14 +1,16 @@
 //! Bounded operational telemetry for long-running server processes.
 //!
 //! This module stores bounded query aggregates, detailed MCP tool history,
-//! and provider lifecycle metadata. Detailed MCP entries retain full request
-//! arguments and responses in a local append-only ledger.
+//! and provider lifecycle metadata. MCP entries are capped at one MiB; when a
+//! request or response exceeds that limit the ledger stores omission markers
+//! while preserving the trace identity and call metadata.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
 use std::thread;
@@ -22,6 +24,64 @@ const PROVIDER_TELEMETRY_DIR: &str = "provider-telemetry";
 const MAX_PROVIDER_TELEMETRY_EVENTS: usize = 500;
 const QUERY_TELEMETRY_FILE: &str = "query-telemetry.json";
 const MCP_CALL_HISTORY_FILE: &str = "mcp-call-history.jsonl";
+const MAX_MCP_CALL_HISTORY_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "MCP call history record exceeds byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_mcp_call_record_bounded(record: &mut McpCallRecord) -> Vec<u8> {
+    let serialize = |record: &McpCallRecord| {
+        let mut writer = BoundedJsonWriter {
+            bytes: Vec::with_capacity(16 * 1024),
+            limit: MAX_MCP_CALL_HISTORY_RECORD_BYTES,
+        };
+        serde_json::to_writer(&mut writer, record)
+            .ok()
+            .map(|()| writer.bytes)
+    };
+
+    if let Some(bytes) = serialize(record) {
+        return bytes;
+    }
+
+    record.arguments = serde_json::json!({
+        "status":"omitted",
+        "reason":"record exceeded history byte limit"
+    });
+    record.response = serde_json::json!({
+        "status":"omitted",
+        "reason":"record exceeded history byte limit"
+    });
+    if let Some(bytes) = serialize(record) {
+        return bytes;
+    }
+
+    record.request_id = None;
+    record.session_id = None;
+    record.provider.truncate(64);
+    record.tool.truncate(64);
+    serialize(record).expect("minimal MCP history record fits byte limit")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpCallRecord {
@@ -49,9 +109,8 @@ pub struct McpCallRecord {
     pub response: serde_json::Value,
 }
 
-/// Persist the detailed request and response for an MCP memory tool call.
-/// The ledger is local to the workspace. Every call and response is appended
-/// without a retention or payload-size limit.
+/// Persist a bounded request and response record for an MCP memory tool call.
+/// The ledger is local to the workspace and append-only.
 pub fn record_mcp_call(
     project_root: &Path,
     provider: &str,
@@ -175,7 +234,7 @@ pub(crate) fn record_mcp_call_with_trace_id_and_attribution(
     };
     let mut record = record;
     record.trace_id = Some(trace_id);
-    let mut line = serde_json::to_vec(&record)?;
+    let mut line = serialize_mcp_call_record_bounded(&mut record);
     line.push(b'\n');
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -184,7 +243,6 @@ pub(crate) fn record_mcp_call_with_trace_id_and_attribution(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    use std::io::Write;
     options.open(path)?.write_all(&line)?;
     drop(lock);
     Ok(())
@@ -1118,6 +1176,29 @@ mod tests {
             .is_some_and(|id| id.starts_with("mcp:")));
         assert_eq!(record.session_id.as_deref(), Some("session-1"));
         assert_eq!(record.session_attribution, "explicit");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mcp_call_history_bounds_large_responses() {
+        let directory = test_directory();
+        record_mcp_call(
+            &directory,
+            "codex",
+            "review_search",
+            None,
+            &serde_json::json!({"page_size": 10}),
+            12,
+            false,
+            serde_json::json!({"documents": "x".repeat(20 * 1024 * 1024)}),
+        )
+        .unwrap();
+
+        let history = fs::read(directory.join(".membrick/mcp-call-history.jsonl")).unwrap();
+        assert!(history.len() <= 16 * 1024 * 1024);
+        let record: McpCallRecord = serde_json::from_slice(&history[..history.len() - 1]).unwrap();
+        assert_eq!(record.response["status"], "omitted");
+        assert!(record.trace_id.is_some());
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -60,7 +60,14 @@ pub fn run_hook(kind: AgyHookKind, fallback_root: &Path) -> Result<()> {
         crate::integrations::read_bounded_json().context("failed to parse AGY hook input")?;
     let input: AgyHookInput =
         serde_json::from_value(raw.clone()).context("failed to decode AGY hook input")?;
-    let root = resolve_root(&input, fallback_root)?;
+    let root = match resolve_root(&input, fallback_root) {
+        Ok(Some(root)) => root,
+        Ok(None) => return write_output(&AgyHookOutput::default()),
+        Err(error) => {
+            tracing::warn!("Membrick AGY hook skipped: {error:#}");
+            return write_output(&AgyHookOutput::default());
+        }
+    };
     let session_id = if input.conversation_id.is_empty() {
         "unknown"
     } else {
@@ -367,7 +374,7 @@ fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> 
     let context = crate::source::SourceDocument {
         doc_id: crate::ids::stable_doc_id_from_source(&source),
         source,
-        content: format!("AGY session context\n{body}"),
+        content: format!("AGY session context\n{body}").into(),
         concept: "session-context".to_string(),
         group_id: Some(format!("agy-session:{project_id}:{session_id}")),
         headings: vec!["session-context".to_string()],
@@ -392,20 +399,20 @@ fn current_timestamp() -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string())
 }
 
-fn resolve_root(input: &AgyHookInput, fallback: &Path) -> Result<PathBuf> {
-    let fallback = fallback
-        .canonicalize()
-        .with_context(|| format!("failed to resolve AGY project root {}", fallback.display()))?;
+fn resolve_root(input: &AgyHookInput, fallback: &Path) -> Result<Option<PathBuf>> {
     let candidate = input
         .workspace_paths
         .first()
         .map(PathBuf::from)
-        .unwrap_or_else(|| fallback.clone())
-        .canonicalize()?;
-    if !candidate.starts_with(&fallback) {
-        anyhow::bail!("AGY workspace path is outside configured project root")
-    }
-    Ok(candidate)
+        .unwrap_or_else(|| fallback.to_path_buf());
+    crate::state_paths::find_project_root(&candidate)
+}
+
+fn write_output(output: &AgyHookOutput) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, output)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
 }
 
 fn resolve_transcript_path(root: &Path, transcript_path: &Path) -> Result<PathBuf> {

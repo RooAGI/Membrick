@@ -59,7 +59,7 @@ impl SourceAdapter for MarkdownAdapter {
                 SourceDocument {
                     doc_id: page.rel_path.clone(),
                     source: page.rel_path,
-                    content: page.content,
+                    content: page.content.into(),
                     concept: page.raw_concept,
                     group_id: None,
                     filters: std::collections::BTreeMap::new(),

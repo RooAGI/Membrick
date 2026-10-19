@@ -63,7 +63,7 @@ impl ClaudeCodeDocument {
         Ok(SourceDocument {
             doc_id: stable_doc_id_from_source(&format!("{source}/{}", self.event_id)),
             source,
-            content,
+            content: content.into(),
             concept: document_type.to_string(),
             group_id: Some(format!(
                 "{}{project_id}:{}",

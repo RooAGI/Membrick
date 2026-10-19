@@ -15,7 +15,8 @@ fn document(topic: &str, bucket: &str, age_days: i64, today: chrono::NaiveDate) 
         source: format!("conversation://{topic}/{bucket}"),
         content: format!(
             "Conversation memory about project {topic}. The team decided to keep the {topic} rollout plan and review it with the team."
-        ),
+        )
+        .into(),
         concept: topic.to_string(),
         group_id: Some(format!("session-{topic}-{bucket}")),
         filters: BTreeMap::new(),

@@ -846,7 +846,7 @@ mod tests {
         SourceDocument {
             doc_id: doc_id.to_string(),
             source: source.to_string(),
-            content: content.to_string(),
+            content: content.into(),
             concept: "test".to_string(),
             group_id: None,
             filters: BTreeMap::new(),

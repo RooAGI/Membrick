@@ -14,7 +14,7 @@ use tantivy::query::{
 use tantivy::schema::document::TantivyDocument;
 use tantivy::schema::{Field, IndexRecordOption, Schema, STORED, STRING, TEXT};
 use tantivy::Term;
-use tantivy::{doc, Index};
+use tantivy::{doc, Index, ReloadPolicy};
 
 use super::helpers::*;
 use super::model::*;
@@ -130,7 +130,7 @@ fn lexical_content_text(doc: &DocRecord) -> String {
 }
 
 fn build_doc_scoring_tokens(
-    docs: &HashMap<String, DocRecord>,
+    docs: &HashMap<String, std::sync::Arc<DocRecord>>,
     doc_id_to_u32: &HashMap<String, u32>,
     doc_count: usize,
     claim_scoring: bool,
@@ -169,9 +169,53 @@ impl MemoryIndex {
         claim_scoring: bool,
     ) -> Self {
         Self::from_records_internal(
+            records.into_iter().map(std::sync::Arc::new).collect(),
+            lexical_dir,
+            None,
+            None,
+            text_rerank_ngram,
+            text_rerank_lcs,
+            claim_scoring,
+        )
+    }
+
+    pub(crate) fn from_shared_records_with_lexical_dir(
+        records: Vec<std::sync::Arc<DocRecord>>,
+        lexical_dir: Option<&Path>,
+        text_rerank_ngram: bool,
+        text_rerank_lcs: bool,
+        claim_scoring: bool,
+    ) -> Self {
+        Self::from_records_internal(
             records,
             lexical_dir,
             None,
+            None,
+            text_rerank_ngram,
+            text_rerank_lcs,
+            claim_scoring,
+        )
+    }
+
+    pub(crate) fn from_shared_records_with_lexical_delta(
+        records: Vec<std::sync::Arc<DocRecord>>,
+        lexical_dir: Option<&Path>,
+        changed_doc_ids: std::collections::HashSet<String>,
+        removed_doc_ids: std::collections::HashSet<String>,
+        rebuild: bool,
+        text_rerank_ngram: bool,
+        text_rerank_lcs: bool,
+        claim_scoring: bool,
+    ) -> Self {
+        let delta = LexicalIndexDelta {
+            changed_doc_ids,
+            removed_doc_ids,
+        };
+        Self::from_records_internal(
+            records,
+            lexical_dir,
+            None,
+            Some((delta, rebuild)),
             text_rerank_ngram,
             text_rerank_lcs,
             claim_scoring,
@@ -187,9 +231,10 @@ impl MemoryIndex {
     ) -> Self {
         semantic_aggregate.sort_pending_postings();
         Self::from_records_internal(
-            records,
+            records.into_iter().map(std::sync::Arc::new).collect(),
             None,
             Some(semantic_aggregate),
+            None,
             text_rerank_ngram,
             text_rerank_lcs,
             claim_scoring,
@@ -197,9 +242,10 @@ impl MemoryIndex {
     }
 
     fn from_records_internal(
-        records: Vec<DocRecord>,
+        records: Vec<std::sync::Arc<DocRecord>>,
         lexical_dir: Option<&Path>,
         semantic_aggregate: Option<SemanticAggregate>,
+        lexical_delta: Option<(LexicalIndexDelta, bool)>,
         text_rerank_ngram: bool,
         text_rerank_lcs: bool,
         claim_scoring: bool,
@@ -224,10 +270,49 @@ impl MemoryIndex {
         let mut chunk_entities: Vec<Vec<u32>> = Vec::new();
         let mut doc_key_entities: Vec<Vec<String>> = Vec::new();
         let mut doc_rerank_texts: Vec<String> = Vec::new();
-        let mut doc_rerank_tokens: Vec<Vec<String>> = Vec::new();
+        let mut doc_rerank_tokens: Vec<Vec<u32>> = Vec::new();
+        let mut rerank_token_lexicon = Vec::new();
+        let mut rerank_token_ids = HashMap::new();
         let mut doc_has_number: Vec<bool> = Vec::new();
 
         for mut record in records {
+            if record.section_chunks.is_empty() {
+                let record = std::sync::Arc::make_mut(&mut record);
+                record.section_chunks.push(SectionChunk {
+                    chunk_id: stable_chunk_id(
+                        &record.doc_id,
+                        record
+                            .headings
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("(document)"),
+                        &record.content,
+                        1,
+                        record.content.lines().count().max(1),
+                    ),
+                    heading: record
+                        .headings
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "(document)".to_string()),
+                    content: record.content.clone(),
+                    start_line: 1,
+                    end_line: record.content.lines().count().max(1),
+                    timestamp: record.timestamp.clone(),
+                    key_entities: record
+                        .key_entities
+                        .iter()
+                        .map(|entity| normalize_for_index(&entity.text))
+                        .filter(|value| !value.is_empty())
+                        .collect(),
+                    important_terms: record
+                        .important_terms
+                        .iter()
+                        .map(|term| normalize_for_index(&term.term))
+                        .filter(|value| !value.is_empty())
+                        .collect(),
+                });
+            }
             let doc_id = record.doc_id.clone();
             let doc_u32 = doc_u32_to_id.len() as u32;
             doc_id_to_u32.insert(doc_id.clone(), doc_u32);
@@ -258,43 +343,11 @@ impl MemoryIndex {
             let (rerank_text, rerank_tokens) = build_doc_rerank_cache(&record);
             doc_has_number.push(contains_number_like(&rerank_text));
             doc_rerank_texts.push(rerank_text);
-            doc_rerank_tokens.push(rerank_tokens);
-            if record.section_chunks.is_empty() {
-                record.section_chunks.push(SectionChunk {
-                    chunk_id: stable_chunk_id(
-                        &doc_id,
-                        record
-                            .headings
-                            .first()
-                            .map(String::as_str)
-                            .unwrap_or("(document)"),
-                        &record.content,
-                        1,
-                        record.content.lines().count().max(1),
-                    ),
-                    heading: record
-                        .headings
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "(document)".to_string()),
-                    content: record.content.clone(),
-                    start_line: 1,
-                    end_line: record.content.lines().count().max(1),
-                    timestamp: record.timestamp.clone(),
-                    key_entities: record
-                        .key_entities
-                        .iter()
-                        .map(|e| normalize_for_index(&e.text))
-                        .filter(|v| !v.is_empty())
-                        .collect(),
-                    important_terms: record
-                        .important_terms
-                        .iter()
-                        .map(|t| normalize_for_index(&t.term))
-                        .filter(|v| !v.is_empty())
-                        .collect(),
-                });
-            }
+            doc_rerank_tokens.push(intern_rerank_tokens(
+                rerank_tokens,
+                &mut rerank_token_lexicon,
+                &mut rerank_token_ids,
+            ));
             if semantic_aggregate.is_none() {
                 for chunk in &record.section_chunks {
                     let chunk_u32 = chunks.len() as u32;
@@ -581,7 +634,7 @@ impl MemoryIndex {
             });
         }
 
-        let lexical = match Self::build_lexical_index(&docs, lexical_dir) {
+        let lexical = match Self::build_lexical_index(&docs, lexical_dir, lexical_delta) {
             Ok(index) => Some(index),
             Err(err) => {
                 tracing::warn!("lexical BM25 index disabled: {}", err);
@@ -620,6 +673,7 @@ impl MemoryIndex {
             doc_key_entities,
             doc_rerank_texts,
             doc_rerank_tokens,
+            rerank_token_lexicon,
             doc_topic_tokens,
             doc_type_tokens,
             doc_claim_tokens,
@@ -731,7 +785,7 @@ impl MemoryIndex {
                         .collect(),
                 });
             }
-            docs.insert(record.doc_id.clone(), record);
+            docs.insert(record.doc_id.clone(), std::sync::Arc::new(record));
         }
         // Recreate the dedicated evidence posting from persisted records so
         // stores written before this posting existed gain it on open too.
@@ -753,7 +807,7 @@ impl MemoryIndex {
                     });
             }
         }
-        let lexical = match Self::build_lexical_index(&docs, lexical_dir) {
+        let lexical = match Self::build_lexical_index(&docs, lexical_dir, None) {
             Ok(index) => Some(index),
             Err(err) => {
                 tracing::warn!("lexical BM25 index disabled: {}", err);
@@ -769,6 +823,8 @@ impl MemoryIndex {
         let mut doc_key_entities = vec![Vec::new(); core.doc_u32_to_id.len()];
         let mut doc_rerank_texts = vec![String::new(); core.doc_u32_to_id.len()];
         let mut doc_rerank_tokens = vec![Vec::new(); core.doc_u32_to_id.len()];
+        let mut rerank_token_lexicon = Vec::new();
+        let mut rerank_token_ids = HashMap::new();
         let entity_postings_doc =
             derive_doc_postings(&core.entity_postings_chunk, &core.chunks, MAX_DOC_POSTINGS);
         let term_postings_doc =
@@ -780,7 +836,11 @@ impl MemoryIndex {
                 let (rerank_text, rerank_tokens) = build_doc_rerank_cache(record);
                 doc_has_number[doc_u32 as usize] = contains_number_like(&rerank_text);
                 doc_rerank_texts[doc_u32 as usize] = rerank_text;
-                doc_rerank_tokens[doc_u32 as usize] = rerank_tokens;
+                doc_rerank_tokens[doc_u32 as usize] = intern_rerank_tokens(
+                    rerank_tokens,
+                    &mut rerank_token_lexicon,
+                    &mut rerank_token_ids,
+                );
             }
         }
         let mut filter_postings: HashMap<String, HashMap<String, RoaringBitmap>> = HashMap::new();
@@ -848,6 +908,7 @@ impl MemoryIndex {
             doc_key_entities,
             doc_rerank_texts,
             doc_rerank_tokens,
+            rerank_token_lexicon,
             doc_topic_tokens,
             doc_type_tokens,
             doc_claim_tokens,
@@ -919,8 +980,9 @@ impl MemoryIndex {
     }
 
     fn build_lexical_index(
-        docs: &HashMap<String, DocRecord>,
+        docs: &HashMap<String, std::sync::Arc<DocRecord>>,
         lexical_dir: Option<&Path>,
+        lexical_delta: Option<(LexicalIndexDelta, bool)>,
     ) -> Result<LexicalIndex> {
         let mut schema_builder = Schema::builder();
         let doc_id_f = schema_builder.add_text_field("doc_id", STRING | STORED);
@@ -948,7 +1010,7 @@ impl MemoryIndex {
         let schema = schema_builder.build();
         // Deterministic doc order so the batched bekind verdicts map back
         // to documents by position.
-        let mut ordered: Vec<&DocRecord> = docs.values().collect();
+        let mut ordered: Vec<&DocRecord> = docs.values().map(AsRef::as_ref).collect();
         ordered.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
         // Tags are precomputed at write time by MemoryService (the single
         // write path) and stored in DocRecord.semantic_tags. If empty
@@ -993,7 +1055,13 @@ impl MemoryIndex {
                             // QueryParser resolves the field tokenizer
                             // through the index's manager.
                             crate::index::cjk_tokenizer::register_cjk_tokenizer(&existing);
-                            return Ok((existing, false));
+                            let should_write =
+                                lexical_delta.as_ref().is_none_or(|(delta, rebuild)| {
+                                    *rebuild
+                                        || !delta.changed_doc_ids.is_empty()
+                                        || !delta.removed_doc_ids.is_empty()
+                                });
+                            return Ok((existing, should_write));
                         }
                         // Only a confirmed old schema authorizes replacement.
                         Ok(_) => fs::remove_dir_all(dir)?,
@@ -1007,7 +1075,28 @@ impl MemoryIndex {
                     Ok((new_index, true))
                 },
                 |writer| {
+                    let rebuild = lexical_delta
+                        .as_ref()
+                        .map(|(_, rebuild)| *rebuild)
+                        .unwrap_or(true);
+                    if rebuild {
+                        writer.delete_all_documents()?;
+                    }
+                    let mut deletes = std::collections::HashSet::new();
+                    if let Some((delta, _)) = lexical_delta.as_ref().filter(|_| !rebuild) {
+                        deletes.extend(delta.removed_doc_ids.iter());
+                    }
+                    for doc_id in deletes {
+                        writer.delete_term(Term::from_field_text(doc_id_f, doc_id));
+                    }
                     for (doc, tags) in ordered.iter().zip(tags_per_doc.iter()) {
+                        if !rebuild
+                            && lexical_delta.as_ref().is_some_and(|(delta, _)| {
+                                !delta.changed_doc_ids.contains(&doc.doc_id)
+                            })
+                        {
+                            continue;
+                        }
                         let headings_text = doc
                             .section_chunks
                             .iter()
@@ -1069,7 +1158,13 @@ impl MemoryIndex {
         // resolves the field tokenizer through this manager, so index-time
         // and query-time segmentation agree.
         crate::index::cjk_tokenizer::register_cjk_tokenizer(&index);
-        let reader = index.reader()?;
+        // Segment indexes are immutable once built, so the reader never needs
+        // to follow later commits. The default policy would start a thread per
+        // index that polls meta.json every 500 ms.
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
         let schema_ref = index.schema();
         let doc_id_f = schema_ref.get_field("doc_id")?;
         let content_f = schema_ref.get_field("content")?;

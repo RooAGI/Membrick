@@ -70,23 +70,69 @@ lock files may remain and are reused by the next owner. Different project roots
 therefore use separate runtime state and endpoints without requiring access to
 the user's home directory.
 
-The provider-launched MCP adapter owns the resident lifecycle. When a provider
-starts its stdio MCP process, the adapter registers a kernel-locked lease in
-`.membrick/runtime/provider-leases/` and triggers resident startup. The resident
-is shared by all provider MCP processes using that project, so Claude, Codex,
-and other providers can use it at the same time. The resident keeps running
-while any provider adapter or one-shot hook/request holds a lease. When the last
-provider process exits, the OS releases its lease even if it crashed; the
-resident detects that no leases remain, waits three seconds for a reconnect,
-then flushes its writer and shuts down. A later provider starts a fresh
-resident automatically. Stale lease files are detected by testing the kernel
-lock and removed during the resident's lease scan. Lease registration and the
-resident's final empty-lease check share the kernel lock at
-`.membrick/runtime/provider-lifecycle.lock`. If a provider starts while the
+The provider-launched MCP adapter requests resident startup when its stdio MCP
+process begins. That warm-up uses a short-lived kernel-locked lease in
+`.membrick/runtime/provider-leases/`. Hooks and other one-shot clients hold
+leases while a request is in flight. A Codex adapter also holds a lease while
+it has one or more bound active sessions; `SessionEnd` releases the lease when
+the adapter's final session ends. Other provider adapters do not hold a lease
+for their full process lifetime. The resident is shared by Claude, Codex, and
+other providers using the same project. After all request and session leases
+are released, the resident waits for `resident_idle_timeout_seconds` (60
+seconds by default, clamped to 5–3600) before flushing its writer and shutting
+down. A later provider or hook request starts a fresh resident automatically.
+Stale lease files are detected by testing the kernel lock and removed during
+the resident's lease scan. Lease registration and the resident's final
+empty-lease check share the kernel lock at
+`.membrick/runtime/provider-lifecycle.lock`. If a request starts while the
 resident is shutting down, registration waits until the old resident has
-closed its endpoints and flushed its writer; the new provider then starts a
-fresh owner. The resident holds this lock through its shutdown path. Manual
-`--resident-server` mode remains signal-controlled rather than lease-controlled.
+closed its endpoints and flushed its writer; the request then starts a fresh
+owner. The resident holds this lock through its shutdown path. Manual
+`--resident-server` mode remains signal-controlled rather than idle-controlled.
+
+The dashboard and direct HTTP listener are served by the resident. Once it has
+idled out, direct browser access does not start it; a provider, hook, or other
+Membrick client request must wake the resident first.
+
+The shared `integrations::provider_lifecycle` manager stores adapter ownership
+under `.membrick/runtime/provider-adapters`. Each ownership token contains the
+provider, conversation ID, and provider-issued instance ID. End events match
+all three fields. Ending an earlier instance cannot release a resumed instance
+or another provider's ownership. Each provider integration translates its own
+signals into these tokens; dropping an adapter releases its ownership record.
+
+Codex adapters also bind the session IDs supplied by installed `SessionStart`
+and `UserPromptSubmit` MCP hooks, or by a tool call's `_meta.threadId`. The
+command `SessionEnd` hook releases that session's ownership under a project
+lock. Once a bound adapter has no remaining sessions, its MCP loop returns
+even if a Codex daemon still holds stdin open. Adapters shared by several
+bound sessions stay up until the final session ends. `SubagentStop` releases a
+bound subagent ID as well.
+
+Codex currently supplies only a conversation ID in its end hook. Its bridge
+therefore uses conversation-scoped ownership, without instance fencing. A
+delayed end event for an earlier resume of the same conversation remains
+ambiguous. The shared manager supports exact instance fencing, but the Codex
+bridge cannot use it until the host supplies a matching instance ID on both
+binding and end events. MCP tool metadata alone does not resolve that gap.
+
+This requires the updated, trusted Codex hooks. `SessionStart` can run before
+MCP initialization, so `UserPromptSubmit` retries binding. Clients without a
+session binding retain the usual stdin-EOF lifecycle; Membrick cannot infer
+their owning terminal. An abrupt disconnect that does not emit `SessionEnd`
+still relies on the host closing the MCP connection. See the
+[Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
+Codex emits this event.
+
+Published read views share immutable temporal facts and semantic relationships
+with the writer through copy-on-write ownership. Segmented stores keep search
+postings in their segments instead of retaining a second corpus-wide posting
+aggregate. Compatibility exports build the global aggregate only on demand.
+Prepared checkpoints stream records through a compressed buffer, then stream
+them back to ordinary JSON at the atomic disk write. This avoids retaining a
+full serialized corpus string beside the live records.
+This reduces duplication; document records, source text and active segment
+indexes still occupy memory, and publishing changed segments can raise peaks.
 
 On normal shutdown the resident stops accepting connections, flushes its
 writer, and removes its socket file if the path still refers to the socket it
@@ -102,6 +148,7 @@ one possible assignment:
 bind = "127.0.0.1:8080"
 resident_http_bind = "127.0.0.1:8465"
 resident_http_auto_port = true
+resident_idle_timeout_seconds = 60
 dashboard_url = "http://127.0.0.1:8465/dashboard"
 ```
 

@@ -84,9 +84,28 @@ impl Role {
     }
 }
 
+/// The level the process logger uses and where it came from: `server.toml`
+/// or the role's default.
+static ACTIVE_LEVEL: std::sync::OnceLock<(LevelFilter, &'static str)> = std::sync::OnceLock::new();
+
+/// The level chosen by [`init`], so startup can report what is in effect.
+pub(crate) fn active_level() -> Option<(LevelFilter, &'static str)> {
+    ACTIVE_LEVEL.get().copied()
+}
+
+/// The level a process of `role` started in `project_root` logs at, and where
+/// it came from.
+fn effective_level(role: Role, project_root: &Path) -> (LevelFilter, &'static str) {
+    match configured_level(project_root) {
+        Some(level) => (level, "server.toml"),
+        None => (role.default_level(), "default"),
+    }
+}
+
 /// Install the process-wide logger. Later calls keep the first logger.
 pub(crate) fn init(role: Role, project_root: &Path) {
-    let level = configured_level(project_root).unwrap_or_else(|| role.default_level());
+    let (level, source) = effective_level(role, project_root);
+    let _ = ACTIVE_LEVEL.set((level, source));
     let filter = Targets::new()
         .with_target("membrick", level)
         .with_default(LevelFilter::WARN);
@@ -208,6 +227,34 @@ mod tests {
             configured_level(&root),
             None,
             "an unknown level falls back to the default"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_resident_uses_the_level_install_wrote() {
+        let root =
+            std::env::temp_dir().join(format!("membrick-logging-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            effective_level(Role::Resident, &root),
+            (LevelFilter::INFO, "default")
+        );
+        crate::state_paths::initialize_project_state(&root).unwrap();
+        assert_eq!(
+            effective_level(Role::Resident, &root),
+            (LevelFilter::INFO, "server.toml")
+        );
+        // A level the user sets afterwards is what the next resident uses.
+        let settings = root.join(".membrick/server.toml");
+        let text = std::fs::read_to_string(&settings)
+            .unwrap()
+            .replace("level = \"info\"", "level = \"debug\"");
+        std::fs::write(&settings, text).unwrap();
+        assert_eq!(
+            effective_level(Role::Resident, &root),
+            (LevelFilter::DEBUG, "server.toml")
         );
         let _ = std::fs::remove_dir_all(root);
     }

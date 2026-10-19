@@ -142,7 +142,7 @@ fn make_synthetic_doc(doc_idx: usize, session_idx: usize, provider: &str) -> Sou
     SourceDocument {
         doc_id: format!("session-recording:{provider}:{session_idx:05}:{doc_idx:06}"),
         source: format!("{provider}://session/{session_idx:05}"),
-        content: content.clone(),
+        content: content.as_str().into(),
         concept: "conversation".into(),
         group_id: Some(group_id),
         filters: Default::default(),
@@ -167,7 +167,7 @@ fn make_longmemeval_doc(session: &SessionText, replica: usize) -> SourceDocument
     SourceDocument {
         doc_id: format!("longmemeval:{}{}", session.id, suffix),
         source: format!("longmemeval://{}{}", session.id, suffix),
-        content: content.clone(),
+        content: content.as_str().into(),
         concept: "conversation".into(),
         group_id: Some(group_id),
         filters: Default::default(),

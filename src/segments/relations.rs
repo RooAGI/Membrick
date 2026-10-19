@@ -2865,7 +2865,7 @@ mod tests {
         crate::SourceDocument {
             doc_id: doc_id.to_string(),
             source: format!("test/{doc_id}"),
-            content: content.to_string(),
+            content: content.into(),
             concept: "test".to_string(),
             group_id: group_id.map(|s| s.to_string()),
             headings: Vec::new(),
