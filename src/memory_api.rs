@@ -1356,6 +1356,12 @@ impl MemoryService {
         self.workspace_store.is_some()
     }
 
+    /// Delete lexical index folders this store's snapshot no longer uses.
+    /// Callers must hold the workspace owner lock.
+    pub(crate) fn remove_unused_segment_lexical_dirs(&self) -> anyhow::Result<usize> {
+        self.store.remove_unused_segment_lexical_dirs()
+    }
+
     pub(crate) fn memory_store(&self, target: MemoryStore) -> &Self {
         match target {
             MemoryStore::Workspace => self.workspace_store.as_deref().unwrap_or(self),

@@ -396,6 +396,25 @@ pub(super) fn open_workspace_memory_owner_with_options_at(
 
     let memory_root = root.join(".membrick").join(memory_name);
     let provider_memory = MemoryService::at_path(&memory_root, options)?;
+    // Opening rebuilt any segment that changed since the last owner ran, into
+    // a new folder. The owner lock guarantees nothing still reads the old one.
+    for (store, store_root) in [
+        (&workspace, workspace_root),
+        (&provider_memory, &memory_root),
+    ] {
+        match store.remove_unused_segment_lexical_dirs() {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(
+                removed,
+                store = %store_root.display(),
+                "removed unused segment lexical folders"
+            ),
+            Err(error) => tracing::warn!(
+                store = %store_root.display(),
+                "could not remove unused segment lexical folders: {error:#}"
+            ),
+        }
+    }
     Ok(MemoryService::retain_workspace_store(
         provider_memory,
         workspace,
@@ -567,6 +586,61 @@ mod tests {
         assert!(published
             .source_document_by_id("workspace-updated")
             .is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reveals_bug_owner_startup_keeps_lexical_folders_of_earlier_segment_versions() {
+        let root = board_test_root("lexical-folder-sweep");
+        fs::create_dir_all(&root).unwrap();
+        let open = || {
+            open_workspace_memory_owner(&root, SHARED_MEMORY_DIR, &[], || {
+                Ok(vec![document(
+                    "workspace-initial",
+                    "docs/readme.md",
+                    "guide",
+                )])
+            })
+            .unwrap()
+        };
+        // Each owner run changes one session segment, so each start builds
+        // that segment's lexical index into a new content-addressed folder.
+        for content in ["first capture", "second capture", "third capture"] {
+            let mut owner = open();
+            let mut turn = document("session-turn", "session/turn.md", content);
+            turn.group_id = Some("session-a".to_string());
+            owner.upsert(turn);
+            owner.refresh_index().unwrap();
+        }
+        drop(open());
+
+        let memory_root = root.join(".membrick").join(SHARED_MEMORY_DIR);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(memory_root.join("semantic").join("segments.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = manifest["segments"].as_array().unwrap();
+        let mut on_disk = fs::read_dir(memory_root.join("segment-lexical"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        on_disk.sort();
+        assert_eq!(
+            on_disk.len(),
+            entries.len(),
+            "one lexical folder per live segment, found {on_disk:?}"
+        );
+        let mut listed = entries
+            .iter()
+            .map(|entry| entry["lexical_dir"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert_eq!(
+            on_disk, listed,
+            "only the folders the manifest lists should remain after an owner start"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -140,6 +140,7 @@ impl SegmentedMemoryIndex {
                     doc_ids: segment.doc_ids.clone(),
                     index: Arc::clone(&segment.index),
                     record_dates: segment.record_dates.clone(),
+                    lexical_dir: segment.lexical_dir.clone(),
                 });
                 if let Some(summary) = index.catalog.summaries.get(old_id) {
                     summaries.insert(next_id.clone(), Arc::clone(summary));
@@ -332,6 +333,7 @@ impl SegmentedMemoryIndex {
                     doc_ids: previous_segment.doc_ids.clone(),
                     index: Arc::clone(&previous_segment.index),
                     record_dates: std::sync::OnceLock::new(),
+                    lexical_dir: previous_segment.lexical_dir.clone(),
                 }),
                 None => {
                     let mut segment_records = Vec::with_capacity(new_doc_ids.len());
@@ -423,6 +425,7 @@ impl SegmentedMemoryIndex {
                     doc_ids: segment.doc_ids.clone(),
                     index: Arc::clone(&segment.index),
                     record_dates: std::sync::OnceLock::new(),
+                    lexical_dir: segment.lexical_dir.clone(),
                 });
                 continue;
             }
@@ -495,6 +498,7 @@ impl SegmentedMemoryIndex {
                 .map(|segment| SegmentManifestEntry {
                     segment_id: segment.segment_id.clone(),
                     doc_ids: segment.doc_ids.clone(),
+                    lexical_dir: segment.lexical_dir.clone(),
                 })
                 .collect(),
         }

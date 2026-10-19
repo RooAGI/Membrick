@@ -503,6 +503,52 @@ impl IndexStore {
         self.checkpoint_revision = self.checkpoint_revision.max(revision);
         self.checkpoint_pending = self.snapshot_revision > self.checkpoint_revision;
     }
+
+    /// Delete `segment-lexical` folders the current snapshot does not use.
+    /// Each folder holds one immutable version of a segment's lexical index,
+    /// so every rebuild of a changed segment leaves the previous version
+    /// behind. Only the workspace owner may call this: another process could
+    /// still be reading an older version.
+    ///
+    /// Does nothing unless every segment's folder is known, so a snapshot
+    /// with an in-memory segment never causes a live folder to be removed.
+    pub(crate) fn remove_unused_segment_lexical_dirs(&self) -> Result<usize> {
+        let Some(root) = self.store_paths.root.as_deref() else {
+            return Ok(0);
+        };
+        let Some(MemoryIndexSnapshot::Segmented(index)) = self.snapshot.as_deref() else {
+            return Ok(0);
+        };
+        let Some(live) = index
+            .segments
+            .iter()
+            .map(|segment| segment.lexical_dir.as_deref())
+            .collect::<Option<HashSet<_>>>()
+        else {
+            return Ok(0);
+        };
+        let lexical_root = root.join("segment-lexical");
+        let Ok(entries) = std::fs::read_dir(&lexical_root) else {
+            return Ok(0);
+        };
+        let mut removed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            // Folder names are SHA-256 hex digests; leave anything else alone.
+            let is_segment_folder =
+                name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+            if !is_segment_folder || live.contains(name) || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            std::fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
     /// Detached read view. Shares immutable indexes and copy-on-write corpus
     /// maps, keeping visibility and reranking metadata on one generation.
     pub(crate) fn published_read_view(&self) -> Self {

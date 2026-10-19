@@ -1090,6 +1090,7 @@ fn segmented_store_reloads_without_a_compatibility_core() {
         segments: vec![crate::segments::SegmentManifestEntry {
             segment_id: "combined".to_string(),
             doc_ids: vec!["doc-1".to_string(), "doc-2".to_string()],
+            lexical_dir: None,
         }],
     };
     fs::write(

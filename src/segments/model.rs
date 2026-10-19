@@ -64,6 +64,9 @@ pub struct MemoryIndexSegment {
     /// timestamp is parsed at most once per segment instead of once per
     /// anchored query.
     pub(crate) record_dates: OnceLock<Vec<NaiveDate>>,
+    /// Name of this segment's folder under the store's `segment-lexical`
+    /// directory, or `None` when its lexical index lives only in memory.
+    pub(crate) lexical_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +79,10 @@ pub struct SegmentManifest {
 pub struct SegmentManifestEntry {
     pub segment_id: String,
     pub doc_ids: Vec<String>,
+    /// The segment's `segment-lexical` folder when the snapshot that wrote
+    /// this manifest had one on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,11 +218,16 @@ pub(crate) fn build_memory_index_segment_with_lexical_root(
     } else {
         MemoryIndex::from_records(segment_records)
     });
+    let lexical_dir = lexical_dir
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
     MemoryIndexSegment {
         segment_id,
         doc_ids,
         index,
         record_dates: OnceLock::new(),
+        lexical_dir,
     }
 }
 
