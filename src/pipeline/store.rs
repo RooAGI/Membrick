@@ -12,7 +12,10 @@ use crate::index::{
     SearchResult, SemanticAggregate, SemanticDocState,
 };
 use crate::query_plan::PreparedQuery;
-use crate::segments::SegmentedMemoryIndex;
+use crate::segments::{
+    remove_segment_lexical_dirs_when_unused, retire_replaced_segment_lexical_dirs,
+    SegmentLexicalDir, SegmentedMemoryIndex,
+};
 use crate::semantic_relations::SemanticRelationStore;
 use crate::source::KeyPhrase;
 use crate::source::SourceDocument;
@@ -353,6 +356,21 @@ fn build_memory_index_snapshot(
     }
 }
 
+/// Called by the writable store when it replaces its snapshot. Detached build
+/// views do not call it: their result may still be rejected.
+fn retire_replaced_lexical_dirs(
+    previous: Option<&MemoryIndexSnapshot>,
+    next: Option<&MemoryIndexSnapshot>,
+) {
+    fn segments(snapshot: Option<&MemoryIndexSnapshot>) -> &[crate::segments::MemoryIndexSegment] {
+        match snapshot {
+            Some(MemoryIndexSnapshot::Segmented(index)) => &index.segments,
+            _ => &[],
+        }
+    }
+    retire_replaced_segment_lexical_dirs(segments(previous), segments(next));
+}
+
 fn merge_composed_map<T>(
     target: &mut HashMap<String, T>,
     additions: HashMap<String, T>,
@@ -401,7 +419,8 @@ impl IndexStore {
             return false;
         }
         assert!(view.snapshot_revision <= self.store_revision);
-        self.snapshot = view.snapshot.clone();
+        let previous = std::mem::replace(&mut self.snapshot, view.snapshot.clone());
+        retire_replaced_lexical_dirs(previous.as_deref(), self.snapshot.as_deref());
         self.snapshot_revision = view.snapshot_revision;
         for id in changed {
             self.pending_snapshot_changes.remove(id);
@@ -516,18 +535,21 @@ impl IndexStore {
         let Some(root) = self.store_paths.root.as_deref() else {
             return Ok(0);
         };
+        let lexical_root = root.join("segment-lexical");
+        // From now on a replaced folder is deleted as soon as no segment
+        // holds it, including folders of segments rebuilt later on.
+        remove_segment_lexical_dirs_when_unused(&lexical_root);
         let Some(MemoryIndexSnapshot::Segmented(index)) = self.snapshot.as_deref() else {
             return Ok(0);
         };
         let Some(live) = index
             .segments
             .iter()
-            .map(|segment| segment.lexical_dir.as_deref())
+            .map(|segment| segment.lexical_dir.as_deref().map(SegmentLexicalDir::name))
             .collect::<Option<HashSet<_>>>()
         else {
             return Ok(0);
         };
-        let lexical_root = root.join("segment-lexical");
         let Ok(entries) = std::fs::read_dir(&lexical_root) else {
             return Ok(0);
         };
@@ -549,6 +571,19 @@ impl IndexStore {
         }
         Ok(removed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn segment_lexical_dir_names(&self) -> Vec<Option<String>> {
+        match self.snapshot.as_deref() {
+            Some(MemoryIndexSnapshot::Segmented(index)) => index
+                .segments
+                .iter()
+                .map(|segment| segment.lexical_dir.as_deref().map(SegmentLexicalDir::name))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Detached read view. Shares immutable indexes and copy-on-write corpus
     /// maps, keeping visibility and reranking metadata on one generation.
     pub(crate) fn published_read_view(&self) -> Self {
@@ -1507,9 +1542,31 @@ impl IndexStore {
         Ok(())
     }
 
+    /// Directory holding this store's per-segment lexical indexes, if it has one.
+    pub(crate) fn segment_lexical_root(&self) -> Option<PathBuf> {
+        self.store_paths
+            .root
+            .as_deref()
+            .map(|root| root.join("segment-lexical"))
+    }
+
+    pub(crate) fn build_prepared_snapshot(&mut self) -> Result<()> {
+        let previous = self.snapshot.clone();
+        let segment_lexical_root = self.segment_lexical_root();
+        self.build_prepared_snapshot_in(segment_lexical_root.as_deref())?;
+        retire_replaced_lexical_dirs(previous.as_deref(), self.snapshot.as_deref());
+        Ok(())
+    }
+
     /// Build a frozen input whose records and semantic metadata were already
     /// prepared by the owner. Do not repeat corpus preparation in the worker.
-    pub(crate) fn build_prepared_snapshot(&mut self) -> Result<()> {
+    /// A detached build view has no store paths of its own, so the owner
+    /// passes its `segment-lexical` directory: rebuilt segments then keep
+    /// their lexical index on disk instead of in memory.
+    pub(crate) fn build_prepared_snapshot_in(
+        &mut self,
+        segment_lexical_root: Option<&Path>,
+    ) -> Result<()> {
         if self.dirty || self.snapshot.is_none() {
             let reprocessed_doc_ids = &self.pending_snapshot_changes;
             // The delta path uses previous membership and explicit changes;
@@ -1519,18 +1576,13 @@ impl IndexStore {
                 let records = &self.records;
                 let layout = &self.options.memory_index_layout;
                 let store_revision = self.store_revision;
-                let segment_lexical_root = self
-                    .store_paths
-                    .root
-                    .as_deref()
-                    .map(|root| root.join("segment-lexical"));
                 Self::try_refresh_incremental(
                     snapshot,
                     records,
                     &reprocessed_doc_ids,
                     store_revision,
                     layout,
-                    segment_lexical_root.as_deref(),
+                    segment_lexical_root,
                 )?
             };
             if !incremental {
@@ -1549,11 +1601,7 @@ impl IndexStore {
                     global_index,
                     &self.options.memory_index_layout,
                     self.store_revision,
-                    self.store_paths
-                        .root
-                        .as_deref()
-                        .map(|root| root.join("segment-lexical"))
-                        .as_deref(),
+                    segment_lexical_root,
                 )));
             }
             self.snapshot_revision = self.store_revision;

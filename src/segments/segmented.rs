@@ -498,7 +498,7 @@ impl SegmentedMemoryIndex {
                 .map(|segment| SegmentManifestEntry {
                     segment_id: segment.segment_id.clone(),
                     doc_ids: segment.doc_ids.clone(),
-                    lexical_dir: segment.lexical_dir.clone(),
+                    lexical_dir: segment.lexical_dir.as_deref().map(SegmentLexicalDir::name),
                 })
                 .collect(),
         }

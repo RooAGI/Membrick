@@ -645,6 +645,52 @@ mod tests {
     }
 
     #[test]
+    fn reveals_bug_running_owner_keeps_rebuilt_segments_off_disk_and_old_folders_on_disk() {
+        let root = board_test_root("lexical-folder-runtime");
+        fs::create_dir_all(&root).unwrap();
+        let mut owner = open_workspace_memory_owner(&root, SHARED_MEMORY_DIR, &[], || {
+            Ok(vec![document(
+                "workspace-initial",
+                "docs/readme.md",
+                "guide",
+            )])
+        })
+        .unwrap();
+        // One running owner rebuilds the session segment on every change,
+        // through the same staged write and background publication the
+        // resident uses.
+        for content in ["first capture", "second capture", "third capture"] {
+            let mut turn = document("session-turn", "session/turn.md", content);
+            turn.group_id = Some("session-a".to_string());
+            owner.stage_upsert_batch(vec![turn]).unwrap();
+            owner.begin_checkpoint_publication().unwrap();
+            owner.wait_publication().unwrap();
+        }
+
+        let live = owner.store.segment_lexical_dir_names();
+        assert!(
+            live.iter().all(Option::is_some),
+            "rebuilt segments should keep their lexical index on disk, got {live:?}"
+        );
+        let mut live = live.into_iter().flatten().collect::<Vec<_>>();
+        live.sort();
+        let memory_root = root.join(".membrick").join(SHARED_MEMORY_DIR);
+        let mut on_disk = fs::read_dir(memory_root.join("segment-lexical"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        on_disk.sort();
+        assert_eq!(
+            on_disk, live,
+            "a folder no snapshot uses should be removed while the owner runs"
+        );
+        drop(owner);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn only_one_resident_can_own_a_project_at_a_time() {
         let root = board_test_root("exclusive-resident-owner");
         fs::create_dir_all(&root).unwrap();

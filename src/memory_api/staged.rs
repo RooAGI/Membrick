@@ -152,6 +152,7 @@ impl MemoryService {
         anyhow::ensure!(self.publication.is_none(), "publication already in flight");
         self.drain_enrichment_inbox();
         let store = self.store.publication_build_view()?;
+        let segment_lexical_root = self.store.segment_lexical_root();
         let changed = self.store.pending_snapshot_changes();
         let mut view = self.read_view_with_store(store);
         let pending = self.pending_adds.clone();
@@ -175,7 +176,8 @@ impl MemoryService {
             .spawn(move || {
                 before_build();
                 let result = (|| -> anyhow::Result<PublicationResult> {
-                    view.store.build_prepared_snapshot()?;
+                    view.store
+                        .build_prepared_snapshot_in(segment_lexical_root.as_deref())?;
                     let prepared_checkpoint = if prepare_checkpoint {
                         Some(view.store.prepare_checkpoint()?)
                     } else {
