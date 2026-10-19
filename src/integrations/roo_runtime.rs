@@ -27,6 +27,10 @@ struct HookInvocation {
     run_id: String,
     #[serde(default)]
     timestamp: Option<String>,
+    /// The agent node the event belongs to. Roo omits it when the hook
+    /// policy does not grant `workspace_identity`.
+    #[serde(default)]
+    node_id: Option<String>,
     #[serde(default)]
     payload: Value,
 }
@@ -310,6 +314,46 @@ fn memory_session_id(project: &str, input: &HookInvocation) -> String {
     format!("rooagi_runtime:{project}:{session}")
 }
 
+/// Segment group for one Roo capture. Roo compacts each agent's transcript on
+/// its own and reports that agent's count as `compactionEpoch`. Captures made
+/// before an agent's first compaction stay in the session's group; later ones
+/// go to a group for that agent and epoch, so earlier epochs stop changing.
+/// Without the agent's node id an epoch is ambiguous, so the session's group
+/// is kept.
+fn memory_segment_group(project: &str, input: &HookInvocation) -> (String, u64) {
+    let session = memory_session_id(project, input);
+    let epoch = input
+        .payload
+        .get("compactionEpoch")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let node = input
+        .node_id
+        .as_deref()
+        .or_else(|| input.payload.get("nodeId").and_then(Value::as_str))
+        .filter(|node| !node.trim().is_empty());
+    match node {
+        Some(node) if epoch > 0 => (
+            crate::provider_sources::session_epoch_group(
+                &format!("{session}:agent:{}", bounded(node, 256)),
+                epoch,
+            ),
+            epoch,
+        ),
+        _ => (session, 0),
+    }
+}
+
+fn set_segment_group(document: &mut SourceDocument, project: &str, input: &HookInvocation) {
+    let (group, epoch) = memory_segment_group(project, input);
+    document.group_id = Some(group);
+    if epoch > 0 {
+        document
+            .filters
+            .insert("session_epoch".into(), epoch.to_string());
+    }
+}
+
 fn capture(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
     let content = if kind == "turn" {
         let user = capture_text::strip_memory_context(
@@ -397,6 +441,7 @@ fn capture(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
             .filters
             .insert("turn_id".to_string(), bounded(id, 256));
     }
+    set_segment_group(&mut document, &root.to_string_lossy(), input);
     let session_id = document
         .filters
         .get("session_id")
@@ -510,6 +555,7 @@ fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result
             .filters
             .insert("turn_id".to_string(), bounded(turn_id, 256));
     }
+    set_segment_group(&mut document, &root.to_string_lossy(), input);
     let capture_id = crate::ids::stable_doc_id_from_source(&document.source);
     document
         .filters
@@ -776,6 +822,7 @@ mod tests {
             event: "post_tool_use".into(),
             run_id: "run".into(),
             timestamp: None,
+            node_id: None,
             payload: serde_json::json!({"toolName": "fetch", "toolUseId": "call", "toolResponse": {"evidence": "a".repeat(MAX_CONTEXT_BYTES * 2), "password": "must-not-appear"}}),
         };
         let context = tool_result_context(&input).additional_context.unwrap();
@@ -819,6 +866,7 @@ mod tests {
             event: "post_tool_use".into(),
             run_id: "first-run".into(),
             timestamp: None,
+            node_id: None,
             payload: serde_json::json!({"toolName": "fetch", "toolUseId": "call-1", "toolResponse": {"items": (0..300).map(|i| format!("item-{i}")).collect::<Vec<_>>(), "finding": "unique-evidence-299"}}),
         };
         capture_tool_event(&root, &input, "tool_result").unwrap();
@@ -828,6 +876,7 @@ mod tests {
             event: "agent_turn_start".into(),
             run_id: "later-run".into(),
             timestamp: None,
+            node_id: None,
             payload: serde_json::json!({"userMessage": "unique-evidence-299"}),
         };
         let context = recall(&root, &search).unwrap().additional_context.unwrap();
@@ -906,6 +955,7 @@ mod tests {
             event: "post_tool_use".into(),
             run_id: "run".into(),
             timestamp: None,
+            node_id: None,
             payload: serde_json::json!({"toolName":"fetch","toolUseId":"call", "payloadReferences":{"toolResponse":{"path":path,"sizeBytes":bytes.len(),"encoding":"json","sha256":format!("{:x}", sha2::Sha256::digest(&bytes))}}}),
         };
         load_payload_references(&root, &mut input.payload).unwrap();
@@ -916,6 +966,7 @@ mod tests {
             event: "agent_turn_start".into(),
             run_id: "later".into(),
             timestamp: None,
+            node_id: None,
             payload: serde_json::json!({"userMessage":"late-evidence-913"}),
         };
         assert!(recall(&root, &query)
@@ -1016,6 +1067,7 @@ mod tests {
             event: "agent_turn_end".to_string(),
             run_id: "roo-run-capture-test".to_string(),
             timestamp: Some("2026-10-04T00:00:00Z".to_string()),
+            node_id: None,
             payload: serde_json::json!({
                 "turnId": "roo-run-capture-test:agent:1",
                 "userMessage": "What storage rule did we choose for integration-test-unique-42?",
@@ -1033,5 +1085,38 @@ mod tests {
         assert!(context.contains("integration-test-unique-42"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn each_agent_compaction_starts_its_own_segment_group() {
+        let input = |node: Option<&str>, epoch: u64| HookInvocation {
+            schema_version: 1,
+            event: "agent_turn_end".into(),
+            run_id: "run-1".into(),
+            timestamp: None,
+            node_id: node.map(str::to_owned),
+            payload: serde_json::json!({"sessionId": "chat-1", "compactionEpoch": epoch}),
+        };
+        let session = "rooagi_runtime:/p:chat-1";
+        // Before an agent compacts, its captures stay in the session's group.
+        assert_eq!(
+            memory_segment_group("/p", &input(Some("chat"), 0)),
+            (session.to_string(), 0)
+        );
+        // After it compacts, each agent gets its own group per epoch, so two
+        // agents' first compactions do not share a segment.
+        assert_eq!(
+            memory_segment_group("/p", &input(Some("chat"), 2)),
+            (format!("{session}:agent:chat:epoch-2"), 2)
+        );
+        assert_eq!(
+            memory_segment_group("/p", &input(Some("critic"), 2)).0,
+            format!("{session}:agent:critic:epoch-2")
+        );
+        // Without the agent's node id the epoch is ambiguous.
+        assert_eq!(
+            memory_segment_group("/p", &input(None, 2)),
+            (session.to_string(), 0)
+        );
     }
 }
