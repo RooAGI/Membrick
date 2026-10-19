@@ -12,7 +12,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_CONTEXT_BYTES: usize = 8_000;
+// Roo accepts at most 6,000 bytes of hook context per turn
+// (`MAX_TURN_CONTEXT_BYTES`) and cuts anything longer, which would drop the
+// closing memory marker.
+const MAX_CONTEXT_BYTES: usize = 6_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -490,7 +493,7 @@ fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result
     }
     document.filters.insert(
         "capture_completeness".to_string(),
-        "complete_sanitized".to_string(),
+        "bounded_sanitized".to_string(),
     );
     if let Some(session_id) = input
         .payload
@@ -876,7 +879,8 @@ mod tests {
             .expect("truncation must not discard recall");
         assert!(result.contains("budget-proof"));
         assert!(result.len() <= MAX_CONTEXT_BYTES);
-        assert!(result.len() > 7_000);
+        assert!(result.len() > MAX_CONTEXT_BYTES - 1_000);
+        assert!(result.ends_with(capture_text::MEMORY_CONTEXT_END));
     }
 
     #[test]
