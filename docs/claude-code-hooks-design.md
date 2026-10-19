@@ -76,7 +76,9 @@ end of their input (about 1 KB), and tool results the start and end of their
 output (about 2 KB); raw call records, thinking signatures and encrypted
 reasoning are not stored. Memory context that Membrick injected is wrapped in
 `<membrick-memory>` markers, and captures drop it, so earlier memories are
-never copied into new ones. All providers share these rules
+never copied into new ones. Roo Runtime marks a compaction summary it puts
+back into a prompt with `<roo-compaction-summary>`, and captures drop that
+too, since the summary is stored once when Roo reports the compaction. All providers share these rules
 (`src/integrations/capture_text.rs`).
 
 A context compaction starts a new segment. Codex records a top-level

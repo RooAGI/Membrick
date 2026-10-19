@@ -10,11 +10,18 @@
 //!   captures drop everything between them.
 //! - Tool calls and their results. They keep the tool name and the start and
 //!   end of their input and output, never the raw call records.
+//!
+//! Roo Runtime also marks a compaction summary it puts back into a prompt
+//! with [`COMPACTION_SUMMARY_START`] and [`COMPACTION_SUMMARY_END`]. The
+//! summary is stored once, when Roo reports the compaction, so captures drop
+//! marked copies too.
 
 use serde_json::Value;
 
 pub(crate) const MEMORY_CONTEXT_START: &str = "<membrick-memory>";
 pub(crate) const MEMORY_CONTEXT_END: &str = "</membrick-memory>";
+pub(crate) const COMPACTION_SUMMARY_START: &str = "<roo-compaction-summary>";
+pub(crate) const COMPACTION_SUMMARY_END: &str = "</roo-compaction-summary>";
 pub(crate) const MAX_TOOL_INPUT_BYTES: usize = 1_000;
 pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 2_000;
 pub(crate) const MAX_REASONING_BYTES: usize = 4_000;
@@ -34,19 +41,14 @@ pub(crate) fn mark_memory_context(context: &str) -> String {
     )
 }
 
-/// Remove injected memory context from captured text.
+/// Remove injected memory context and repeated compaction summaries from
+/// captured text.
 pub(crate) fn strip_memory_context(text: &str) -> String {
-    let mut kept = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(MEMORY_CONTEXT_START) {
-        kept.push_str(&rest[..start]);
-        let block = &rest[start..];
-        // An unterminated block was cut off mid-injection; drop the remainder.
-        rest = block
-            .find(MEMORY_CONTEXT_END)
-            .map_or("", |end| &block[end + MEMORY_CONTEXT_END.len()..]);
-    }
-    kept.push_str(rest);
+    let mut kept = strip_blocks(
+        &strip_blocks(text, MEMORY_CONTEXT_START, MEMORY_CONTEXT_END),
+        COMPACTION_SUMMARY_START,
+        COMPACTION_SUMMARY_END,
+    );
     for header in LEGACY_MEMORY_CONTEXT_HEADERS {
         if let Some(start) = kept.find(header) {
             kept.truncate(start);
@@ -55,6 +57,21 @@ pub(crate) fn strip_memory_context(text: &str) -> String {
     if is_legacy_memory_entries(&kept) {
         return String::new();
     }
+    kept
+}
+
+fn strip_blocks(text: &str, start_marker: &str, end_marker: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(start_marker) {
+        kept.push_str(&rest[..start]);
+        let block = &rest[start..];
+        // An unterminated block was cut off mid-injection; drop the remainder.
+        rest = block
+            .find(end_marker)
+            .map_or("", |end| &block[end + end_marker.len()..]);
+    }
+    kept.push_str(rest);
     kept
 }
 

@@ -118,6 +118,7 @@ pub enum RooRuntimeHook {
     RunEnd,
     PreToolUse,
     PostToolUse,
+    PostCompact,
 }
 
 #[cfg(feature = "agy")]

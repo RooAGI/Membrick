@@ -111,6 +111,10 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
                 capture_tool_event(&root, &invocation, "tool_result")?;
                 Ok(tool_result_context(&invocation))
             }
+            RooRuntimeHook::PostCompact => {
+                capture_compaction(&root, &invocation)?;
+                Ok(HookResult::default())
+            }
             RooRuntimeHook::RunEnd => {
                 // The current RunEnd projection may omit workspaceRoot. Do
                 // not guess from the hook process cwd and write into the
@@ -152,7 +156,10 @@ fn load_payload_references(root: &Path, payload: &mut Value) -> Result<()> {
     );
     for (field, reference) in references {
         anyhow::ensure!(
-            matches!(field.as_str(), "toolInput" | "toolResponse" | "toolError"),
+            matches!(
+                field.as_str(),
+                "toolInput" | "toolResponse" | "toolError" | "compactedMessages"
+            ),
             "unsupported payload reference field"
         );
         let path = reference
@@ -321,12 +328,16 @@ fn memory_session_id(project: &str, input: &HookInvocation) -> String {
 /// Without the agent's node id an epoch is ambiguous, so the session's group
 /// is kept.
 fn memory_segment_group(project: &str, input: &HookInvocation) -> (String, u64) {
-    let session = memory_session_id(project, input);
     let epoch = input
         .payload
         .get("compactionEpoch")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    epoch_segment_group(project, input, epoch)
+}
+
+fn epoch_segment_group(project: &str, input: &HookInvocation, epoch: u64) -> (String, u64) {
+    let session = memory_session_id(project, input);
     let node = input
         .node_id
         .as_deref()
@@ -345,7 +356,10 @@ fn memory_segment_group(project: &str, input: &HookInvocation) -> (String, u64) 
 }
 
 fn set_segment_group(document: &mut SourceDocument, project: &str, input: &HookInvocation) {
-    let (group, epoch) = memory_segment_group(project, input);
+    set_epoch_segment_group(document, memory_segment_group(project, input));
+}
+
+fn set_epoch_segment_group(document: &mut SourceDocument, (group, epoch): (String, u64)) {
     document.group_id = Some(group);
     if epoch > 0 {
         document
@@ -596,6 +610,186 @@ fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result
     )
 }
 
+/// Store what one Roo compaction replaced: its summary, as a checkpoint, and
+/// the part of the compacted transcript no other capture holds. Both go to
+/// the epoch the compaction closed, one before the epoch Roo reports.
+fn capture_compaction(root: &Path, input: &HookInvocation) -> Result<()> {
+    let new_epoch = input
+        .payload
+        .get("compactionEpoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > 0)
+        .context("Roo compaction payload is missing compactionEpoch")?;
+    let epoch = new_epoch - 1;
+    let node = input
+        .node_id
+        .as_deref()
+        .filter(|node| !node.trim().is_empty())
+        .map(|node| bounded(node, 256))
+        .unwrap_or_else(|| "agent".to_string());
+    let summary = capture_text::strip_memory_context(
+        input
+            .payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let transcript = compacted_transcript_text(
+        input
+            .payload
+            .get("compactedMessages")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
+    let project = root.to_string_lossy().into_owned();
+    let project_id = crate::ids::stable_doc_id_from_source(&project);
+    let session_id = input
+        .payload
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| memory_session_id(&project, input));
+    let mut documents = vec![];
+    for (kind, content) in [
+        (
+            "checkpoint",
+            (!summary.trim().is_empty()).then(|| {
+                format!(
+                    "Roo Runtime compaction summary\nAgent: {node}\nEpoch: {epoch}\n\n{}",
+                    summary.trim()
+                )
+            }),
+        ),
+        (
+            "compacted_transcript",
+            (!transcript.is_empty()).then(|| {
+                format!(
+                    "Roo Runtime compacted transcript\nAgent: {node}\nEpoch: {epoch}\n\n{transcript}"
+                )
+            }),
+        ),
+    ] {
+        let Some(content) = content else { continue };
+        let source = format!(
+            "roo-runtime://{project_id}/{}/{node}/compaction-{new_epoch}-{kind}",
+            input.run_id
+        );
+        let mut document = SourceDocument::with_stable_doc_id_from_source(
+            source,
+            content,
+            kind.to_string(),
+            Some(memory_session_id(&project, input)),
+            vec![],
+            vec![],
+            input.timestamp.clone(),
+            Some("rooagi_runtime".to_string()),
+        );
+        document.filters = BTreeMap::from([
+            ("provider".to_string(), "rooagi_runtime".to_string()),
+            ("project_root".to_string(), project.clone()),
+            ("run_id".to_string(), input.run_id.clone()),
+            ("capture_type".to_string(), kind.to_string()),
+            ("session_id".to_string(), session_id.clone()),
+        ]);
+        if let Some(turn_id) = input.payload.get("turnId").and_then(Value::as_str) {
+            document
+                .filters
+                .insert("turn_id".to_string(), bounded(turn_id, 256));
+        }
+        set_epoch_segment_group(&mut document, epoch_segment_group(&project, input, epoch));
+        documents.push(document);
+    }
+    if documents.is_empty() {
+        return Ok(());
+    }
+    crate::integrations::mcp_tools::upsert_hook_documents(
+        root,
+        "rooagi_runtime",
+        &session_id,
+        documents,
+    )
+}
+
+/// The part of a compacted Roo transcript that no other Roo capture holds.
+///
+/// The turn hook already stores each user prompt and final answer, and the
+/// tool hooks store each tool call's input and result. Those entries are
+/// dropped, so this capture never repeats them. What is left is the
+/// assistant's text between tool calls, which Roo drops from the prompt when
+/// it compacts, with the names of the tools it called in order. Injected
+/// memory, repeated compaction summaries and Roo's own runtime messages are
+/// dropped as well.
+fn compacted_transcript_text(entries: &[Value]) -> String {
+    let mut lines = vec![];
+    for entry in entries {
+        let message = entry.get("message").unwrap_or(&Value::Null);
+        if message.get("subtype").and_then(Value::as_str) == Some("runtime_hook_context")
+            || entry.get("kind").and_then(Value::as_str) != Some("assistant_tool_call")
+        {
+            continue;
+        }
+        let text = match message.get("content") {
+            Some(Value::String(text)) => capture_text::strip_memory_context(text),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("text" | "input_text" | "output_text")
+                    )
+                })
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .map(capture_text::strip_memory_context)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.trim().is_empty() {
+            lines.push(format!("Assistant: {}", text.trim()));
+        }
+        let tools = message_tool_names(message);
+        if !tools.is_empty() {
+            lines.push(format!("Called: {}", tools.join(", ")));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Names of the tools a provider message calls. Covers the chat
+/// completions, Anthropic and Responses API shapes.
+fn message_tool_names(message: &Value) -> Vec<String> {
+    let mut names = vec![];
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            names.push(bounded(name, 128));
+        }
+    }
+    for block in message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+    {
+        if let Some(name) = block.get("name").and_then(Value::as_str) {
+            names.push(bounded(name, 128));
+        }
+    }
+    if message.get("type").and_then(Value::as_str) == Some("function_call") {
+        if let Some(name) = message.get("name").and_then(Value::as_str) {
+            names.push(bounded(name, 128));
+        }
+    }
+    names
+}
+
 // Context is useful even if the original result was too large for Roo's inline
 // tool message. Do not claim durable capture here: the caller must ingest first.
 fn tool_result_context(input: &HookInvocation) -> HookResult {
@@ -689,6 +883,7 @@ fn event_name(kind: RooRuntimeHook) -> &'static str {
         RooRuntimeHook::RunEnd => "run_end",
         RooRuntimeHook::PreToolUse => "pre_tool_use",
         RooRuntimeHook::PostToolUse => "post_tool_use",
+        RooRuntimeHook::PostCompact => "post_compact",
     }
 }
 
@@ -727,6 +922,7 @@ pub fn install_hooks(config_override: Option<&Path>) -> Result<PathBuf> {
         RooRuntimeHook::RunEnd,
         RooRuntimeHook::PreToolUse,
         RooRuntimeHook::PostToolUse,
+        RooRuntimeHook::PostCompact,
     ] {
         let name = event_name(kind);
         let profile = if matches!(
@@ -737,7 +933,10 @@ pub fn install_hooks(config_override: Option<&Path>) -> Result<PathBuf> {
         } else {
             "observer"
         };
-        let timeout_seconds = if matches!(kind, RooRuntimeHook::PostToolUse) {
+        let timeout_seconds = if matches!(
+            kind,
+            RooRuntimeHook::PostToolUse | RooRuntimeHook::PostCompact
+        ) {
             15
         } else {
             5
@@ -1021,7 +1220,9 @@ mod tests {
         install_hooks(Some(&path)).unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let hooks = value["hooks"].as_array().unwrap();
-        assert_eq!(hooks.len(), 7);
+        assert_eq!(hooks.len(), 8);
+        assert_eq!(hooks[7]["event"], "post_compact");
+        assert_eq!(hooks[7]["handlers"][0]["sandbox_profile"], "observer");
         assert_eq!(hooks[0]["id"], "user-hook");
         assert_eq!(hooks[2]["event"], "agent_turn_start");
         assert_eq!(
@@ -1118,5 +1319,113 @@ mod tests {
             memory_segment_group("/p", &input(None, 2)),
             (session.to_string(), 0)
         );
+    }
+
+    #[test]
+    fn compacted_transcript_drops_what_turn_and_tool_hooks_already_stored() {
+        let entries = vec![
+            serde_json::json!({"kind": "message", "message": {"role": "user", "content": "the prompt"}}),
+            serde_json::json!({"kind": "message", "message": {
+                "role": "user", "subtype": "runtime_hook_context", "content": "hook text"
+            }}),
+            serde_json::json!({"kind": "assistant_tool_call", "callIds": ["c1"], "message": {
+                "role": "assistant",
+                "content": "Let me check the config first.",
+                "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{\"path\":\"a.toml\"}"}}]
+            }}),
+            serde_json::json!({"kind": "tool_output", "callIds": ["c1"], "message": {
+                "role": "tool", "tool_call_id": "c1", "content": "file body"
+            }}),
+            serde_json::json!({"kind": "assistant_tool_call", "callIds": ["c2"], "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": format!(
+                        "Found it.{}old memory{}{}old summary{}",
+                        capture_text::MEMORY_CONTEXT_START,
+                        capture_text::MEMORY_CONTEXT_END,
+                        capture_text::COMPACTION_SUMMARY_START,
+                        capture_text::COMPACTION_SUMMARY_END,
+                    )},
+                    {"type": "tool_use", "id": "c2", "name": "grep", "input": {"pattern": "port"}}
+                ]
+            }}),
+            serde_json::json!({"kind": "message", "message": {"role": "assistant", "content": "final answer"}}),
+        ];
+        assert_eq!(
+            compacted_transcript_text(&entries),
+            "Assistant: Let me check the config first.\n\
+             Called: read_file\n\
+             Assistant: Found it.\n\
+             Called: grep"
+        );
+    }
+
+    #[test]
+    fn compaction_stores_summary_and_transcript_in_the_closed_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "membrick-roo-compaction-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let input = HookInvocation {
+            schema_version: 1,
+            event: "post_compact".into(),
+            run_id: "run-1".into(),
+            timestamp: None,
+            node_id: Some("chat".into()),
+            payload: serde_json::json!({
+                "sessionId": "chat-1",
+                "compactionEpoch": 2,
+                "summary": "We settled on compaction-summary-unique-7.",
+                "compactedMessages": [
+                    {"kind": "assistant_tool_call", "message": {
+                        "role": "assistant",
+                        "content": "Checking narration-unique-8 next.",
+                        "tool_calls": [{"function": {"name": "search"}}]
+                    }},
+                    {"kind": "message", "message": {"role": "user", "content": "turn-text-unique-9"}}
+                ],
+            }),
+        };
+        capture_compaction(&root, &input).unwrap();
+        // A replay replaces the same two documents.
+        capture_compaction(&root, &input).unwrap();
+        MemoryService::with_shared_memory(&root, |memory| {
+            let documents = memory.source_documents();
+            let compaction: Vec<_> = documents
+                .iter()
+                .filter(|doc| doc.source.contains("/chat/compaction-2-"))
+                .collect();
+            assert_eq!(compaction.len(), 2);
+            let group = format!(
+                "{}:agent:chat:epoch-1",
+                memory_session_id(root.to_str().unwrap(), &input)
+            );
+            for doc in &compaction {
+                assert_eq!(doc.group_id.as_deref(), Some(group.as_str()));
+                assert_eq!(doc.filters["session_id"], "chat-1");
+                assert_eq!(doc.filters["session_epoch"], "1");
+            }
+            let summary = compaction
+                .iter()
+                .find(|doc| doc.filters["capture_type"] == "checkpoint")
+                .unwrap();
+            assert!(summary.content.contains("compaction-summary-unique-7"));
+            let transcript = compaction
+                .iter()
+                .find(|doc| doc.filters["capture_type"] == "compacted_transcript")
+                .unwrap();
+            assert!(transcript.content.contains("narration-unique-8"));
+            assert!(transcript.content.contains("Called: search"));
+            assert!(!transcript.content.contains("turn-text-unique-9"));
+            Ok(())
+        })
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 }
