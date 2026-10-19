@@ -67,8 +67,17 @@ publication.
 A missing cursor is initialized to byte zero under
 `.membrick/{claude,codex}-state/capture-cursors/`. Complete JSONL lines are
 batched up to 1 MiB without splitting a line. An unusually large line remains
-intact in its own batch. All transcript text is retained; batching limits work
-per pass and never truncates the session.
+intact in its own batch. Batching limits work per pass and never truncates the
+session.
+
+Captures keep what was said, not everything the session carried. User and
+assistant text is kept whole. Tool calls keep the tool name and the start and
+end of their input (about 1 KB), and tool results the start and end of their
+output (about 2 KB); raw call records, thinking signatures and encrypted
+reasoning are not stored. Memory context that Membrick injected is wrapped in
+`<membrick-memory>` markers, and captures drop it, so earlier memories are
+never copied into new ones. All providers share these rules
+(`src/integrations/capture_text.rs`).
 
 A context compaction starts a new segment. Codex records a top-level
 `compacted` line in its rollout and Claude Code a `compact_boundary` system

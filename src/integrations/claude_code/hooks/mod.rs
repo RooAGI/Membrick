@@ -7,7 +7,7 @@ use crate::integrations::session_recording::{
     membrick_enabled, provider_state_dir, record_event_if_enabled,
     record_transcript_usage_if_available, RecordingProvider,
 };
-use crate::integrations::transcript_cursor;
+use crate::integrations::{capture_text, transcript_cursor};
 use crate::memory_api::MemoryService;
 #[cfg(test)]
 use crate::pipeline::{MemoryIndexLayout, PipelineOptions};
@@ -424,7 +424,10 @@ fn retrieve(
     if seen.is_empty() {
         return Ok(ClaudeHookOutput::default());
     }
-    Ok(ClaudeHookOutput::additional_context(event_name, context))
+    Ok(ClaudeHookOutput::additional_context(
+        event_name,
+        capture_text::mark_memory_context(&context),
+    ))
 }
 
 fn is_operational_memory_result(result: &Value) -> bool {
@@ -706,55 +709,24 @@ fn extract_messages(text: &str) -> VecDeque<ConversationMessage> {
                     .and_then(Value::as_str)
                     .unwrap_or("message")
             });
+        // Tool calls and results are kept in bounded form; injected memory
+        // context and thinking signatures are dropped.
         let content = message
             .get("content")
-            .map(text_blocks)
-            .filter(|content| !content.is_empty())
-            .or_else(|| serde_json::to_string(message).ok())
+            .map(capture_text::content_text)
             .unwrap_or_default();
+        if content.trim().is_empty() {
+            continue;
+        }
         messages.push_back(ConversationMessage {
             turn_id: transcript_cursor::transcript_turn_id(&value)
                 .map(str::to_owned)
                 .or_else(|| context_turn_id.clone()),
             role: role.to_string(),
-            content: redact(if content.trim().is_empty() {
-                "[empty message content]"
-            } else {
-                &content
-            }),
+            content: redact(&content),
         });
     }
     messages
-}
-
-fn text_blocks(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .map(|block| {
-                let kind = block
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("content");
-                match kind {
-                    "text" | "input_text" | "output_text" => block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    _ => format!(
-                        "[{kind}] {}",
-                        serde_json::to_string_pretty(block)
-                            .unwrap_or_else(|_| "[unserializable block]".to_string())
-                    ),
-                }
-            })
-            .filter(|block| !block.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
 }
 
 fn redact(text: &str) -> String {
@@ -1240,7 +1212,7 @@ mod tests {
         assert!(messages.len() >= 4);
         assert!(messages
             .iter()
-            .any(|message| message.content.contains("tool_use")));
+            .any(|message| message.content.contains("[tool call:")));
         assert!(messages
             .iter()
             .any(|message| message.content.contains("No rule match")));
@@ -1267,7 +1239,8 @@ mod tests {
         assert!(content.contains("[REDACTED]"));
         assert!(content.contains("Finished work"));
         assert!(content.contains("Memory type: outcome"));
-        assert!(content.contains("Observation 1 [assistant]"));
+        assert!(content.contains("Message 1 [assistant]"));
+        assert!(content.contains("[tool call: Bash]"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1286,7 +1259,10 @@ mod tests {
         let content =
             extract_structured_memory(&transcript, ClaudeCodeDocumentType::Outcome, &[]).unwrap();
         assert!(content.contains("Remember cobalt routing"));
-        assert!(content.contains(&"x".repeat(96 * 1024)));
+        // The oversized tool result is read, then kept as its start and end.
+        assert!(content.contains("[tool result] xxxx"));
+        assert!(content.contains("bytes omitted"));
+        assert!(content.len() < 4_000, "got {} bytes", content.len());
         fs::remove_dir_all(root).unwrap();
     }
 

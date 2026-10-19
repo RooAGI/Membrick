@@ -1,6 +1,7 @@
 //! Roo Runtime process hook adapter. All durable writes use MemoryService's
 //! shared workspace memory store, so MCP and hook callers see one index.
 use crate::cli::RooRuntimeHook;
+use crate::integrations::capture_text;
 use crate::integrations::session_recording::{membrick_enabled, RecordingProvider};
 use crate::memory_api::MemoryService;
 use crate::source::SourceDocument;
@@ -242,10 +243,12 @@ fn recall(root: &Path, input: &HookInvocation) -> Result<HookResult> {
 }
 
 fn recall_context_result(context: &str) -> HookResult {
-    let context = bounded(context, MAX_CONTEXT_BYTES);
+    // Leave room for the markers that let a later capture drop this context.
+    let markers = capture_text::mark_memory_context("").len();
+    let context = bounded(context, MAX_CONTEXT_BYTES - markers);
     if context.len() > 40 {
         HookResult {
-            additional_context: Some(context.trim_end().to_string()),
+            additional_context: Some(capture_text::mark_memory_context(context.trim_end())),
         }
     } else {
         HookResult::default()
@@ -306,11 +309,13 @@ fn memory_session_id(project: &str, input: &HookInvocation) -> String {
 
 fn capture(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
     let content = if kind == "turn" {
-        let user = input
-            .payload
-            .get("userMessage")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let user = capture_text::strip_memory_context(
+            input
+                .payload
+                .get("userMessage")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
         let assistant = input
             .payload
             .get("assistantResponse")
@@ -420,16 +425,27 @@ fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result
         !input.run_id.trim().is_empty(),
         "Roo tool hook payload is missing runId"
     );
+    // Tool records keep the start and end of their input and result.
     let tool_input = input
         .payload
         .get("toolInput")
-        .map(|value| sanitize_tool_value(value, 0))
+        .map(|value| {
+            capture_text::clip(
+                &sanitize_tool_value(value, 0),
+                capture_text::MAX_TOOL_INPUT_BYTES,
+            )
+        })
         .unwrap_or_else(|| "null".to_string());
     let result = input
         .payload
         .get("toolResponse")
         .or_else(|| input.payload.get("toolError"))
-        .map(|value| sanitize_tool_value(value, 0));
+        .map(|value| {
+            capture_text::clip(
+                &capture_text::strip_memory_context(&sanitize_tool_value(value, 0)),
+                capture_text::MAX_TOOL_OUTPUT_BYTES,
+            )
+        });
     if kind == "tool_result" && result.is_none() {
         return Ok(());
     }
@@ -864,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn referenced_results_are_chunked_and_shrinking_replays_remove_old_evidence() {
+    fn referenced_results_keep_late_evidence_and_shrinking_replays_remove_old_evidence() {
         let root = std::env::temp_dir().join(format!(
             "roo-ref-{}-{}",
             std::process::id(),
@@ -903,10 +919,22 @@ mod tests {
             .additional_context
             .unwrap()
             .contains("late-evidence-913"));
-        let count =
-            MemoryService::with_shared_memory(&root, |memory| Ok(memory.source_documents().len()))
-                .unwrap();
-        assert!(count > 1);
+        // A long result keeps its start and end, so the late evidence above
+        // is still found, and it is stored as one bounded document.
+        let stored = MemoryService::with_shared_memory(&root, |memory| {
+            Ok(memory
+                .source_documents()
+                .iter()
+                .map(|document| document.content.len())
+                .collect::<Vec<_>>())
+        })
+        .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0] < 4_000,
+            "result was stored at {} bytes",
+            stored[0]
+        );
         input.payload["toolResponse"] = serde_json::json!({"finding":"replacement evidence"});
         capture_tool_event(&root, &input, "tool_result").unwrap();
         assert_eq!(

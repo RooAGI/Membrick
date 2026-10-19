@@ -6,7 +6,7 @@ use crate::integrations::session_recording::{
     membrick_enabled, provider_state_dir, record_event_if_enabled,
     record_transcript_usage_if_available, RecordingProvider,
 };
-use crate::integrations::transcript_cursor;
+use crate::integrations::{capture_text, transcript_cursor};
 use crate::memory_api::MemoryService;
 #[cfg(test)]
 use crate::pipeline::{MemoryIndexLayout, PipelineOptions};
@@ -429,7 +429,10 @@ fn retrieve(
     if seen.is_empty() {
         return Ok(CodexHookOutput::default());
     }
-    Ok(CodexHookOutput::additional_context(event_name, context))
+    Ok(CodexHookOutput::additional_context(
+        event_name,
+        capture_text::mark_memory_context(&context),
+    ))
 }
 
 fn tool_query(input: &CodexHookInput) -> String {
@@ -872,55 +875,24 @@ fn extract_messages(text: &str) -> VecDeque<ConversationMessage> {
                     .and_then(Value::as_str)
                     .unwrap_or("message")
             });
-        let content = message
-            .get("content")
-            .map(text_blocks)
-            .filter(|content| !content.is_empty())
-            .or_else(|| serde_json::to_string(message).ok())
-            .unwrap_or_default();
+        // Tool calls, tool outputs and reasoning have no `content`; they are
+        // kept in bounded form. Injected memory context is dropped.
+        let content = match message.get("content") {
+            Some(content) => capture_text::content_text(content),
+            None => capture_text::response_item_text(message).unwrap_or_default(),
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
         messages.push_back(ConversationMessage {
             turn_id: transcript_cursor::transcript_turn_id(&value)
                 .map(str::to_owned)
                 .or_else(|| context_turn_id.clone()),
             role: role.to_string(),
-            content: redact(if content.trim().is_empty() {
-                "[empty message content]"
-            } else {
-                &content
-            }),
+            content: redact(&content),
         });
     }
     messages
-}
-
-fn text_blocks(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Array(blocks) => blocks
-            .iter()
-            .map(|block| {
-                let kind = block
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("content");
-                match kind {
-                    "text" | "input_text" | "output_text" => block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    _ => format!(
-                        "[{kind}] {}",
-                        serde_json::to_string_pretty(block)
-                            .unwrap_or_else(|_| "[unserializable block]".to_string())
-                    ),
-                }
-            })
-            .filter(|block| !block.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
 }
 
 fn redact(text: &str) -> String {
@@ -1494,8 +1466,50 @@ mod tests {
         assert!(content.contains("[REDACTED]"));
         assert!(content.contains("Finished work"));
         assert!(content.contains("Memory type: outcome"));
-        assert!(content.contains("Observation 1 [assistant]:"));
+        assert!(content.contains("Message 1 [assistant]:"));
+        assert!(content.contains("[tool call: Bash]"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reveals_bug_capture_stores_injected_memory_and_raw_tool_records() {
+        let injected = "\n- Source: codex://p/s/outcome\n  Type: outcome\n  Captured: now\n  \
+                        Memory status: current\n  Relation evidence: none\n  earlier memory copy";
+        let lines = [
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Why did routing fail?"}]}}),
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": injected}]}}),
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": capture_text::mark_memory_context(injected)}]}}),
+            serde_json::json!({"type": "response_item", "payload": {"type": "custom_tool_call",
+                "name": "exec", "call_id": "c1", "input": "q".repeat(20_000)}}),
+            serde_json::json!({"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                "call_id": "c1", "output": "r".repeat(200_000)}}),
+            serde_json::json!({"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "The default route was missing."}]}}),
+        ];
+        let transcript = lines
+            .iter()
+            .map(|line| line.to_string() + "\n")
+            .collect::<String>();
+        let content = structured_memory(
+            &extract_messages(&transcript),
+            CodexDocumentType::Outcome,
+            &[],
+        );
+        assert!(content.contains("Why did routing fail?"));
+        assert!(content.contains("The default route was missing."));
+        assert!(content.contains("[tool call: exec]"));
+        assert!(
+            !content.contains("earlier memory copy"),
+            "injected memory context must not be captured again"
+        );
+        assert!(
+            content.len() < 5_000,
+            "tool records must be bounded, captured {} bytes",
+            content.len()
+        );
     }
 
     #[test]
@@ -1505,7 +1519,7 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert!(messages
             .iter()
-            .any(|message| message.content.contains("function_call")));
+            .any(|message| message.content.contains("[tool call:")));
         assert!(messages
             .iter()
             .any(|message| message.content.contains("default_route")));

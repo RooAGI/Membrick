@@ -1,3 +1,4 @@
+use crate::integrations::capture_text;
 use crate::integrations::session_recording::{
     membrick_enabled, record_event_if_enabled, RecordingProvider,
 };
@@ -240,7 +241,7 @@ fn handle_hook(
     Ok(GeminiHookOutput {
         hook_specific_output: Some(GeminiHookSpecificOutput {
             hook_event_name: kind.event_name().into(),
-            additional_context: context,
+            additional_context: capture_text::mark_memory_context(&context),
         }),
         system_message: None,
     })
@@ -339,20 +340,37 @@ fn capture_content(input: &GeminiHookInput) -> Result<String> {
         Value::Object(value)
     };
     let mut text = Vec::new();
-    collect_capture_text(&value, &mut text);
+    collect_capture_text(&value, None, &mut text);
     Ok(redact_capture_text(&text.join("\n")))
 }
 
-fn collect_capture_text(value: &Value, output: &mut Vec<String>) {
+/// Collect transcript text. Tool output (the `output`, `response` and
+/// `result` fields) keeps only its start and end, and injected memory
+/// context is dropped.
+fn collect_capture_text(value: &Value, max_bytes: Option<usize>, output: &mut Vec<String>) {
     match value {
-        Value::String(text) if !text.trim().is_empty() => output.push(text.trim().to_string()),
+        Value::String(text) => {
+            let text = capture_text::strip_memory_context(text);
+            let text = text.trim();
+            if !text.is_empty() {
+                output.push(match max_bytes {
+                    Some(max_bytes) => capture_text::clip(text, max_bytes),
+                    None => text.to_string(),
+                });
+            }
+        }
         Value::Array(values) => values
             .iter()
-            .for_each(|value| collect_capture_text(value, output)),
+            .for_each(|value| collect_capture_text(value, max_bytes, output)),
         Value::Object(values) => {
             for key in ["content", "text", "message", "output", "response", "result"] {
                 if let Some(value) = values.get(key) {
-                    collect_capture_text(value, output);
+                    let max_bytes = if matches!(key, "output" | "response" | "result") {
+                        Some(capture_text::MAX_TOOL_OUTPUT_BYTES)
+                    } else {
+                        max_bytes
+                    };
+                    collect_capture_text(value, max_bytes, output);
                 }
             }
         }

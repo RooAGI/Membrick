@@ -114,13 +114,25 @@ class TurnRecordTest(unittest.TestCase):
         self.assertIn("m0", ctx[0]["content"])
         self.assertIn("m49", ctx[0]["content"])
 
-    def test_full_turn_is_preserved(self):
+    def test_full_turn_is_preserved_and_history_is_bounded(self):
         big = "z" * 50000
         msgs = self._record(user_message=big, assistant_response=big,
                             conversation_history=[{"role": "u", "content": big}])["messages"]
         self.assertIn(big, msgs[0]["content"])
         self.assertIn(big, msgs[1]["content"])
-        self.assertIn(big, msgs[2]["content"])
+        # Earlier turns have their own records; the history keeps its tail.
+        self.assertLess(len(msgs[2]["content"]), 5000)
+
+    def test_recalled_memory_is_not_captured_again(self):
+        recalled = format_recall_context([{"content": "old memory", "score": 0.5}])
+        msgs = self._record(
+            user_message="Real question\n" + recalled,
+            conversation_history=[{"role": "user", "content": "Earlier\n" + recalled}],
+        )["messages"]
+        self.assertIn("Real question", msgs[0]["content"])
+        self.assertNotIn("old memory", msgs[0]["content"])
+        self.assertIn("Earlier", msgs[2]["content"])
+        self.assertNotIn("old memory", msgs[2]["content"])
 
     def test_user_id_filled_by_plugin(self):
         self.assertIsNone(self._record()["user_id"])
@@ -145,10 +157,14 @@ class ToolRecordTest(unittest.TestCase):
                               error_message="killed")
         self.assertIn("Timeout", r["messages"][0]["content"])
 
-    def test_long_args_preserved_for_capture(self):
+    def test_long_args_and_result_keep_their_start(self):
         r = build_tool_record(session_id="s", turn_id="t", tool_call_id="c",
-                              function_name="f", function_args="a" * 9000)
-        self.assertIn("a" * 9000, r["messages"][0]["content"])
+                              function_name="f", function_args="a" * 9000,
+                              result="b" * 90000)
+        content = r["messages"][0]["content"]
+        self.assertIn("a" * 500, content)
+        self.assertIn("b" * 500, content)
+        self.assertLess(len(content), 4000)
 
     def test_runtime_transcript_fixture_and_large_turn_are_preserved(self):
         fixture = Path(__file__).resolve().parents[5] / "tests/fixtures/runtime_transcripts/hermes.json"

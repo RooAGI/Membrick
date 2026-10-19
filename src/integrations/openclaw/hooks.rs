@@ -15,6 +15,7 @@
 
 use super::document::{OpenClawDocument, OpenClawDocumentType};
 use crate::ids::stable_doc_id_from_source;
+use crate::integrations::capture_text;
 use crate::integrations::recall::{relevant_excerpt, truncate_utf8};
 use crate::integrations::session_recording::{
     membrick_enabled, record_event_if_enabled, RecordingProvider,
@@ -417,7 +418,10 @@ fn retrieve_memories(root: &Path, query: &str) -> Result<String> {
         }
         output.push_str(&format!("\n- Source: {}\n  {}\n", source, excerpt));
     }
-    Ok(output)
+    if output.is_empty() {
+        return Ok(output);
+    }
+    Ok(capture_text::mark_memory_context(&output))
 }
 
 // ---------------------------------------------------------------------------
@@ -472,28 +476,11 @@ fn is_internal_context(message: &Value) -> bool {
     false
 }
 
+/// Message text with tool blocks kept in bounded form and injected memory
+/// context dropped.
 fn content_text(content: &Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(blocks) => {
-            let mut out = String::new();
-            for block in blocks {
-                if matches!(
-                    block.get("type").and_then(Value::as_str),
-                    Some("text" | "input_text" | "output_text")
-                ) {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        out.push_str(text);
-                    }
-                } else {
-                    out.push_str(&serde_json::to_string(block).unwrap_or_default());
-                }
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-            }
-            Some(out)
-        }
+        Value::String(_) | Value::Array(_) => Some(capture_text::content_text(content)),
         _ => None,
     }
 }
@@ -991,7 +978,7 @@ mod tests {
         let texts = message_texts(messages);
         assert_eq!(texts.len(), 2);
         assert!(texts.iter().any(|(_, text)| text.contains("default route")));
-        assert!(texts.iter().any(|(_, text)| text.contains("toolCall")));
+        assert!(texts.iter().any(|(_, text)| text.contains("[tool call:")));
     }
 
     #[test]
