@@ -1,6 +1,6 @@
 use anyhow::Result;
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, Debouncer, NoCache};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,7 +51,7 @@ impl WorkspaceChangeEvent {
 
 /// Debounced project-file changes shared by every long-lived index consumer.
 pub struct WorkspaceWatcher {
-    _watcher: Debouncer<RecommendedWatcher, RecommendedCache>,
+    _watcher: Debouncer<RecommendedWatcher, NoCache>,
     events: Mutex<Receiver<DebounceEventResult>>,
     root: PathBuf,
     ignore_paths: Vec<String>,
@@ -64,7 +64,17 @@ impl WorkspaceWatcher {
     pub fn new(root: &Path, ignore_paths: &[String]) -> Result<Self> {
         let root = root.canonicalize()?;
         let (sender, receiver) = mpsc::channel();
-        let mut watcher = new_debouncer(Duration::from_millis(350), None, sender)?;
+        // No file ID cache. On macOS the default cache walks the whole tree
+        // at startup and keeps an entry per file, including ignored build and
+        // store folders: about 115 MB per 250,000 files. Events are handled
+        // per path, so rename pairing by file ID is not needed.
+        let mut watcher = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            Duration::from_millis(350),
+            None,
+            sender,
+            NoCache,
+            notify::Config::default(),
+        )?;
         watcher.watch(&root, RecursiveMode::Recursive)?;
         Ok(Self {
             _watcher: watcher,
