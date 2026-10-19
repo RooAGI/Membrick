@@ -8,7 +8,6 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -222,7 +221,7 @@ pub(super) fn migrate_legacy_provider_memory_dirs(root: &Path) -> Result<()> {
         migrated_any = true;
     }
     if migrated_any {
-        trace_event("migrated legacy provider memory stores into shared memory");
+        tracing::info!("migrated legacy provider memory stores into shared memory");
     }
     Ok(())
 }
@@ -264,14 +263,6 @@ pub fn segmented_store_options() -> PipelineOptions {
 /// live in the shared memory store. One resident owner publishes both stores
 /// into the immutable view searched by every provider.
 pub const WORKSPACE_MEMORY_NAME: &str = "workspace-memory";
-pub fn trace_event(event: &str) {
-    let Some(path) = std::env::var_os("MEMBRICK_MCP_TRACE_PATH") else {
-        return;
-    };
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{event}");
-    }
-}
 
 /// Open the project index, rebuilding it only when the workspace it describes
 /// has moved on. `ignore_paths` is part of that description: the documents the

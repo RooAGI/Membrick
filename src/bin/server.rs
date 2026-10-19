@@ -346,7 +346,7 @@ impl WorkspaceRegistry {
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                eprintln!("workspace initialization task failed: {error}");
+                tracing::error!("workspace initialization task failed: {error}");
                 self.release_failed_opening(&root, &opening).await;
                 return Err(WorkspaceResolveError::Initialization);
             }
@@ -354,7 +354,7 @@ impl WorkspaceRegistry {
         let runtime = match runtime {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
-                eprintln!("workspace initialization failed: {error:#}");
+                tracing::error!("workspace initialization failed: {error:#}");
                 self.release_failed_opening(&root, &opening).await;
                 return Err(WorkspaceResolveError::Initialization);
             }
@@ -440,7 +440,7 @@ fn start_runtime_workspace_watcher(runtime: Arc<WorkspaceRuntime>) {
     ) {
         Ok(watcher) => Arc::new(watcher),
         Err(error) => {
-            eprintln!(
+            tracing::warn!(
                 "workspace watcher unavailable for {}: {error:#}",
                 runtime.project_root.display()
             );
@@ -521,7 +521,7 @@ fn start_runtime_watcher_with_handle(
                     retry_after = None;
                 }
                 Err(error) => {
-                    eprintln!("workspace refresh failed for {}: {error:#}", root.display());
+                    tracing::warn!("workspace refresh failed for {}: {error:#}", root.display());
                     retry_after = Some(std::time::Instant::now() + Duration::from_secs(2));
                 }
             }
@@ -937,7 +937,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
                         retry_after = None;
                     }
                     Err(error) => {
-                        eprintln!("workspace index refresh failed: {error:#}");
+                        tracing::warn!("workspace index refresh failed: {error:#}");
                         retry_after = Some(std::time::Instant::now() + Duration::from_secs(5));
                     }
                 }
@@ -948,6 +948,12 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     if args.resident_server {
         let root = state.project_root.clone();
         let managed = args.managed_resident;
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            managed,
+            root = %state.project_root.display(),
+            "resident starting"
+        );
         let shutdown = async move {
             crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal()).await
         };
@@ -962,7 +968,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-        eprintln!("Membrick server listening on {}", args.bind);
+        tracing::info!("Membrick server listening on {}", args.bind);
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
@@ -991,6 +997,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|status| anyhow::anyhow!("shutdown flush failed: {status}"))?;
     }
+    tracing::info!("shutdown complete; pending writes flushed");
     Ok(())
 }
 
@@ -2782,7 +2789,7 @@ async fn search(
         .map_err(|join| anyhow::anyhow!("backfill task failed: {join}"))
         .and_then(|inner| inner);
         if let Err(error) = backfill {
-            eprintln!("key-phrase backfill failed (fail-open): {error:#}");
+            tracing::warn!("key-phrase backfill failed (fail-open): {error:#}");
         }
     }
     if let Some(worker) = &state.staged_writer {

@@ -236,7 +236,7 @@ impl MemoryService {
                 }
                 Err(error) => {
                     let error = format!("invalid pending capture {}: {error:#}", path.display());
-                    eprintln!("{error}");
+                    tracing::warn!("{error}");
                     load_errors.push(CaptureStatus {
                         provider: "unknown".into(),
                         session_id: path
@@ -476,7 +476,7 @@ fn worker_loop(queue: Arc<Queue>, persist: &Persist) {
                 if let Err(error) = save_record(&queue.root, &key, record) {
                     record.last_error = Some(format!("failed to save capture progress: {error:#}"));
                     record.retry_after_ms = now_ms() + 1000;
-                    eprintln!("{}", record.last_error.as_deref().unwrap());
+                    tracing::warn!("{}", record.last_error.as_deref().unwrap());
                 }
             }
             drop(records);

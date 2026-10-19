@@ -139,8 +139,8 @@ pub(crate) fn write_segment_catalog_cache(path: &Path, bytes: &[u8]) -> anyhow::
         let stale = entry?.path();
         if stale != path && stale.is_file() {
             if let Err(error) = fs::remove_file(&stale) {
-                eprintln!(
-                    "warning: could not remove stale segment catalog cache {}: {error}",
+                tracing::warn!(
+                    "could not remove stale segment catalog cache {}: {error}",
                     stale.display()
                 );
             }
@@ -1041,7 +1041,7 @@ impl SegmentCatalog {
                 .encode_cache(segments)
                 .and_then(|bytes| write_segment_catalog_cache(path, &bytes));
             if let Err(error) = write {
-                eprintln!("warning: failed to persist segment catalog cache: {error:#}");
+                tracing::warn!("failed to persist segment catalog cache: {error:#}");
             }
         }
         catalog

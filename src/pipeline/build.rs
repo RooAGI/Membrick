@@ -105,8 +105,8 @@ pub(crate) fn rank_key_entities_batched(
                 match spacy.rank_docs(&group_docs) {
                     Ok(entities) => out.extend(entities),
                     Err(err) => {
-                        eprintln!(
-                            "warning: {} ranker unavailable for model {model} ({err}), falling back to heuristic",
+                        tracing::warn!(
+                            "{} ranker unavailable for model {model} ({err}), falling back to heuristic",
                             spacy.name(),
                         );
                         out.extend(heuristic.rank_docs(&group_docs).unwrap_or_default());

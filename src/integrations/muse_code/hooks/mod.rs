@@ -69,7 +69,7 @@ pub fn run_hook(kind: MuseHookKind, fallback_root: &Path) -> Result<()> {
     match run_hook_inner(kind, fallback_root) {
         Ok(()) => Ok(()),
         Err(error) => {
-            eprintln!("warning: Membrick Muse hook failed open: {error:#}");
+            tracing::warn!("Membrick Muse hook failed open: {error:#}");
             Ok(())
         }
     }

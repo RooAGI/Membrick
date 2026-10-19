@@ -95,11 +95,11 @@ pub fn run_hook_for(
     if let Err(error) =
         record_event_if_enabled(provider, &root, &input.session_id, kind.event_name(), raw)
     {
-        eprintln!("warning: Membrick {provider_label} session recording failed open: {error:#}");
+        tracing::warn!("Membrick {provider_label} session recording failed open: {error:#}");
     }
     let mut output =
         handle_hook(kind, &input, &root, provider, provider_label).unwrap_or_else(|error| {
-            eprintln!("warning: Membrick {provider_label} hook failed open: {error:#}");
+            tracing::warn!("Membrick {provider_label} hook failed open: {error:#}");
             GeminiHookOutput::default()
         });
     if kind == GeminiHookKind::SessionEnd {

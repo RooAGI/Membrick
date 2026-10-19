@@ -64,6 +64,7 @@ mod index;
 ))]
 mod integrations;
 mod lang;
+mod logging;
 /// Agent-facing search-result shaping, shared by the MCP `search` tools and
 /// the retrieval benchmark so both present hits identically.
 pub mod memory_api;
@@ -161,10 +162,30 @@ mod local_ipc;
 /// Launch a bundled executable. This process entry point exposes no memory internals.
 #[doc(hidden)]
 pub fn run_binary(name: &str) -> anyhow::Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+    let role = if name == "server" {
+        logging::Role::Server
+    } else {
+        logging::Role::from_args(&args)
+    };
+    // Residents, adapters and hooks start in their project root.
+    logging::init(
+        role,
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
     if matches!(name, "membrick" | "lint-ai") {
         updater::check_for_update();
     }
-    executables::run(name)
+    let result = executables::run(name);
+    match (&result, role) {
+        // A background process has no user to show the error to; record it
+        // in the log format instead of letting the runtime print it bare.
+        (Err(error), logging::Role::Resident | logging::Role::Mcp | logging::Role::Hook) => {
+            tracing::error!("exiting: {error:#}");
+            std::process::exit(1);
+        }
+        _ => result,
+    }
 }
 
 #[cfg(feature = "python")]

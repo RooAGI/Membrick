@@ -310,7 +310,7 @@ pub(crate) fn record_mcp_tool_response(
         ),
     };
     if let Err(error) = record {
-        eprintln!("Membrick could not append MCP call history: {error:#}");
+        tracing::warn!("Membrick could not append MCP call history: {error:#}");
         if tool == "search"
             && response
                 .as_ref()

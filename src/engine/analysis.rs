@@ -492,8 +492,8 @@ pub(crate) fn show_tier1_entities(
             match spacy.rank_docs(&docs) {
                 Ok(out) => out,
                 Err(err) => {
-                    eprintln!(
-                        "warning: {} ranker unavailable ({}), falling back to heuristic",
+                    tracing::warn!(
+                        "{} ranker unavailable ({}), falling back to heuristic",
                         spacy.name(),
                         err
                     );

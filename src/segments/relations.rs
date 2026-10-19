@@ -469,7 +469,7 @@ fn run_extractor_oneshot(
         None => extractor_script_path(),
     };
     if !script.exists() {
-        eprintln!("relations: extractor script missing: {}", script.display());
+        tracing::warn!("relations: extractor script missing: {}", script.display());
         return None;
     }
     let payload = serde_json::json!({
@@ -486,7 +486,7 @@ fn run_extractor_oneshot(
     {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("relations: failed to spawn extractor: {e}");
+            tracing::warn!("relations: failed to spawn extractor: {e}");
             return None;
         }
     };
@@ -499,7 +499,7 @@ fn run_extractor_oneshot(
         })
         .unwrap_or(Ok(()));
     if let Err(e) = write_result {
-        eprintln!("relations: failed to write extractor input: {e}");
+        tracing::warn!("relations: failed to write extractor input: {e}");
         return None;
     }
     // Take stdout/stderr handles before the wait loop; we'll read them
@@ -519,7 +519,9 @@ fn run_extractor_oneshot(
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= ONESHOT_TIMEOUT {
-                    eprintln!("relations: one-shot extractor timed out after 120s; killing child");
+                    tracing::warn!(
+                        "relations: one-shot extractor timed out after 120s; killing child"
+                    );
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;
@@ -527,7 +529,7 @@ fn run_extractor_oneshot(
                 std::thread::sleep(POLL_INTERVAL);
             }
             Err(e) => {
-                eprintln!("relations: extractor wait failed: {e}");
+                tracing::warn!("relations: extractor wait failed: {e}");
                 return None;
             }
         }
@@ -549,7 +551,7 @@ fn run_extractor_oneshot(
         stderr: stderr_buf,
     };
     if !output.status.success() {
-        eprintln!(
+        tracing::warn!(
             "relations: extractor failed: {}",
             String::from_utf8_lossy(&output.stderr)
                 .chars()
@@ -562,7 +564,7 @@ fn run_extractor_oneshot(
     match parse_extractor_output(&stdout) {
         Some(parsed) => Some(parsed),
         None => {
-            eprintln!(
+            tracing::warn!(
                 "relations: bad extractor output: {}",
                 stdout.chars().take(300).collect::<String>()
             );

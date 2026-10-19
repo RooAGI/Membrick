@@ -232,10 +232,7 @@ pub(crate) fn load_cached_query_index(
     ) {
         Ok(index) => return Some(index),
         Err(err) => {
-            eprintln!(
-                "warning: binary core cache load failed (falling back): {}",
-                err
-            );
+            tracing::warn!("binary core cache load failed (falling back): {}", err);
         }
     }
     Some(MemoryIndex::from_records_with_lexical_dir(

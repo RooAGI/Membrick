@@ -248,7 +248,7 @@ impl MemoryService {
             Some(raw) => raw,
             None => {
                 if let Err(error) = self.flush() {
-                    eprintln!("key-phrase backfill refresh failed (fail-open): {error:#}");
+                    tracing::warn!("key-phrase backfill refresh failed (fail-open): {error:#}");
                 }
                 return 0;
             }
@@ -281,7 +281,7 @@ impl MemoryService {
             extracted += 1;
         }
         if let Err(error) = self.flush() {
-            eprintln!("key-phrase backfill refresh failed (fail-open): {error:#}");
+            tracing::warn!("key-phrase backfill refresh failed (fail-open): {error:#}");
         }
         extracted
     }

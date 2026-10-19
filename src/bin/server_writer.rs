@@ -462,7 +462,7 @@ fn run_writer(
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    eprintln!("memory writer shutdown checkpoint failed: {error:#}");
+                    tracing::error!("memory writer shutdown checkpoint failed: {error:#}");
                     fail_barriers(&mut barriers, &format!("{error:#}"));
                 }
                 break;
@@ -507,7 +507,9 @@ fn run_writer(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    eprintln!("memory publication failed; durable journal retained: {error:#}");
+                    tracing::error!(
+                        "memory publication failed; durable journal retained: {error:#}"
+                    );
                     fail_barriers(&mut barriers, &format!("{error:#}"));
                     schedules[slot].checkpoint_build = false;
                     schedules[slot].retry_after = Some(Instant::now() + schedule.refresh_interval);
@@ -601,7 +603,7 @@ fn run_writer(
                         schedules[slot].retry_after = None;
                     }
                     Err(error) => {
-                        eprintln!("memory publication capture failed; durable journal retained: {error:#}");
+                        tracing::error!("memory publication capture failed; durable journal retained: {error:#}");
                         fail_barriers(&mut barriers, &format!("{error:#}"));
                         schedules[slot].retry_after =
                             Some(Instant::now() + schedule.refresh_interval);
@@ -686,7 +688,7 @@ impl StagedWriter {
         if error.is::<PendingWriteLimit>() {
             StatusCode::TOO_MANY_REQUESTS
         } else {
-            eprintln!("staged mutation failed: {error:#}");
+            tracing::error!("staged mutation failed: {error:#}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

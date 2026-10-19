@@ -198,13 +198,13 @@ impl DaemonMutable {
         }
         let exe = argv.first().map(String::as_str).unwrap_or("");
         if exe.is_empty() {
-            eprintln!("{name} daemon: empty command line");
+            tracing::warn!("{name} daemon: empty command line");
             return None;
         }
         // A bare executable name resolves via PATH at spawn; only check
         // existence when argv[0] names a path (as the old script check did).
         if exe.contains(std::path::MAIN_SEPARATOR) && !Path::new(exe).is_file() {
-            eprintln!("{name} daemon: executable missing: {exe}");
+            tracing::warn!("{name} daemon: executable missing: {exe}");
             return None;
         }
         let mut child = Command::new(exe)
@@ -216,7 +216,7 @@ impl DaemonMutable {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| {
-                eprintln!("{name} daemon: failed to spawn: {e}");
+                tracing::warn!("{name} daemon: failed to spawn: {e}");
             })
             .ok()?;
         let stdin: ChildStdin = child.stdin.take()?;

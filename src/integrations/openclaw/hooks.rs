@@ -104,7 +104,7 @@ pub fn run_hook(kind: OpenClawHookKind, fallback_root: &Path) -> Result<()> {
             // Unparseable stdin: there is no safe mutation to return (for
             // bootstrap we cannot know the existing files), so emit a sentinel
             // the shims treat as "leave the event untouched".
-            eprintln!("warning: Membrick OpenClaw hook received invalid input: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook received invalid input: {error:#}");
             emit(&json!({ "ok": false, "error": "invalid hook input" }))?;
             return Ok(());
         }
@@ -141,7 +141,7 @@ pub fn process_http_hook_with_writer(
     let input: OpenClawHookInput = match serde_json::from_value(value) {
         Ok(input) => input,
         Err(error) => {
-            eprintln!("warning: Membrick OpenClaw hook received invalid input: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook received invalid input: {error:#}");
             return json!({ "ok": false, "error": "invalid hook input" });
         }
     };
@@ -156,7 +156,7 @@ fn process_hook(kind: OpenClawHookKind, input: OpenClawHookInput, fallback_root:
     let root = match resolve_root(&input, kind, fallback_root) {
         Ok(root) => root,
         Err(error) => {
-            eprintln!("warning: Membrick OpenClaw hook failed open: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook failed open: {error:#}");
             return default_output(kind, &input);
         }
     };
@@ -190,12 +190,12 @@ fn process_hook_at_root(
         kind.event_name(),
         telemetry_payload(kind, &input),
     ) {
-        eprintln!("warning: Membrick OpenClaw session recording failed open: {error:#}");
+        tracing::warn!("Membrick OpenClaw session recording failed open: {error:#}");
     }
     let output = match handle_hook(kind, &input, &root, publish) {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("warning: Membrick OpenClaw hook failed open: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook failed open: {error:#}");
             default_output(kind, &input)
         }
     };

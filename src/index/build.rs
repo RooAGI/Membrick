@@ -584,7 +584,7 @@ impl MemoryIndex {
         let lexical = match Self::build_lexical_index(&docs, lexical_dir) {
             Ok(index) => Some(index),
             Err(err) => {
-                eprintln!("warning: lexical BM25 index disabled: {}", err);
+                tracing::warn!("lexical BM25 index disabled: {}", err);
                 None
             }
         };
@@ -756,7 +756,7 @@ impl MemoryIndex {
         let lexical = match Self::build_lexical_index(&docs, lexical_dir) {
             Ok(index) => Some(index),
             Err(err) => {
-                eprintln!("warning: lexical BM25 index disabled: {}", err);
+                tracing::warn!("lexical BM25 index disabled: {}", err);
                 None
             }
         };

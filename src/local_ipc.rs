@@ -106,12 +106,13 @@ pub(crate) fn start_provider_session(root: &Path, provider: &str) -> Result<Prov
     }
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let lease = ProviderSessionLease::acquire(&root, provider)?;
+    tracing::info!(provider, lease = %lease.path.display(), "provider session registered");
     let startup_root = root.clone();
     std::thread::Builder::new()
         .name("membrick-resident-startup".into())
         .spawn(move || {
             if let Err(error) = post_json_with_transport(&startup_root, "/health", &Value::Null) {
-                eprintln!("provider resident startup failed: {error:#}");
+                tracing::warn!("provider resident startup failed: {error:#}");
             }
         })?;
     Ok(lease)
@@ -129,11 +130,15 @@ pub(crate) async fn resident_shutdown(
     if managed {
         tokio::select! {
             _ = signal => {}
-            gate = wait_for_no_provider_sessions(root, Duration::from_secs(3)) => return Some(gate),
+            gate = wait_for_no_provider_sessions(root, Duration::from_secs(3)) => {
+                tracing::info!("no provider sessions remain; shutting down");
+                return Some(gate);
+            }
         }
     } else {
         signal.await;
     }
+    tracing::info!("shutdown signal received; shutting down");
     // A client may be registering right now; wait for it, then hold the lock.
     let root = root.to_owned();
     let gate = tokio::task::spawn_blocking(move || {
@@ -145,11 +150,11 @@ pub(crate) async fn resident_shutdown(
     match gate {
         Ok(Ok(gate)) => Some(gate),
         Ok(Err(error)) => {
-            eprintln!("could not hold provider lifecycle lock during shutdown: {error:#}");
+            tracing::warn!("could not hold provider lifecycle lock during shutdown: {error:#}");
             None
         }
         Err(error) => {
-            eprintln!("could not hold provider lifecycle lock during shutdown: {error}");
+            tracing::warn!("could not hold provider lifecycle lock during shutdown: {error}");
             None
         }
     }
@@ -175,18 +180,18 @@ pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) 
                                 Ok(false) => return gate,
                                 Ok(true) => empty_since = None,
                                 Err(error) => {
-                                    eprintln!("provider lease recheck failed; keeping resident alive: {error:#}");
+                                    tracing::warn!("provider lease recheck failed; keeping resident alive: {error:#}");
                                     empty_since = None;
                                 }
                             },
                             Err(fs::TryLockError::WouldBlock) => empty_since = None,
                             Err(fs::TryLockError::Error(error)) => {
-                                eprintln!("provider lifecycle lock failed; keeping resident alive: {error}");
+                                tracing::warn!("provider lifecycle lock failed; keeping resident alive: {error}");
                                 empty_since = None;
                             }
                         },
                         Err(error) => {
-                            eprintln!("provider lifecycle lock unavailable; keeping resident alive: {error:#}");
+                            tracing::warn!("provider lifecycle lock unavailable; keeping resident alive: {error:#}");
                             empty_since = None;
                         }
                     }
@@ -195,7 +200,7 @@ pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) 
             Err(error) => {
                 // A scan error must never stop a resident while a provider
                 // may still be connected.
-                eprintln!("provider lease scan failed; keeping resident alive: {error:#}");
+                tracing::warn!("provider lease scan failed; keeping resident alive: {error:#}");
                 empty_since = None;
             }
         }
@@ -578,7 +583,7 @@ fn recover_interrupted_claims(root: &Path) -> Result<usize> {
             .and_then(|bytes| serde_json::from_slice::<QueueRequest>(&bytes).ok());
         if let Some(request) = request {
             if path.file_stem().and_then(|value| value.to_str()) != Some(request.id.as_str()) {
-                eprintln!(
+                tracing::warn!(
                     "removing abandoned queue claim with mismatched id {}",
                     path.display()
                 );
@@ -604,7 +609,7 @@ fn recover_interrupted_claims(root: &Path) -> Result<usize> {
                 fs::rename(temporary, response_path)?;
             }
         } else {
-            eprintln!(
+            tracing::warn!(
                 "removing malformed abandoned queue claim {}",
                 path.display()
             );
@@ -790,7 +795,7 @@ fn retain_startup_owner(owner: StartupOwner) {
             }
         });
     if let Err(error) = monitor {
-        eprintln!("could not start resident startup monitor; retaining startup ownership until ready: {error}");
+        tracing::warn!("could not start resident startup monitor; retaining startup ownership until ready: {error}");
         // Thread creation failure is rare, but releasing the lock here would
         // reintroduce the duplicate-start race. Wait fail-closed.
         let owner = owner
@@ -815,7 +820,7 @@ fn monitor_startup_owner(mut owner: StartupOwner) {
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(error) => {
-                eprintln!("could not monitor resident startup child: {error}");
+                tracing::warn!("could not monitor resident startup child: {error}");
                 // Keep the startup lock while the child remains alive. If it
                 // has exited, clean up its marker before releasing ownership.
                 loop {
@@ -876,12 +881,15 @@ fn start_server(root: &Path) -> Result<Option<StartupOwner>> {
     })();
 
     match launch {
-        Ok(child) => Ok(Some(StartupOwner {
-            child,
-            marker,
-            token,
-            _startup_lock: claim.lock,
-        })),
+        Ok(child) => {
+            tracing::info!(resident_pid = child.id(), "started resident");
+            Ok(Some(StartupOwner {
+                child,
+                marker,
+                token,
+                _startup_lock: claim.lock,
+            }))
+        }
         Err(error) => {
             remove_startup_marker_if_owned(&marker, &token);
             Err(error)
@@ -1002,7 +1010,7 @@ pub(crate) async fn process_queue_once(router: &Router, root: &Path) -> Result<(
         let router = router.clone();
         tasks.spawn(async move {
             if let Err(error) = process_claimed_request(router, claim.clone(), responses).await {
-                eprintln!("resident file-queue request failed: {error:#}");
+                tracing::warn!("resident file-queue request failed: {error:#}");
             }
             let claim_to_remove = claim;
             let _ = tokio::task::spawn_blocking(move || fs::remove_file(claim_to_remove)).await;
@@ -1100,24 +1108,24 @@ pub(crate) async fn serve(
     })
     .await
     {
-        Ok(Ok((recovered, expired))) if recovered > 0 || expired > 0 => eprintln!(
+        Ok(Ok((recovered, expired))) if recovered > 0 || expired > 0 => tracing::info!(
             "recovered {recovered} interrupted file-queue requests and removed {expired} expired queue files"
         ),
         Ok(Ok(_)) => {}
-        Ok(Err(error)) => eprintln!("file-queue startup cleanup failed: {error:#}"),
-        Err(error) => eprintln!("file-queue startup cleanup worker failed: {error}"),
+        Ok(Err(error)) => tracing::warn!("file-queue startup cleanup failed: {error:#}"),
+        Err(error) => tracing::warn!("file-queue startup cleanup worker failed: {error}"),
     }
     let mut http_listener = if let Some(bind) = http_bind {
         match bind_resident_http(bind, auto_http_port, settings_path).await {
             Ok(listener) => {
-                eprintln!(
+                tracing::info!(
                     "Membrick resident HTTP listening on {}",
                     listener.local_addr()?
                 );
                 Some(listener)
             }
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "resident HTTP listener unavailable; continuing with local transports: {error}"
                 );
                 None
@@ -1131,12 +1139,12 @@ pub(crate) async fn serve(
         Ok((pending, _, _)) => match watch_directory(&pending, queue_wakeup.clone()) {
             Ok(watcher) => Some(watcher),
             Err(error) => {
-                eprintln!("resident queue watcher unavailable; using recovery scans: {error}");
+                tracing::warn!("resident queue watcher unavailable; using recovery scans: {error}");
                 None
             }
         },
         Err(error) => {
-            eprintln!("resident queue setup failed; using recovery scans: {error:#}");
+            tracing::warn!("resident queue setup failed; using recovery scans: {error:#}");
             None
         }
     };
@@ -1156,7 +1164,7 @@ pub(crate) async fn serve(
             match UnixListener::bind(&endpoint) {
                 Ok(listener) => Some(listener),
                 Err(error) => {
-                    eprintln!("resident IPC socket unavailable; using file queue: {error}");
+                    tracing::warn!("resident IPC socket unavailable; using file queue: {error}");
                     None
                 }
             }
@@ -1164,7 +1172,7 @@ pub(crate) async fn serve(
             match UnixListener::bind(&endpoint) {
                 Ok(listener) => Some(listener),
                 Err(error) => {
-                    eprintln!("resident IPC socket unavailable; using file queue: {error}");
+                    tracing::warn!("resident IPC socket unavailable; using file queue: {error}");
                     None
                 }
             }
@@ -1181,7 +1189,7 @@ pub(crate) async fn serve(
             .map(|metadata| metadata.ino());
         let _ = std::fs::remove_file(starting_path(root)?);
         if listener.is_some() {
-            eprintln!("Membrick resident IPC listening on {}", endpoint.display());
+            tracing::info!("Membrick resident IPC listening on {}", endpoint.display());
         }
         let recovery_period = if _queue_watcher.is_some() {
             std::time::Duration::from_secs(1)
@@ -1204,7 +1212,7 @@ pub(crate) async fn serve(
                     Ok(Some((stream, _))) => serve_stream(router.clone(), stream, true),
                     Ok(None) => unreachable!(),
                     Err(error) => {
-                        eprintln!("resident IPC listener failed; continuing with file queue: {error}");
+                        tracing::warn!("resident IPC listener failed; continuing with file queue: {error}");
                         listener = None;
                     },
                 },
@@ -1217,25 +1225,25 @@ pub(crate) async fn serve(
                     Ok(Some((stream, _))) => serve_stream(router.clone(), stream, http_bind_is_loopback(http_bind)),
                     Ok(None) => unreachable!(),
                     Err(error) => {
-                        eprintln!("resident HTTP listener stopped: {error}");
+                        tracing::warn!("resident HTTP listener stopped: {error}");
                         http_listener = None;
                     },
                 },
                 _ = queue_wakeup.notified() => if let Err(error) = process_queue_once(&router, root).await {
-                    eprintln!("resident file-queue poll failed: {error:#}");
+                    tracing::warn!("resident file-queue poll failed: {error:#}");
                 },
                 _ = recovery.tick() => if let Err(error) = process_queue_once(&router, root).await {
-                    eprintln!("resident file-queue recovery scan failed: {error:#}");
+                    tracing::warn!("resident file-queue recovery scan failed: {error:#}");
                 },
                 _ = queue_cleanup.tick() => {
                     let cleanup_root = root.to_owned();
                     match tokio::task::spawn_blocking(move || {
                         cleanup_expired_queue_files(&cleanup_root, std::time::SystemTime::now())
                     }).await {
-                        Ok(Ok(removed)) if removed > 0 => eprintln!("removed {removed} expired file-queue artifacts"),
+                        Ok(Ok(removed)) if removed > 0 => tracing::info!("removed {removed} expired file-queue artifacts"),
                         Ok(Ok(_)) => {}
-                        Ok(Err(error)) => eprintln!("file-queue cleanup failed: {error:#}"),
-                        Err(error) => eprintln!("file-queue cleanup worker failed: {error}"),
+                        Ok(Err(error)) => tracing::warn!("file-queue cleanup failed: {error:#}"),
+                        Err(error) => tracing::warn!("file-queue cleanup worker failed: {error}"),
                     }
                 }
                 gate = &mut shutdown => break gate,
@@ -1248,14 +1256,14 @@ pub(crate) async fn serve(
         {
             let _ = std::fs::remove_file(&endpoint);
         }
-        eprintln!("Membrick resident stopped on {}", endpoint.display());
+        tracing::info!("Membrick resident stopped on {}", endpoint.display());
         Ok(shutdown_gate)
     }
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ServerOptions;
         let endpoint = pipe_name(root)?;
-        eprintln!("Membrick resident IPC listening on {endpoint}");
+        tracing::info!("Membrick resident IPC listening on {endpoint}");
         let recovery_period = if _queue_watcher.is_some() {
             std::time::Duration::from_secs(1)
         } else {
@@ -1285,25 +1293,25 @@ pub(crate) async fn serve(
                     }
                     Ok(None) => unreachable!(),
                     Err(error) => {
-                        eprintln!("resident HTTP listener stopped: {error}");
+                        tracing::warn!("resident HTTP listener stopped: {error}");
                         http_listener = None;
                     },
                 },
                 _ = queue_wakeup.notified() => if let Err(error) = process_queue_once(&router, root).await {
-                    eprintln!("resident file-queue poll failed: {error:#}");
+                    tracing::warn!("resident file-queue poll failed: {error:#}");
                 },
                 _ = recovery.tick() => if let Err(error) = process_queue_once(&router, root).await {
-                    eprintln!("resident file-queue recovery scan failed: {error:#}");
+                    tracing::warn!("resident file-queue recovery scan failed: {error:#}");
                 },
                 _ = queue_cleanup.tick() => {
                     let cleanup_root = root.to_owned();
                     match tokio::task::spawn_blocking(move || {
                         cleanup_expired_queue_files(&cleanup_root, std::time::SystemTime::now())
                     }).await {
-                        Ok(Ok(removed)) if removed > 0 => eprintln!("removed {removed} expired file-queue artifacts"),
+                        Ok(Ok(removed)) if removed > 0 => tracing::info!("removed {removed} expired file-queue artifacts"),
                         Ok(Ok(_)) => {}
-                        Ok(Err(error)) => eprintln!("file-queue cleanup failed: {error:#}"),
-                        Err(error) => eprintln!("file-queue cleanup worker failed: {error}"),
+                        Ok(Err(error)) => tracing::warn!("file-queue cleanup failed: {error:#}"),
+                        Err(error) => tracing::warn!("file-queue cleanup worker failed: {error}"),
                     }
                 }
                 gate = &mut shutdown => break gate,
@@ -1348,7 +1356,7 @@ async fn bind_resident_http(
                                 "could not persist the resident HTTP port selected after a bind conflict",
                             );
                         }
-                        eprintln!(
+                        tracing::info!(
                             "resident HTTP port {} was occupied; using {}",
                             requested.port(),
                             actual.port()

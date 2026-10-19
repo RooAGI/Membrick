@@ -482,7 +482,7 @@ impl MemoryService {
         if !legacy_observations.is_empty() {
             store.remove_many(legacy_observations.iter().map(String::as_str));
             store.refresh()?;
-            eprintln!(
+            tracing::info!(
                 "removed {} legacy session-observation documents from the searchable index",
                 legacy_observations.len()
             );
@@ -539,13 +539,13 @@ impl MemoryService {
                     file.write_all(&json)
                 })();
                 if let Err(e) = result {
-                    eprintln!("failed to append adjudication receipts: {e}");
+                    tracing::warn!("failed toappend adjudication receipts: {e}");
                 } else {
                     self.pending_receipt_persistence.clear();
                     self.trim_receipt_cache();
                 }
             }
-            Err(e) => eprintln!("failed to serialize adjudication receipts: {e}"),
+            Err(e) => tracing::warn!("failed toserialize adjudication receipts: {e}"),
         }
     }
 

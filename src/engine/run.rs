@@ -850,7 +850,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             )?;
             if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built)
             {
-                eprintln!("warning: unable to persist query cache: {}", err);
+                tracing::warn!("unable to persist query cache: {}", err);
             }
             built
         };
@@ -1001,7 +1001,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             Some(&lexical_dir),
         )?;
         if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &index) {
-            eprintln!("warning: unable to persist query cache: {}", err);
+            tracing::warn!("unable to persist query cache: {}", err);
         }
         if args.index_redacted {
             println!(
@@ -1225,7 +1225,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             Some(&lexical_dir),
         )?;
         if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built) {
-            eprintln!("warning: unable to persist review search index: {}", err);
+            tracing::warn!("unable to persist review search index: {}", err);
         }
         built
     };

@@ -68,7 +68,7 @@ pub fn run_hook(kind: CodexHookKind, fallback_root: &Path) -> Result<()> {
     let mut output = match run_with_budget(kind, input, fallback_root) {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("warning: Membrick Codex hook failed open: {error:#}");
+            tracing::warn!("Membrick Codex hook failed open: {error:#}");
             CodexHookOutput::default()
         }
     };
@@ -206,7 +206,7 @@ fn handle_hook(
         kind.event_name(),
         payload,
     ) {
-        eprintln!("warning: Membrick session recording failed open: {error:#}");
+        tracing::warn!("Membrick session recording failed open: {error:#}");
     }
     if matches!(kind, CodexHookKind::Stop) && !input.stop_hook_active {
         if let Err(error) = record_transcript_usage_if_available(
@@ -219,7 +219,7 @@ fn handle_hook(
             input.agent_type.as_deref(),
             "codex-transcript",
         ) {
-            eprintln!("warning: Codex transcript usage capture failed open: {error:#}");
+            tracing::warn!("Codex transcript usage capture failed open: {error:#}");
         }
     }
     if !membrick_enabled(RecordingProvider::Codex, &root)? {

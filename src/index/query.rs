@@ -350,7 +350,7 @@ impl MemoryIndex {
         ) {
             Ok(hits) => Some(hits),
             Err(err) => {
-                eprintln!("warning: lexical BM25 query component failed: {}", err);
+                tracing::warn!("lexical BM25 query component failed: {}", err);
                 None
             }
         };

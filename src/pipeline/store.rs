@@ -270,7 +270,7 @@ pub(crate) struct PreparedCheckpoint {
 fn write_catalog_cache_best_effort(store_root: &Path, bytes: &[u8]) {
     let path = crate::segments::segment_catalog_cache_path(store_root);
     if let Err(error) = crate::segments::write_segment_catalog_cache(&path, bytes) {
-        eprintln!("warning: could not write segment catalog cache: {error:#}");
+        tracing::warn!("could not write segment catalog cache: {error:#}");
     }
 }
 
@@ -447,7 +447,7 @@ impl IndexStore {
             if let Some(relations) = &prepared.relations {
                 if let Err(error) = super::persist_semantic_relations(&self.store_paths, relations)
                 {
-                    eprintln!("warning: could not write semantic relation cache: {error:#}");
+                    tracing::warn!("could not write semantic relation cache: {error:#}");
                 }
             }
             if let (Some(catalog), Some(root)) = (&prepared.catalog, &self.store_paths.root) {
@@ -471,7 +471,7 @@ impl IndexStore {
             MemoryIndexSnapshot::Single(index) => (Some(index), None, None),
             MemoryIndexSnapshot::Segmented(index) => {
                 let catalog = index.encode_catalog_cache().unwrap_or_else(|error| {
-                    eprintln!("warning: could not prepare segment catalog cache: {error:#}");
+                    tracing::warn!("could not prepare segment catalog cache: {error:#}");
                     Vec::new()
                 });
                 (
@@ -488,7 +488,7 @@ impl IndexStore {
             self.options.supersession,
         )
         .unwrap_or_else(|error| {
-            eprintln!("warning: could not prepare semantic relation cache: {error:#}");
+            tracing::warn!("could not prepare semantic relation cache: {error:#}");
             None
         });
         Ok(PreparedCheckpoint {
@@ -587,8 +587,8 @@ impl IndexStore {
         match Self::try_new(options.clone()) {
             Ok(store) => store,
             Err(err) => {
-                eprintln!(
-                    "warning: index store initialization failed (falling back to in-memory): {}",
+                tracing::warn!(
+                    "index store initialization failed (falling back to in-memory): {}",
                     err
                 );
                 let fallback_options = PipelineOptions {
@@ -874,7 +874,7 @@ impl IndexStore {
                 ) {
                     Ok(segmented) => Some(MemoryIndexSnapshot::Segmented(segmented)),
                     Err(error) => {
-                        eprintln!("warning: ignoring invalid persisted segment manifest: {error}");
+                        tracing::warn!("ignoring invalid persisted segment manifest: {error}");
                         None
                     }
                 }
@@ -992,7 +992,7 @@ impl IndexStore {
                     match segmented.encode_catalog_cache() {
                         Ok(bytes) => write_catalog_cache_best_effort(root, &bytes),
                         Err(error) => {
-                            eprintln!("warning: could not prepare segment catalog cache: {error:#}")
+                            tracing::warn!("could not prepare segment catalog cache: {error:#}")
                         }
                     }
                 }

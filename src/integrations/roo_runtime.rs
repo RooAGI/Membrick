@@ -121,7 +121,7 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
         }
     })();
     let result = result.unwrap_or_else(|error| {
-        eprintln!("warning: Roo Runtime Membrick hook failed open: {error:#}");
+        tracing::warn!("Roo Runtime Membrick hook failed open: {error:#}");
         HookResult::default()
     });
     serde_json::to_writer(std::io::stdout().lock(), &result)?;

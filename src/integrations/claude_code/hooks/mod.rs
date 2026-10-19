@@ -67,7 +67,7 @@ pub fn run_hook(kind: ClaudeHookKind, fallback_root: &Path) -> Result<()> {
     let mut output = match run_with_budget(kind, input, fallback_root) {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("warning: Membrick Claude hook failed open: {error:#}");
+            tracing::warn!("Membrick Claude hook failed open: {error:#}");
             ClaudeHookOutput::default()
         }
     };
@@ -200,7 +200,7 @@ fn handle_hook(
         kind.event_name(),
         payload,
     ) {
-        eprintln!("warning: Membrick session recording failed open: {error:#}");
+        tracing::warn!("Membrick session recording failed open: {error:#}");
     }
     if matches!(kind, ClaudeHookKind::Stop) && !input.stop_hook_active {
         if let Err(error) = record_transcript_usage_if_available(
@@ -213,7 +213,7 @@ fn handle_hook(
             input.agent_type.as_deref(),
             "claude-transcript",
         ) {
-            eprintln!("warning: Claude transcript usage capture failed open: {error:#}");
+            tracing::warn!("Claude transcript usage capture failed open: {error:#}");
         }
     }
     if !membrick_enabled(RecordingProvider::Claude, &root)? {

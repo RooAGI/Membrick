@@ -765,7 +765,7 @@ pub(crate) fn persist_semantic_relations_best_effort(
     let result = prepare_semantic_relations(relations, source_docs, records, options)
         .and_then(|bytes| bytes.map_or(Ok(()), |bytes| persist_semantic_relations(paths, &bytes)));
     if let Err(error) = result {
-        eprintln!("warning: could not write semantic relation cache: {error:#}");
+        tracing::warn!("could not write semantic relation cache: {error:#}");
     }
 }
 

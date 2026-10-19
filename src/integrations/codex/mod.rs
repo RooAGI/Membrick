@@ -449,7 +449,7 @@ pub fn install_hook_settings(root: &Path, settings_path: Option<&Path>) -> Resul
 
 pub fn run_server(root: &Path, options: CodexServerOptions<'_>) -> Result<()> {
     let _resident_lease = crate::local_ipc::start_provider_session(root, "codex")?;
-    mcp_index::trace_event("server-start");
+    tracing::debug!("MCP server starting");
     let mcp = CodexMcp {
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
@@ -496,7 +496,7 @@ impl CodexMcp {
                     file_changes,
                 )
             {
-                eprintln!("warning: failed to save workspace file changes: {error:#}");
+                tracing::warn!("failed to save workspace file changes: {error:#}");
             }
             if workspace_index_changed {
                 *store = None;
@@ -540,9 +540,9 @@ impl CodexMcp {
             &mut reader,
             &mut writer,
             |request| self.handle_request(request),
-            |method| mcp_index::trace_event(&format!("request:{method}")),
-            |method, error| mcp_index::trace_event(&format!("request-error:{method}:{error:#}")),
-            || mcp_index::trace_event("response-written"),
+            |method| tracing::debug!(method, "MCP request received"),
+            |method, error| tracing::debug!(method, "MCP request failed: {error:#}"),
+            || tracing::debug!("MCP response written"),
         )
     }
 

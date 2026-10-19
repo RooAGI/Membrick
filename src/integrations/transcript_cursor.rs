@@ -223,7 +223,7 @@ fn read_next_batch_until(
             &recovery.to_string(),
         )?;
         mark_captured(state_dir, session_id, 0)?;
-        eprintln!(
+        tracing::info!(
             "Recovered transcript cursor {}: {reason}; replaying from zero",
             path.display()
         );

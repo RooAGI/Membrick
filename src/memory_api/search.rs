@@ -805,7 +805,7 @@ fn relations_index_for(
     )) {
         Ok(relations) => relations,
         Err(_) => {
-            eprintln!(
+            tracing::warn!(
                 "relations: extractor timed out after {RELATIONS_EXTRACT_TIMEOUT_SECS}s; \
                  structured-fact path disabled for this query (not cached, will retry)"
             );

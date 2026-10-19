@@ -364,6 +364,24 @@ The local resident service writes startup and listener diagnostics to the
 project's `.membrick/runtime/resident.log`; startup rotates it to one backup
 when it exceeds 1 MiB.
 
+Every Membrick process logs one line per event to stderr, with the UTC time,
+level, process role and id, and the module that logged:
+
+```text
+2026-10-18T23:35:29.445Z  INFO resident[45368] membrick::executables::server: resident starting version="0.6.3" managed=true root=/path/to/project
+```
+
+The role is `resident`, `mcp`, `hook`, `server` or `cli`. Set the level in the
+project's `.membrick/server.toml`:
+
+```toml
+[logging]
+level = "debug"
+```
+
+Accepted levels are `off`, `error`, `warn`, `info`, `debug` and `trace`.
+Background roles default to `info`. Interactive commands default to `warn`.
+
 Hermes and OpenClaw plugins can share one HTTP server process. OpenClaw hook payloads with a
 workspace directory are routed to that workspace's runtime. Hermes currently
 uses the legacy `/provider-memory/add/batch` endpoint, which writes to the

@@ -88,10 +88,10 @@ pub fn run_hook(kind: AgyHookKind, fallback_root: &Path) -> Result<()> {
         kind.event_name(),
         raw,
     ) {
-        eprintln!("warning: Membrick AGY session recording failed open: {error:#}");
+        tracing::warn!("Membrick AGY session recording failed open: {error:#}");
     }
     let mut output = handle_hook(kind, &input, &root).unwrap_or_else(|error| {
-        eprintln!("warning: Membrick AGY hook failed open: {error:#}");
+        tracing::warn!("Membrick AGY hook failed open: {error:#}");
         AgyHookOutput::default()
     });
     if kind == AgyHookKind::Stop && !input.conversation_id.is_empty() {
@@ -141,7 +141,7 @@ fn handle_hook(kind: AgyHookKind, input: &AgyHookInput, root: &Path) -> Result<A
                 None,
                 "agy-transcript",
             ) {
-                eprintln!("warning: AGY transcript usage capture failed open: {error:#}");
+                tracing::warn!("AGY transcript usage capture failed open: {error:#}");
             }
             let _ = capture_transcript(root, session_id, &path);
         }

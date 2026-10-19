@@ -144,7 +144,7 @@ pub fn run_server_for(
     options: GeminiCliServerOptions<'_>,
 ) -> Result<()> {
     let _resident_lease = crate::local_ipc::start_provider_session(root, provider_label)?;
-    mcp_index::trace_event("gemini-server-start");
+    tracing::debug!("MCP server starting");
     let server = GeminiMcp {
         root: root.to_path_buf(),
         store: Mutex::new(None),
@@ -221,7 +221,7 @@ impl GeminiMcp {
                     file_changes,
                 )
             {
-                eprintln!("warning: failed to save workspace file changes: {error:#}");
+                tracing::warn!("failed to save workspace file changes: {error:#}");
             }
             if workspace_index_changed {
                 *store = None;
