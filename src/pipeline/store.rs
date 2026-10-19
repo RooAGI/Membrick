@@ -867,37 +867,12 @@ impl IndexStore {
                 temporal_facts: previous_facts,
                 ..
             } = previous;
-            let unchanged = previous_records.len() <= records.len()
-                && previous_records.iter().all(|(doc_id, previous_record)| {
-                    records
-                        .get(doc_id)
-                        .is_some_and(|record| Arc::ptr_eq(previous_record, record))
-                });
-            if unchanged {
-                let additions = records
-                    .iter()
-                    .filter(|(doc_id, _)| !previous_records.contains_key(*doc_id))
-                    .map(|(_, record)| record.as_ref())
-                    .collect::<Vec<_>>();
-                if additions.is_empty() {
-                    previous_facts
-                } else {
-                    let mut facts = Arc::unwrap_or_clone(previous_facts);
-                    if facts.append_records_if_ordered(additions, &chunk_lifecycle) {
-                        Arc::new(facts)
-                    } else {
-                        Arc::new(TemporalFactStore::from_records(
-                            records.values().map(AsRef::as_ref),
-                            &chunk_lifecycle,
-                        ))
-                    }
-                }
-            } else {
-                Arc::new(TemporalFactStore::from_records(
-                    records.values().map(AsRef::as_ref),
-                    &chunk_lifecycle,
-                ))
-            }
+            TemporalFactStore::carry_forward(
+                previous_facts,
+                &previous_records,
+                &records,
+                &chunk_lifecycle,
+            )
         } else {
             Arc::new(TemporalFactStore::from_records(
                 records.values().map(AsRef::as_ref),

@@ -4,6 +4,7 @@ use crate::temporal::parse_temporal_date;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TimelineEvent<'a> {
@@ -151,6 +152,11 @@ impl TemporalFactStore {
 
         let mut store = Self::default();
         for (order_key, record) in ordered {
+            // Only records with claims add facts, so only they set the order
+            // that later appends must follow.
+            if record.top_claims.is_empty() {
+                continue;
+            }
             store.last_record_order = Some(order_key);
             let (source_chunk_id, source_chunk_version, chunk_timestamp) =
                 best_source_chunk(record, chunk_lifecycle);
@@ -179,7 +185,10 @@ impl TemporalFactStore {
     where
         I: IntoIterator<Item = &'a DocRecord>,
     {
-        let mut ordered = records.into_iter().collect::<Vec<_>>();
+        let mut ordered = records
+            .into_iter()
+            .filter(|record| !record.top_claims.is_empty())
+            .collect::<Vec<_>>();
         if ordered.is_empty() {
             return true;
         }
@@ -207,6 +216,56 @@ impl TemporalFactStore {
             }
         }
         true
+    }
+
+    /// The store for `records`, reusing `previous`, the store built from
+    /// `previous_records`, when that gives the same facts as a full rebuild.
+    ///
+    /// Only records with claims add facts. Replacing or removing a record
+    /// without claims therefore leaves the facts as they are, and new claims
+    /// can be appended when they follow every claim already ingested. Any
+    /// replaced or removed record with claims needs a full rebuild, since a
+    /// later fact may have closed its validity window.
+    pub(crate) fn carry_forward(
+        previous: Arc<Self>,
+        previous_records: &HashMap<String, Arc<DocRecord>>,
+        records: &HashMap<String, Arc<DocRecord>>,
+        chunk_lifecycle: &HashMap<String, ChunkLifecycleMeta>,
+    ) -> Arc<Self> {
+        let rebuild = || {
+            Arc::new(Self::from_records(
+                records.values().map(AsRef::as_ref),
+                chunk_lifecycle,
+            ))
+        };
+        let claims_dropped = previous_records.iter().any(|(doc_id, previous_record)| {
+            !previous_record.top_claims.is_empty()
+                && !records
+                    .get(doc_id)
+                    .is_some_and(|record| Arc::ptr_eq(previous_record, record))
+        });
+        if claims_dropped {
+            return rebuild();
+        }
+        let additions = records
+            .iter()
+            .filter(|(doc_id, record)| {
+                !record.top_claims.is_empty()
+                    && !previous_records
+                        .get(*doc_id)
+                        .is_some_and(|previous_record| Arc::ptr_eq(previous_record, record))
+            })
+            .map(|(_, record)| record.as_ref())
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            return previous;
+        }
+        let mut facts = Arc::unwrap_or_clone(previous);
+        if facts.append_records_if_ordered(additions, chunk_lifecycle) {
+            Arc::new(facts)
+        } else {
+            rebuild()
+        }
     }
 
     pub fn facts(&self) -> &[TemporalFact] {
@@ -765,6 +824,132 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn works_at(doc_id: &str, timestamp: &str, employer: &str) -> DocRecord {
+        sample_record(
+            doc_id,
+            Some(timestamp),
+            vec![Claim {
+                subject: "Alice".into(),
+                predicate: "works_at".into(),
+                object: employer.into(),
+                confidence: 0.9,
+                ..Default::default()
+            }],
+        )
+    }
+
+    fn record_map(records: &[DocRecord]) -> HashMap<String, Arc<DocRecord>> {
+        records
+            .iter()
+            .map(|record| (record.doc_id.clone(), Arc::new(record.clone())))
+            .collect()
+    }
+
+    fn timeline_view(store: &TemporalFactStore) -> Vec<(Option<String>, Option<String>, bool)> {
+        store
+            .timeline("alice")
+            .iter()
+            .map(|fact| (fact.object.clone(), fact.valid_to.clone(), fact.is_latest))
+            .collect()
+    }
+
+    #[test]
+    fn replacing_a_record_without_claims_reuses_the_store() {
+        let lifecycle = HashMap::new();
+        let previous_records = record_map(&[
+            works_at("doc-a", "2024-01-01", "Acme"),
+            works_at("doc-b", "2024-02-01", "Beta"),
+            sample_record("session-context", Some("2024-03-01"), vec![]),
+        ]);
+        let previous = Arc::new(TemporalFactStore::from_records(
+            previous_records.values().map(AsRef::as_ref),
+            &lifecycle,
+        ));
+        // A capture rewrites the session context with a newer timestamp.
+        let mut records = previous_records.clone();
+        records.insert(
+            "session-context".into(),
+            Arc::new(sample_record("session-context", Some("2025-01-01"), vec![])),
+        );
+
+        let carried = TemporalFactStore::carry_forward(
+            Arc::clone(&previous),
+            &previous_records,
+            &records,
+            &lifecycle,
+        );
+
+        assert!(
+            Arc::ptr_eq(&carried, &previous),
+            "a claim-free replacement rebuilt the store"
+        );
+        let rebuilt =
+            TemporalFactStore::from_records(records.values().map(AsRef::as_ref), &lifecycle);
+        assert_eq!(carried.facts(), rebuilt.facts());
+    }
+
+    #[test]
+    fn claims_added_after_a_claim_free_replacement_match_a_full_rebuild() {
+        let lifecycle = HashMap::new();
+        let previous_records = record_map(&[
+            works_at("doc-a", "2024-01-01", "Acme"),
+            sample_record("session-context", Some("2024-03-01"), vec![]),
+        ]);
+        let previous = Arc::new(TemporalFactStore::from_records(
+            previous_records.values().map(AsRef::as_ref),
+            &lifecycle,
+        ));
+        let mut records = previous_records.clone();
+        records.insert(
+            "session-context".into(),
+            Arc::new(sample_record("session-context", Some("2025-01-01"), vec![])),
+        );
+        records.insert(
+            "doc-b".into(),
+            Arc::new(works_at("doc-b", "2024-06-01", "Beta")),
+        );
+
+        let carried =
+            TemporalFactStore::carry_forward(previous, &previous_records, &records, &lifecycle);
+
+        let rebuilt =
+            TemporalFactStore::from_records(records.values().map(AsRef::as_ref), &lifecycle);
+        assert_eq!(carried.facts(), rebuilt.facts());
+        assert_eq!(timeline_view(&carried), timeline_view(&rebuilt));
+        // An appended claim still has to follow every claim already ingested.
+        let mut appended = (*carried).clone();
+        assert!(!appended
+            .append_records_if_ordered([&works_at("doc-c", "2024-05-01", "Gamma")], &lifecycle));
+    }
+
+    #[test]
+    fn replacing_a_record_with_claims_matches_a_full_rebuild() {
+        let lifecycle = HashMap::new();
+        let previous_records = record_map(&[
+            works_at("doc-a", "2024-01-01", "Acme"),
+            works_at("doc-b", "2024-02-01", "Beta"),
+            works_at("doc-c", "2024-03-01", "Gamma"),
+        ]);
+        let previous = Arc::new(TemporalFactStore::from_records(
+            previous_records.values().map(AsRef::as_ref),
+            &lifecycle,
+        ));
+        let mut records = previous_records.clone();
+        records.insert(
+            "doc-b".into(),
+            Arc::new(works_at("doc-b", "2024-02-01", "Delta")),
+        );
+        records.remove("doc-c");
+
+        let carried =
+            TemporalFactStore::carry_forward(previous, &previous_records, &records, &lifecycle);
+
+        let rebuilt =
+            TemporalFactStore::from_records(records.values().map(AsRef::as_ref), &lifecycle);
+        assert_eq!(carried.facts(), rebuilt.facts());
+        assert_eq!(timeline_view(&carried), timeline_view(&rebuilt));
     }
 
     #[test]
