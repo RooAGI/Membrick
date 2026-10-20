@@ -787,36 +787,75 @@ pub(crate) fn load_semantic_relations(
     (cached.fingerprint == fingerprint).then_some(cached.store)
 }
 
-type SemanticState = (
-    HashMap<String, Arc<SourceDocument>>,
-    HashMap<String, Arc<DocRecord>>,
-    HashMap<String, ChunkLifecycleMeta>,
-    Option<MemoryIndex>,
-);
+/// Records are split across this many files by a hash of their doc id, so a
+/// checkpoint rewrites only the files that hold a changed record.
+const RECORD_SHARD_COUNT: usize = 64;
+const RECORD_SHARD_DIR: &str = "records-shards";
+/// Names the file that holds each shard. A checkpoint writes its changed shards
+/// under new names and then replaces this file, so a checkpoint that stops
+/// partway leaves the previous set whole. Until it exists, the store still
+/// loads the single legacy `records.json`.
+const RECORD_SHARD_MANIFEST_FILE: &str = "manifest.json";
 
-pub(crate) fn load_semantic_state(
-    store_paths: &StorePaths,
-    layout: &MemoryIndexLayout,
-) -> Result<SemanticState> {
-    let Some(records_path) = semantic_records_path(store_paths) else {
-        return Ok((HashMap::new(), HashMap::new(), HashMap::new(), None));
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecordShardManifest {
+    schema_version: u32,
+    layout_version: String,
+    generation: u64,
+    /// The file for each shard, or `None` for a shard with no records.
+    files: Vec<Option<String>>,
+}
+
+fn record_shard_dir(store_paths: &StorePaths) -> Option<PathBuf> {
+    store_paths
+        .semantic_dir
+        .as_ref()
+        .map(|dir| dir.join(RECORD_SHARD_DIR))
+}
+
+fn record_shard_file_name(shard: usize, generation: u64) -> String {
+    format!("{shard:02}-{generation}.json")
+}
+
+fn read_record_shard_manifest(shard_dir: &Path) -> Result<Option<RecordShardManifest>> {
+    let manifest_path = shard_dir.join(RECORD_SHARD_MANIFEST_FILE);
+    let text = match fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
-    if !records_path.exists() {
-        return Ok((HashMap::new(), HashMap::new(), HashMap::new(), None));
-    }
-    let core_path = semantic_core_path(store_paths);
-    if matches!(layout, MemoryIndexLayout::Single)
-        && !core_path.as_ref().is_some_and(|p| p.exists())
-    {
-        return Ok((HashMap::new(), HashMap::new(), HashMap::new(), None));
-    }
+    let manifest: RecordShardManifest = serde_json::from_str(&text)?;
+    anyhow::ensure!(
+        manifest.schema_version == STORE_SCHEMA_VERSION
+            && manifest.layout_version == STORE_LAYOUT_VERSION
+            && manifest.files.len() == RECORD_SHARD_COUNT
+            && manifest.files.iter().flatten().all(|name| {
+                Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
+                    && name != RECORD_SHARD_MANIFEST_FILE
+            }),
+        "unsupported record shard manifest at {}",
+        manifest_path.display()
+    );
+    Ok(Some(manifest))
+}
 
+/// FNV-1a, so a record keeps its shard across processes and platforms.
+fn record_shard(doc_id: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in doc_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % RECORD_SHARD_COUNT as u64) as usize
+}
+
+fn read_semantic_records(path: &Path) -> Result<PersistedSemanticRecords> {
     let persisted: PersistedSemanticRecords =
-        serde_json::from_reader(std::io::BufReader::new(fs::File::open(&records_path)?))?;
+        serde_json::from_reader(std::io::BufReader::new(fs::File::open(path)?))?;
     if persisted.schema_version != STORE_SCHEMA_VERSION {
         anyhow::bail!(
             "semantic record schema mismatch at {}: found {}, expected {}",
-            records_path.display(),
+            path.display(),
             persisted.schema_version,
             STORE_SCHEMA_VERSION
         );
@@ -824,14 +863,90 @@ pub(crate) fn load_semantic_state(
     if persisted.layout_version != STORE_LAYOUT_VERSION {
         anyhow::bail!(
             "semantic record layout mismatch at {}: found {}, expected {}",
-            records_path.display(),
+            path.display(),
             persisted.layout_version,
             STORE_LAYOUT_VERSION
         );
     }
+    Ok(persisted)
+}
 
-    let restored_records = persisted
-        .records
+/// Records and chunk lifecycle from a complete shard set, or `None` when the
+/// store has none yet.
+fn read_record_shards(
+    store_paths: &StorePaths,
+) -> Result<Option<(Vec<PersistedDocRecord>, Vec<ChunkLifecycleMeta>)>> {
+    let Some(shard_dir) = record_shard_dir(store_paths) else {
+        return Ok(None);
+    };
+    let Some(manifest) = read_record_shard_manifest(&shard_dir)? else {
+        return Ok(None);
+    };
+    let mut records = Vec::new();
+    for name in manifest.files.iter().flatten() {
+        records.extend(read_semantic_records(&shard_dir.join(name))?.records);
+    }
+    let lifecycle = match chunk_lifecycle_path(store_paths) {
+        Some(path) if path.exists() => serde_json::from_str(&fs::read_to_string(path)?)?,
+        _ => Vec::new(),
+    };
+    Ok(Some((records, lifecycle)))
+}
+
+/// Every persisted record in a semantic directory, from its shard set or the
+/// legacy single file.
+pub(crate) fn load_persisted_records(semantic_dir: &Path) -> Result<Vec<DocRecord>> {
+    let paths = StorePaths {
+        root: None,
+        semantic_dir: Some(semantic_dir.to_path_buf()),
+        lexical_dir: None,
+        metadata_path: None,
+    };
+    let records = match read_record_shards(&paths)? {
+        Some((records, _)) => records,
+        None => read_semantic_records(&semantic_dir.join(SEMANTIC_RECORDS_FILE))?.records,
+    };
+    Ok(records.into_iter().map(Into::into).collect())
+}
+
+type SemanticState = (
+    HashMap<String, Arc<SourceDocument>>,
+    HashMap<String, Arc<DocRecord>>,
+    HashMap<String, ChunkLifecycleMeta>,
+    Option<MemoryIndex>,
+    // Whether the records came from a shard set, so they match the files on
+    // disk and a checkpoint may rewrite only the shards that change.
+    bool,
+);
+
+pub(crate) fn load_semantic_state(
+    store_paths: &StorePaths,
+    layout: &MemoryIndexLayout,
+) -> Result<SemanticState> {
+    let empty = || Ok((HashMap::new(), HashMap::new(), HashMap::new(), None, false));
+    let Some(records_path) = semantic_records_path(store_paths) else {
+        return empty();
+    };
+    let sharded = read_record_shards(store_paths)?;
+    if sharded.is_none() && !records_path.exists() {
+        return empty();
+    }
+    let core_path = semantic_core_path(store_paths);
+    if matches!(layout, MemoryIndexLayout::Single)
+        && !core_path.as_ref().is_some_and(|p| p.exists())
+    {
+        return empty();
+    }
+
+    let from_shards = sharded.is_some();
+    let (persisted_records, persisted_lifecycle) = match sharded {
+        Some(shards) => shards,
+        None => {
+            let persisted = read_semantic_records(&records_path)?;
+            (persisted.records, persisted.chunk_lifecycle)
+        }
+    };
+    let restored_records = persisted_records
         .into_iter()
         .map(Into::into)
         .collect::<Vec<DocRecord>>();
@@ -855,8 +970,7 @@ pub(crate) fn load_semantic_state(
         );
         records.insert(record.doc_id.clone(), Arc::new(record));
     }
-    let mut chunk_lifecycle = persisted
-        .chunk_lifecycle
+    let mut chunk_lifecycle = persisted_lifecycle
         .into_iter()
         .map(|meta| (meta.chunk_id.clone(), meta))
         .collect::<HashMap<_, _>>();
@@ -889,22 +1003,22 @@ pub(crate) fn load_semantic_state(
             )?;
         }
     }
-    Ok((source_docs, records, chunk_lifecycle, snapshot))
+    Ok((source_docs, records, chunk_lifecycle, snapshot, from_shards))
 }
 
 pub(crate) struct PreparedSemanticState {
-    // Internal transport only; records.json on disk remains ordinary JSON.
-    records: Vec<u8>,
+    // Internal transport only; each shard on disk remains ordinary JSON.
+    // `None` is a shard left with no records, which gets no file.
+    shards: Vec<(usize, Option<Vec<u8>>)>,
+    /// Every shard is included, so the set can be marked complete and the
+    /// legacy single file retired.
+    complete: bool,
     lifecycle: String,
     core: Option<Vec<u8>>,
 }
 
-/// Serialize a matching generation without touching the filesystem.
-pub(crate) fn prepare_semantic_state(
-    snapshot: Option<&MemoryIndex>,
-    records_map: &HashMap<String, Arc<DocRecord>>,
-    chunk_lifecycle_map: &HashMap<String, ChunkLifecycleMeta>,
-) -> Result<PreparedSemanticState> {
+/// One shard's records as compressed JSON.
+fn encode_record_shard(mut records: Vec<&DocRecord>) -> Result<Vec<u8>> {
     #[derive(serde::Serialize)]
     struct RecordRef<'a> {
         #[serde(flatten)]
@@ -918,9 +1032,7 @@ pub(crate) fn prepare_semantic_state(
         schema_version: u32,
         layout_version: &'a str,
         records: Vec<RecordRef<'a>>,
-        chunk_lifecycle: Vec<&'a ChunkLifecycleMeta>,
     }
-    let mut records = records_map.values().map(AsRef::as_ref).collect::<Vec<_>>();
     records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
     let payload = RecordsRef {
         schema_version: STORE_SCHEMA_VERSION,
@@ -932,19 +1044,66 @@ pub(crate) fn prepare_semantic_state(
                 content: &record.content,
             })
             .collect(),
-        chunk_lifecycle: chunk_lifecycle_map.values().collect(),
     };
-    let mut lifecycle = chunk_lifecycle_map.values().collect::<Vec<_>>();
-    lifecycle.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
     // Stream directly into the encoder: never materialize the uncompressed
-    // corpus JSON in a second heap buffer while the immutable records live.
+    // JSON in a second heap buffer while the immutable records live.
     let encoder = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
     let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, encoder);
     serde_json::to_writer(&mut buffered, &payload)?;
     let encoder = buffered.into_inner().map_err(|error| error.into_error())?;
-    let records = encoder.finish()?;
+    Ok(encoder.finish()?)
+}
+
+/// Serialize a matching generation without touching the filesystem.
+///
+/// `persisted` is the record map whose shards are already on disk. Only
+/// shards holding an added, changed or removed record are serialized; with
+/// no map, every shard is.
+pub(crate) fn prepare_semantic_state(
+    snapshot: Option<&MemoryIndex>,
+    records_map: &HashMap<String, Arc<DocRecord>>,
+    chunk_lifecycle_map: &HashMap<String, ChunkLifecycleMeta>,
+    persisted: Option<&HashMap<String, Arc<DocRecord>>>,
+) -> Result<PreparedSemanticState> {
+    let mut changed = vec![persisted.is_none(); RECORD_SHARD_COUNT];
+    if let Some(persisted) = persisted {
+        for (doc_id, record) in records_map {
+            if !persisted
+                .get(doc_id)
+                .is_some_and(|previous| Arc::ptr_eq(previous, record))
+            {
+                changed[record_shard(doc_id)] = true;
+            }
+        }
+        for doc_id in persisted.keys() {
+            if !records_map.contains_key(doc_id) {
+                changed[record_shard(doc_id)] = true;
+            }
+        }
+    }
+    let mut grouped = vec![Vec::new(); RECORD_SHARD_COUNT];
+    for (doc_id, record) in records_map {
+        let shard = record_shard(doc_id);
+        if changed[shard] {
+            grouped[shard].push(record.as_ref());
+        }
+    }
+    let shards = grouped
+        .into_iter()
+        .enumerate()
+        .filter(|(shard, _)| changed[*shard])
+        .map(|(shard, records)| {
+            let bytes = (!records.is_empty())
+                .then(|| encode_record_shard(records))
+                .transpose()?;
+            Ok((shard, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut lifecycle = chunk_lifecycle_map.values().collect::<Vec<_>>();
+    lifecycle.sort_by(|a, b| a.chunk_id.cmp(&b.chunk_id));
     Ok(PreparedSemanticState {
-        records,
+        shards,
+        complete: persisted.is_none(),
         lifecycle: serde_json::to_string(&lifecycle)?,
         core: snapshot.map(MemoryIndex::to_bytes).transpose()?,
     })
@@ -957,22 +1116,79 @@ pub(crate) fn persist_prepared_semantic_state(
     let Some(semantic_dir) = paths.semantic_dir.as_ref() else {
         return Ok(());
     };
-    fs::create_dir_all(semantic_dir)?;
-    write_file_atomic_with(
-        &semantic_records_path(paths).expect("records path"),
-        false,
-        |file| {
-            let mut decoder = zstd::stream::read::Decoder::new(prepared.records.as_slice())?;
-            std::io::copy(&mut decoder, file)?;
-            Ok(())
-        },
-    )?;
+    let shard_dir = record_shard_dir(paths).expect("shard dir");
+    fs::create_dir_all(&shard_dir)?;
+    let previous = read_record_shard_manifest(&shard_dir)?;
+    anyhow::ensure!(
+        prepared.complete || previous.is_some(),
+        "partial checkpoint without a record shard manifest at {}",
+        shard_dir.display()
+    );
+    let generation = previous.as_ref().map_or(0, |manifest| manifest.generation) + 1;
+    let mut files = match previous {
+        Some(manifest) if !prepared.complete => manifest.files,
+        _ => vec![None; RECORD_SHARD_COUNT],
+    };
+    for (shard, bytes) in &prepared.shards {
+        files[*shard] = match bytes {
+            Some(bytes) => {
+                let name = record_shard_file_name(*shard, generation);
+                write_file_atomic_with(&shard_dir.join(&name), false, |file| {
+                    let mut decoder = zstd::stream::read::Decoder::new(bytes.as_slice())?;
+                    std::io::copy(&mut decoder, file)?;
+                    Ok(())
+                })?;
+                Some(name)
+            }
+            None => None,
+        };
+    }
     write_text_file_atomic(
         &chunk_lifecycle_path(paths).expect("lifecycle path"),
         &prepared.lifecycle,
     )?;
     if let Some(core) = &prepared.core {
         write_bytes_file_atomic(&semantic_core_path(paths).expect("core path"), core)?;
+    }
+    let manifest = RecordShardManifest {
+        schema_version: STORE_SCHEMA_VERSION,
+        layout_version: STORE_LAYOUT_VERSION.to_string(),
+        generation,
+        files,
+    };
+    write_text_file_atomic(
+        &shard_dir.join(RECORD_SHARD_MANIFEST_FILE),
+        &serde_json::to_string(&manifest)?,
+    )?;
+    // Shards the manifest no longer names, including any left by a checkpoint
+    // that stopped before its manifest was written.
+    let referenced = manifest
+        .files
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    for entry in fs::read_dir(&shard_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.ends_with(".json")
+            && name != RECORD_SHARD_MANIFEST_FILE
+            && !referenced.contains(name)
+        {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    if prepared.complete {
+        match fs::remove_file(semantic_dir.join(SEMANTIC_RECORDS_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }
@@ -982,11 +1198,12 @@ pub(crate) fn persist_semantic_state(
     snapshot: Option<&MemoryIndex>,
     records: &HashMap<String, Arc<DocRecord>>,
     lifecycle: &HashMap<String, ChunkLifecycleMeta>,
+    persisted: Option<&HashMap<String, Arc<DocRecord>>>,
 ) -> Result<()> {
     if paths.semantic_dir.is_none() {
         return Ok(());
     }
-    let prepared = prepare_semantic_state(snapshot, records, lifecycle)?;
+    let prepared = prepare_semantic_state(snapshot, records, lifecycle, persisted)?;
     persist_prepared_semantic_state(paths, &prepared)
 }
 
@@ -1149,11 +1366,15 @@ mod checkpoint_buffer_tests {
         }))
         .unwrap();
         let records = HashMap::from([("large".to_string(), Arc::new(record))]);
-        let mut prepared = prepare_semantic_state(None, &records, &HashMap::new()).unwrap();
+        let mut prepared = prepare_semantic_state(None, &records, &HashMap::new(), None).unwrap();
+        let retained = prepared
+            .shards
+            .iter()
+            .flat_map(|(_, bytes)| bytes.as_ref().map(Vec::len))
+            .sum::<usize>();
         assert!(
-            prepared.records.len() < content.len() / 10,
-            "checkpoint retained {} bytes for {} bytes of repeated source text",
-            prepared.records.len(),
+            retained < content.len() / 10,
+            "checkpoint retained {retained} bytes for {} bytes of repeated source text",
             content.len()
         );
         let root = std::env::temp_dir()
@@ -1161,11 +1382,6 @@ mod checkpoint_buffer_tests {
             .unwrap()
             .join(format!("mb-checkpoint-buffer-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        eprintln!(
-            "retained checkpoint bytes={}, source bytes={}",
-            prepared.records.len(),
-            content.len()
-        );
         let paths = StorePaths {
             root: Some(root.clone()),
             semantic_dir: Some(root.clone()),
@@ -1173,10 +1389,16 @@ mod checkpoint_buffer_tests {
             metadata_path: None,
         };
         persist_prepared_semantic_state(&paths, &prepared).unwrap();
-        let payload: serde_json::Value = serde_json::from_reader(
-            fs::File::open(semantic_records_path(&paths).unwrap()).unwrap(),
-        )
-        .unwrap();
+        let shard_dir = record_shard_dir(&paths).unwrap();
+        let manifest = read_record_shard_manifest(&shard_dir).unwrap().unwrap();
+        assert_eq!(
+            manifest.files.iter().flatten().count(),
+            1,
+            "a shard with no records got a file"
+        );
+        let shard_path = shard_dir.join(manifest.files[record_shard("large")].as_ref().unwrap());
+        let payload: serde_json::Value =
+            serde_json::from_reader(fs::File::open(&shard_path).unwrap()).unwrap();
         assert_eq!(
             payload["records"][0]["content"].as_str(),
             Some(content.as_str())
@@ -1187,20 +1409,209 @@ mod checkpoint_buffer_tests {
             fs::read_to_string(chunk_lifecycle_path(&paths).unwrap()).unwrap(),
             "[]"
         );
-        let records_path = semantic_records_path(&paths).unwrap();
-        let prior = fs::read(&records_path).unwrap();
-        prepared.records.truncate(8);
+        let prior = fs::read(&shard_path).unwrap();
+        let (_, bytes) = prepared
+            .shards
+            .iter_mut()
+            .find(|(shard, _)| *shard == record_shard("large"))
+            .unwrap();
+        bytes.as_mut().unwrap().truncate(8);
         assert!(persist_prepared_semantic_state(&paths, &prepared).is_err());
         assert_eq!(
-            fs::read(&records_path).unwrap(),
+            fs::read(&shard_path).unwrap(),
             prior,
             "failed streaming write replaced a valid checkpoint"
         );
         assert_eq!(
-            fs::read_dir(&root).unwrap().count(),
+            fs::read_dir(&shard_dir).unwrap().count(),
             2,
             "failed streaming write left a temporary output file"
         );
         fs::remove_dir_all(root).unwrap();
     }
+
+    fn record(doc_id: &str, content: &str) -> Arc<DocRecord> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "doc_id":doc_id, "source":format!("test://{doc_id}"), "content":content,
+                "timestamp":null, "doc_length":content.len(), "author_agent":null,
+                "group_id":null, "probable_topic":null, "doc_type_guess":null,
+                "headings":[], "key_entities":[], "important_terms":[],
+                "section_chunks":[], "embedding":null, "top_claims":[],
+                "provenance":{"source":format!("test://{doc_id}"), "timestamp":null,
+                    "ner_provider":"heuristic", "term_ranker":"yake", "index_version":"test"}
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn temp_paths(name: &str) -> StorePaths {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("mb-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        StorePaths {
+            root: Some(root.clone()),
+            semantic_dir: Some(root),
+            lexical_dir: None,
+            metadata_path: None,
+        }
+    }
+
+    fn loaded_contents(paths: &StorePaths) -> (HashMap<String, String>, bool) {
+        let (_, records, _, _, from_shards) = load_semantic_state(
+            paths,
+            &MemoryIndexLayout::Segmented {
+                query_top_n: 4,
+                routing_strategy: crate::segments::SegmentRoutingStrategy::SparseOverlap,
+            },
+        )
+        .unwrap();
+        let contents = records
+            .into_iter()
+            .map(|(doc_id, record)| (doc_id, record.content.to_string()))
+            .collect();
+        (contents, from_shards)
+    }
+
+    #[test]
+    fn checkpoint_rewrites_only_the_shards_that_changed() {
+        let paths = temp_paths("checkpoint-shards");
+        let persisted = (0..200)
+            .map(|i| (format!("doc-{i}"), record(&format!("doc-{i}"), "first")))
+            .collect::<HashMap<_, _>>();
+        persist_semantic_state(&paths, None, &persisted, &HashMap::new(), None).unwrap();
+
+        let mut records = persisted.clone();
+        records.insert("doc-7".into(), record("doc-7", "second"));
+        records.remove("doc-42");
+        records.insert("doc-new".into(), record("doc-new", "added"));
+        let prepared =
+            prepare_semantic_state(None, &records, &HashMap::new(), Some(&persisted)).unwrap();
+
+        let mut written = prepared
+            .shards
+            .iter()
+            .map(|(shard, _)| *shard)
+            .collect::<Vec<_>>();
+        written.sort();
+        let mut expected = vec![
+            record_shard("doc-7"),
+            record_shard("doc-42"),
+            record_shard("doc-new"),
+        ];
+        expected.sort();
+        expected.dedup();
+        assert_eq!(written, expected, "checkpoint rewrote unchanged shards");
+        assert!(!prepared.complete);
+
+        persist_prepared_semantic_state(&paths, &prepared).unwrap();
+        let (contents, from_shards) = loaded_contents(&paths);
+        assert!(from_shards);
+        assert_eq!(contents.len(), 200);
+        assert_eq!(contents["doc-7"], "second");
+        assert_eq!(contents["doc-new"], "added");
+        assert!(!contents.contains_key("doc-42"));
+        fs::remove_dir_all(paths.root.unwrap()).unwrap();
+    }
+
+    /// A checkpoint that stops after writing some of its shards must leave the
+    /// previous checkpoint whole, not a mix of new and old shards.
+    #[test]
+    fn checkpoint_stopped_partway_keeps_the_previous_records() {
+        let paths = temp_paths("checkpoint-partial");
+        let persisted = (0..200)
+            .map(|i| (format!("doc-{i}"), record(&format!("doc-{i}"), "first")))
+            .collect::<HashMap<_, _>>();
+        persist_semantic_state(&paths, None, &persisted, &HashMap::new(), None).unwrap();
+
+        let records = persisted
+            .keys()
+            .map(|doc_id| (doc_id.clone(), record(doc_id, "second")))
+            .collect::<HashMap<_, _>>();
+        let mut prepared =
+            prepare_semantic_state(None, &records, &HashMap::new(), Some(&persisted)).unwrap();
+        assert!(prepared.shards.len() > 1);
+        // The last shard fails to write, after the others are on disk.
+        let (_, bytes) = prepared.shards.last_mut().unwrap();
+        bytes.as_mut().unwrap().truncate(8);
+        assert!(persist_prepared_semantic_state(&paths, &prepared).is_err());
+
+        let (contents, from_shards) = loaded_contents(&paths);
+        assert!(from_shards);
+        assert_eq!(contents.len(), 200);
+        assert!(
+            contents.values().all(|content| content == "first"),
+            "a stopped checkpoint mixed new shards into the previous one"
+        );
+
+        // The next checkpoint completes and removes what the stopped one left.
+        let prepared =
+            prepare_semantic_state(None, &records, &HashMap::new(), Some(&persisted)).unwrap();
+        persist_prepared_semantic_state(&paths, &prepared).unwrap();
+        let (contents, _) = loaded_contents(&paths);
+        assert!(contents.values().all(|content| content == "second"));
+        let shard_dir = record_shard_dir(&paths).unwrap();
+        let manifest = read_record_shard_manifest(&shard_dir).unwrap().unwrap();
+        assert_eq!(
+            fs::read_dir(&shard_dir).unwrap().count(),
+            manifest.files.iter().flatten().count() + 1,
+            "unreferenced shard files were left behind"
+        );
+        fs::remove_dir_all(paths.root.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn first_checkpoint_moves_a_legacy_records_file_into_shards() {
+        let paths = temp_paths("checkpoint-legacy");
+        let records = (0..20)
+            .map(|i| (format!("doc-{i}"), record(&format!("doc-{i}"), "legacy")))
+            .collect::<HashMap<_, _>>();
+        let legacy = serde_json::json!({
+            "schema_version": STORE_SCHEMA_VERSION,
+            "layout_version": STORE_LAYOUT_VERSION,
+            "records": records.values().map(|record| {
+                let mut value = serde_json::to_value(record.as_ref()).unwrap();
+                value["content"] = serde_json::Value::String(record.content.to_string());
+                value
+            }).collect::<Vec<_>>(),
+        });
+        let legacy_path = semantic_records_path(&paths).unwrap();
+        fs::write(&legacy_path, legacy.to_string()).unwrap();
+
+        let (contents, from_shards) = loaded_contents(&paths);
+        assert!(!from_shards, "a legacy file is not a shard set");
+        assert_eq!(contents.len(), 20);
+
+        persist_semantic_state(&paths, None, &records, &HashMap::new(), None).unwrap();
+        assert!(!legacy_path.exists(), "the legacy file outlived its shards");
+        let (contents, from_shards) = loaded_contents(&paths);
+        assert!(from_shards);
+        assert_eq!(contents.len(), 20);
+        assert!(contents.values().all(|content| content == "legacy"));
+        fs::remove_dir_all(paths.root.unwrap()).unwrap();
+    }
+}
+
+/// Every persisted record as JSON, from the shard set or the legacy file.
+#[cfg(test)]
+pub(crate) fn persisted_record_values(semantic_dir: &Path) -> Vec<serde_json::Value> {
+    let read = |path: &Path| -> serde_json::Value {
+        serde_json::from_reader(fs::File::open(path).unwrap()).unwrap()
+    };
+    let shard_dir = semantic_dir.join(RECORD_SHARD_DIR);
+    let mut records = Vec::new();
+    if let Some(manifest) = read_record_shard_manifest(&shard_dir).unwrap() {
+        for name in manifest.files.iter().flatten() {
+            let payload = read(&shard_dir.join(name));
+            records.extend(payload["records"].as_array().unwrap().iter().cloned());
+        }
+    } else {
+        let payload = read(&semantic_dir.join(SEMANTIC_RECORDS_FILE));
+        records.extend(payload["records"].as_array().unwrap().iter().cloned());
+    }
+    records.sort_by(|a, b| a["doc_id"].as_str().cmp(&b["doc_id"].as_str()));
+    records
 }

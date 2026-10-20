@@ -1030,7 +1030,7 @@ fn index_store_persists_and_reloads_semantic_state() {
     drop(first);
 
     let semantic_dir = corpus_root.join(".membrick").join("semantic");
-    assert!(semantic_dir.join("records.json").exists());
+    assert!(semantic_dir.join("records-shards/manifest.json").exists());
     assert!(semantic_dir.join("core.bin").exists());
 
     let mut second =
@@ -1075,7 +1075,7 @@ fn segmented_store_reloads_without_a_compatibility_core() {
     drop(first);
 
     let semantic_dir = index_root.join("semantic");
-    assert!(semantic_dir.join("records.json").exists());
+    assert!(semantic_dir.join("records-shards/manifest.json").exists());
     assert!(!semantic_dir.join("core.bin").exists());
     let manifest: SegmentManifest = serde_json::from_str(
         &fs::read_to_string(semantic_dir.join("segments.json"))

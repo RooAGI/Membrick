@@ -35,7 +35,7 @@ To evaluate the real persisted Membrick project memory corpus instead:
 
 ```bash
 cargo run --bin project_memory_recency_benchmark -- \
-  --records .membrick/memory/semantic/records.json
+  --semantic-dir .membrick/memory/semantic
 ```
 
 This reports the corpus freshness distribution and the freshness distribution

@@ -331,9 +331,8 @@ Current metadata shape:
 Persistence:
 
 - lifecycle is written with semantic state under `.membrick/semantic/`
-- currently persisted both:
-  - inline in `records.json` as `chunk_lifecycle`
-  - in a dedicated `chunk_lifecycle.json`
+- persisted in a dedicated `chunk_lifecycle.json` (stores with the older
+  single `records.json` also carried it inline there as `chunk_lifecycle`)
 
 Transition behavior:
 
@@ -495,8 +494,15 @@ Persistent stores now use `.membrick/semantic/` for semantic state.
 
 Current files:
 
-- `records.json`
-  - persisted semantic document records
+- `records-shards/`
+  - persisted semantic document records, split into 64 files by a hash of
+    the doc id, so a checkpoint rewrites only the files that hold a changed
+    record
+  - `manifest.json` names the file for each shard. A checkpoint writes its
+    changed shards under new names and replaces the manifest last, so a
+    checkpoint that stops partway leaves the previous one whole
+  - a store with the older single `records.json` still loads it, and its
+    next checkpoint moves the records into shards and removes the file
 - `core.bin`
   - binary semantic core used to rebuild the semantic `MemoryIndex`
 

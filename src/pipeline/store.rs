@@ -259,9 +259,14 @@ pub struct IndexStore {
     store_revision: u64,
     dirty: bool,
     checkpoint_pending: bool,
+    /// The records whose shards are on disk, so a checkpoint rewrites only
+    /// the shards that changed since. `None` writes every shard.
+    persisted_records: Option<Arc<HashMap<String, Arc<DocRecord>>>>,
 }
 
 pub(crate) struct PreparedCheckpoint {
+    /// The records this checkpoint writes, which become the persisted set.
+    records: Arc<HashMap<String, Arc<DocRecord>>>,
     semantic: super::PreparedSemanticState,
     manifest: Option<String>,
     /// Relation cache for the same generation, when one could be prepared.
@@ -444,7 +449,7 @@ impl IndexStore {
     /// Persist matching index and records from the captured generation.
     /// The MemoryService owner serializes all persistence operations.
     pub(crate) fn checkpoint_publication_view(
-        &self,
+        &mut self,
         view: &Self,
         prepared: Option<&PreparedCheckpoint>,
     ) -> Result<()> {
@@ -455,6 +460,7 @@ impl IndexStore {
         persist_store_metadata(&self.store_paths, &self.options)?;
         if let Some(prepared) = prepared {
             super::persist_prepared_semantic_state(&self.store_paths, &prepared.semantic)?;
+            self.persisted_records = Some(prepared.records.clone());
             if let Some(manifest) = &prepared.manifest {
                 let path = self
                     .store_paths
@@ -514,7 +520,13 @@ impl IndexStore {
             None
         });
         Ok(PreparedCheckpoint {
-            semantic: super::prepare_semantic_state(single, &self.records, &self.chunk_lifecycle)?,
+            records: self.records.clone(),
+            semantic: super::prepare_semantic_state(
+                single,
+                &self.records,
+                &self.chunk_lifecycle,
+                self.persisted_records.as_deref(),
+            )?,
             manifest,
             relations,
             catalog,
@@ -618,6 +630,7 @@ impl IndexStore {
             store_revision: self.snapshot_revision,
             dirty: false,
             checkpoint_pending: false,
+            persisted_records: self.persisted_records.clone(),
         }
     }
 
@@ -928,6 +941,7 @@ impl IndexStore {
             snapshot,
             dirty: false,
             checkpoint_pending: false,
+            persisted_records: None,
         })
     }
 
@@ -982,8 +996,11 @@ impl IndexStore {
                 .map(|path| path.join(SEMANTIC_RELATIONS_FILE)),
         );
         let state_load_started = Instant::now();
-        let (source_docs, records, chunk_lifecycle, loaded_snapshot) =
+        let (source_docs, records, chunk_lifecycle, loaded_snapshot, from_shards) =
             load_semantic_state(&store_paths, &options.memory_index_layout)?;
+        // Taken before any change to the loaded records, so it matches the
+        // shards on disk.
+        let persisted_records = from_shards.then(|| Arc::new(records.clone()));
         let state_load_ms = state_load_started.elapsed().as_millis() as u64;
         let source_content_bytes = source_docs
             .values()
@@ -1151,6 +1168,7 @@ impl IndexStore {
             store_revision: 0,
             dirty: false,
             checkpoint_pending: false,
+            persisted_records,
         })
     }
 
@@ -1191,20 +1209,28 @@ impl IndexStore {
         )
     }
 
-    fn persist_compatibility_state(&self) -> Result<()> {
-        self.persist_compatibility_state_to(&self.store_paths)
-    }
-
-    fn persist_compatibility_state_to(&self, paths: &StorePaths) -> Result<()> {
+    fn persist_compatibility_state(&mut self) -> Result<()> {
+        let paths = &self.store_paths;
         if paths.semantic_dir.is_none() {
             return Ok(());
         }
+        let persisted = self.persisted_records.as_deref();
         match self.snapshot.as_deref().expect("snapshot should exist") {
-            MemoryIndexSnapshot::Single(index) => {
-                persist_semantic_state(paths, Some(index), &self.records, &self.chunk_lifecycle)?
-            }
+            MemoryIndexSnapshot::Single(index) => persist_semantic_state(
+                paths,
+                Some(index),
+                &self.records,
+                &self.chunk_lifecycle,
+                persisted,
+            )?,
             MemoryIndexSnapshot::Segmented(segmented) => {
-                persist_semantic_state(paths, None, &self.records, &self.chunk_lifecycle)?;
+                persist_semantic_state(
+                    paths,
+                    None,
+                    &self.records,
+                    &self.chunk_lifecycle,
+                    persisted,
+                )?;
                 persist_segment_manifest(paths, &segmented.manifest())?;
                 if let Some(root) = &paths.root {
                     match segmented.encode_catalog_cache() {
@@ -1216,6 +1242,7 @@ impl IndexStore {
                 }
             }
         }
+        self.persisted_records = Some(self.records.clone());
         super::persist_semantic_relations_best_effort(
             paths,
             &self.semantic_relations,
@@ -1363,6 +1390,7 @@ impl IndexStore {
             store_revision: 1,
             dirty: false,
             checkpoint_pending: false,
+            persisted_records: None,
         })
     }
 
@@ -2709,10 +2737,9 @@ mod tests {
         doc.links = vec!["original-observation".into()];
         owner.upsert(doc);
         owner.refresh().unwrap();
-        let actual: serde_json::Value = serde_json::from_reader(
-            std::fs::File::open(root.join("semantic/records.json")).unwrap(),
-        )
-        .unwrap();
+        let actual = serde_json::json!({
+            "records": super::super::persisted_record_values(&root.join("semantic")),
+        });
         let expected: serde_json::Value = serde_json::from_str(
             &serde_json::to_string(&PersistedDocRecord::from(
                 owner.record_by_id("stable").unwrap().clone(),
