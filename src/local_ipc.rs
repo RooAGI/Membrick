@@ -630,9 +630,12 @@ fn queue_dirs(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&base, fs::Permissions::from_mode(0o700))?;
-        for directory in [&pending, &claimed, &responses] {
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        // Only fix permissions that differ. Setting them changes the folder,
+        // and the resident's watcher on `pending` would wake and scan again.
+        for directory in [&base, &pending, &claimed, &responses] {
+            if fs::metadata(directory)?.permissions().mode() & 0o777 != 0o700 {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
         }
     }
     Ok((pending, claimed, responses))
@@ -1583,6 +1586,33 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The resident watches `pending` and scans the queue on every event, and
+    /// every scan prepares the queue folders. Rewriting their permissions
+    /// changes the folders, which wakes the watcher again, so an idle resident
+    /// would scan in a loop.
+    #[cfg(unix)]
+    #[test]
+    fn preparing_existing_queue_dirs_leaves_them_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let root = TempDir::new();
+        let (pending, claimed, responses) = queue_dirs(&root.0).unwrap();
+        let base = pending.parent().unwrap().to_path_buf();
+        let change_times = || {
+            [&base, &pending, &claimed, &responses]
+                .map(|directory| std::fs::metadata(directory).unwrap().ctime_nsec())
+        };
+        let before = change_times();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        queue_dirs(&root.0).unwrap();
+
+        assert_eq!(
+            change_times(),
+            before,
+            "preparing the queue changed its folders"
+        );
     }
 
     #[test]
