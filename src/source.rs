@@ -45,7 +45,9 @@ impl TimestampKind {
 pub struct SourceDocument {
     pub doc_id: String,
     pub source: String,
-    pub content: String,
+    /// Shared with the record built from this document, so the store keeps
+    /// one copy of the text.
+    pub content: crate::index::SharedText,
     pub concept: String,
     #[serde(default)]
     pub group_id: Option<String>,
@@ -206,7 +208,7 @@ impl SourceDocument {
         Self {
             doc_id,
             source,
-            content,
+            content: content.into(),
             concept,
             group_id,
             headings,

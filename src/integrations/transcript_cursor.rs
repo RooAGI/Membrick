@@ -61,7 +61,68 @@ pub(crate) struct TranscriptSlice {
     pub end: u64,
     /// Invalid cursor metadata was reset before this replay.
     pub restarted: bool,
+    /// Compaction epoch of every line in this slice: the number of
+    /// compactions recorded before it. A batch never spans a compaction.
+    pub epoch: u64,
     checkpoint: serde_json::Value,
+}
+
+/// Whether a transcript line records a context compaction. Codex writes a
+/// top-level `compacted` record; Claude Code writes a `compact_boundary`
+/// system record.
+fn is_compaction_marker(line: &[u8]) -> bool {
+    let candidate =
+        contains_bytes(line, b"\"compacted\"") || contains_bytes(line, b"compact_boundary");
+    if !candidate {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    let kind = value.get("type").and_then(serde_json::Value::as_str);
+    kind == Some("compacted")
+        || (kind == Some("system")
+            && value.get("subtype").and_then(serde_json::Value::as_str) == Some("compact_boundary"))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Place a captured document in the segment of its compaction epoch. The
+/// `session_id` filter is unchanged, so session-scoped lookups still see the
+/// whole session.
+pub(crate) fn assign_session_epoch(document: &mut crate::SourceDocument, epoch: u64) {
+    if epoch == 0 {
+        return;
+    }
+    if let Some(group) = document.group_id.as_deref() {
+        document.group_id = Some(crate::provider_sources::session_epoch_group(group, epoch));
+    }
+    document
+        .filters
+        .insert("session_epoch".into(), epoch.to_string());
+}
+
+/// Count compactions recorded before `end`. Used once for a cursor written
+/// before epochs were tracked; later cursors store the epoch.
+fn count_compactions(file: &mut fs::File, end: u64) -> Result<u64> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(file.take(end));
+    let mut line = Vec::new();
+    let mut count = 0;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if is_compaction_marker(&line) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Read one bounded batch of complete lines after the stored position. A
@@ -162,7 +223,7 @@ fn read_next_batch_until(
             &recovery.to_string(),
         )?;
         mark_captured(state_dir, session_id, 0)?;
-        eprintln!(
+        tracing::info!(
             "Recovered transcript cursor {}: {reason}; replaying from zero",
             path.display()
         );
@@ -170,10 +231,20 @@ fn read_next_batch_until(
     } else {
         stored.expect("validated cursor offset")
     };
+    let epoch = match saved
+        .as_ref()
+        .and_then(|v| v.get("epoch"))
+        .and_then(|v| v.as_u64())
+    {
+        _ if start == 0 => 0,
+        Some(epoch) => epoch,
+        None => count_compactions(&mut file, start)?,
+    };
     file.seek(SeekFrom::Start(start))?;
     let end = target_bytes.unwrap_or(length).min(length);
     let mut reader = BufReader::new(file.take(end.saturating_sub(start)));
     let mut bytes = Vec::with_capacity(max_batch_bytes.min(64 * 1024));
+    let mut compacted = false;
     loop {
         let mut line = Vec::new();
         let read = reader
@@ -186,6 +257,11 @@ fn read_next_batch_until(
             break;
         }
         bytes.extend_from_slice(&line);
+        // The marker closes its epoch; the next batch starts the new one.
+        if is_compaction_marker(&line) {
+            compacted = true;
+            break;
+        }
         if bytes.len() >= max_batch_bytes {
             break;
         }
@@ -194,6 +270,7 @@ fn read_next_batch_until(
     let mut file = reader.into_inner().into_inner();
     let checkpoint = serde_json::json!({
         "offset": start + complete as u64,
+        "epoch": epoch + u64::from(compacted),
         "transcript_anchor": transcript_anchor(&mut file, start + complete as u64)?,
     });
     Ok(TranscriptSlice {
@@ -201,6 +278,7 @@ fn read_next_batch_until(
         start,
         end: start + complete as u64,
         restarted,
+        epoch,
         checkpoint,
     })
 }
@@ -571,6 +649,80 @@ mod tests {
             .with_extension("json.recovery")
             .exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn compaction_transcript() -> String {
+        concat!(
+            "{\"type\":\"response_item\",\"payload\":{\"text\":\"before\"}}\n",
+            "{\"type\":\"compacted\",\"payload\":{\"window_number\":1}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"text\":\"middle\"}}\n",
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\"}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"text\":\"after\"}}\n",
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn batches_end_at_compaction_markers_and_carry_their_epoch() {
+        let root = temp_dir("epochs");
+        let transcript = root.join("t.jsonl");
+        fs::write(&transcript, compaction_transcript()).unwrap();
+        let mut slices = Vec::new();
+        replay_batches(&root, "s", &transcript, |slice| {
+            slices.push((slice.epoch, slice.text.clone()));
+            Ok(())
+        })
+        .unwrap();
+        let epochs = slices.iter().map(|(epoch, _)| *epoch).collect::<Vec<_>>();
+        assert_eq!(epochs, [0, 1, 2]);
+        assert!(slices[0].1.contains("before") && slices[0].1.contains("\"compacted\""));
+        assert!(slices[1].1.contains("middle") && slices[1].1.contains("compact_boundary"));
+        assert!(slices[2].1.contains("after"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appended_lines_keep_the_epoch_saved_in_the_cursor() {
+        let root = temp_dir("epoch-resume");
+        let transcript = root.join("t.jsonl");
+        fs::write(&transcript, compaction_transcript()).unwrap();
+        replay_batches(&root, "s", &transcript, |_| Ok(())).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(b"{\"type\":\"response_item\",\"payload\":{\"text\":\"later\"}}\n")
+            .unwrap();
+        let slice = read_since_last_capture(&root, "s", &transcript).unwrap();
+        assert_eq!(slice.epoch, 2);
+        assert!(slice.text.contains("later"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cursor_without_a_saved_epoch_counts_earlier_compactions() {
+        let root = temp_dir("epoch-legacy-cursor");
+        let transcript = root.join("t.jsonl");
+        let contents = compaction_transcript();
+        fs::write(&transcript, &contents).unwrap();
+        // A cursor written before epochs were tracked: an offset only.
+        let after_both_markers = contents.rfind("{\"type\":\"response_item\"").unwrap();
+        mark_captured(&root, "s", after_both_markers as u64).unwrap();
+        let slice = read_since_last_capture(&root, "s", &transcript).unwrap();
+        assert_eq!(slice.epoch, 2);
+        assert!(slice.text.contains("after"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn text_mentioning_compaction_is_not_a_marker() {
+        assert!(!is_compaction_marker(
+            b"{\"type\":\"response_item\",\"payload\":{\"text\":\"the \\\"compacted\\\" record\"}}\n"
+        ));
+        assert!(!is_compaction_marker(b"not json compact_boundary\n"));
+        assert!(is_compaction_marker(
+            b"{\"type\":\"compacted\",\"payload\":{}}\n"
+        ));
     }
 
     #[test]

@@ -414,7 +414,8 @@ pub fn run_status_line() -> Result<()> {
 }
 
 pub fn run_server(root: &Path, options: ClaudeCodeServerOptions<'_>) -> Result<()> {
-    mcp_index::trace_event("server-start");
+    crate::local_ipc::ensure_provider_resident(root, "claude")?;
+    tracing::debug!("MCP server starting");
     let mcp = ClaudeMcp {
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
@@ -461,7 +462,7 @@ impl ClaudeMcp {
                     file_changes,
                 )
             {
-                eprintln!("warning: failed to save workspace file changes: {error:#}");
+                tracing::warn!("failed to save workspace file changes: {error:#}");
             }
             if workspace_index_changed {
                 *store = None;
@@ -505,9 +506,9 @@ impl ClaudeMcp {
             &mut reader,
             &mut writer,
             |request| self.handle_request(request),
-            |method| mcp_index::trace_event(&format!("request:{method}")),
-            |method, error| mcp_index::trace_event(&format!("request-error:{method}:{error:#}")),
-            || mcp_index::trace_event("response-written"),
+            |method| tracing::debug!(method, "MCP request received"),
+            |method, error| tracing::debug!(method, "MCP request failed: {error:#}"),
+            || tracing::debug!("MCP response written"),
         )
     }
 
@@ -1458,7 +1459,7 @@ mod tests {
         let document = SourceDocument {
             doc_id: "doc-1".to_string(),
             source: "docs/install.md".to_string(),
-            content: "docker install guide".to_string(),
+            content: "docker install guide".into(),
             concept: "Install".to_string(),
             group_id: None,
             filters: std::collections::BTreeMap::new(),
@@ -1557,7 +1558,7 @@ mod tests {
         memory.upsert(SourceDocument {
             doc_id: "memory-1".to_string(),
             source: "claude-code://project/session/outcome".to_string(),
-            content: "The durable routing codename is cobalt".to_string(),
+            content: "The durable routing codename is cobalt".into(),
             concept: "Claude Code outcome".to_string(),
             group_id: Some("claude-session:session".to_string()),
             filters: std::collections::BTreeMap::new(),

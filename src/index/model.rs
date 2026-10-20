@@ -47,14 +47,16 @@ impl ClaimStatus {
 pub struct ClaimEvidence {
     pub source_document_id: String,
     pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Evidence is also written to the binary relation cache, which reads
+    // fields by position, so the optional fields are always written.
+    #[serde(default)]
     pub source_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_chunk_id: Option<String>,
     pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub start_byte: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub end_byte: Option<usize>,
 }
 
@@ -137,11 +139,107 @@ mod claim_contract_tests {
     }
 }
 
+/// Read-only text that clones by reference. A record and a chunk that covers
+/// the whole record point at one copy of the text.
+#[derive(Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SharedText(Arc<str>);
+
+impl SharedText {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether both values point at the same text in memory.
+    pub fn shares_with(&self, other: &SharedText) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::ops::Deref for SharedText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SharedText {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for SharedText {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SharedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl std::fmt::Display for SharedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl From<String> for SharedText {
+    fn from(text: String) -> Self {
+        Self(Arc::from(text))
+    }
+}
+
+impl From<&str> for SharedText {
+    fn from(text: &str) -> Self {
+        Self(Arc::from(text))
+    }
+}
+
+impl From<SharedText> for String {
+    fn from(text: SharedText) -> Self {
+        text.0.to_string()
+    }
+}
+
+impl PartialEq<str> for SharedText {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SharedText {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<String> for SharedText {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+
+impl Serialize for SharedText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionChunk {
     pub chunk_id: String,
     pub heading: String,
-    pub content: String,
+    pub content: SharedText,
     #[serde(default)]
     pub start_line: usize,
     #[serde(default)]
@@ -157,7 +255,7 @@ pub struct DocRecord {
     pub doc_id: String,
     pub source: String,
     #[serde(skip_serializing)]
-    pub content: String,
+    pub content: SharedText,
     pub timestamp: Option<String>,
     pub doc_length: usize,
     pub author_agent: Option<String>,
@@ -202,6 +300,19 @@ pub struct DocRecord {
     /// index builder. No recomputation at index time.
     #[serde(default)]
     pub semantic_tags: Vec<String>,
+}
+
+impl DocRecord {
+    /// Point every chunk whose text is the record's whole text at the
+    /// record's copy. Most records are a single chunk, so without this the
+    /// store would hold all of its text twice.
+    pub fn share_whole_record_chunks(&mut self) {
+        for chunk in &mut self.section_chunks {
+            if !chunk.content.shares_with(&self.content) && chunk.content == self.content {
+                chunk.content = self.content.clone();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,7 +529,7 @@ impl IntervalTree {
 
 #[derive(Serialize)]
 pub struct MemoryIndex {
-    pub docs: HashMap<String, DocRecord>,
+    pub docs: HashMap<String, Arc<DocRecord>>,
     pub entity_to_docs: HashMap<String, Vec<EntityPosting>>,
     pub term_to_docs: HashMap<String, Vec<TermPosting>>,
     pub claim_to_docs: HashMap<String, Vec<TermPosting>>,
@@ -472,7 +583,9 @@ pub struct MemoryIndex {
     #[serde(skip_serializing)]
     pub(crate) doc_rerank_texts: Vec<String>,
     #[serde(skip_serializing)]
-    pub(crate) doc_rerank_tokens: Vec<Vec<String>>,
+    pub(crate) doc_rerank_tokens: Vec<Vec<u32>>,
+    #[serde(skip_serializing)]
+    pub(crate) rerank_token_lexicon: Vec<String>,
     #[serde(skip_serializing)]
     pub(crate) doc_topic_tokens: Vec<Vec<String>>,
     #[serde(skip_serializing)]
@@ -512,6 +625,14 @@ pub(crate) struct LexicalIndex {
     /// Tag->doc_ids JSON mapping for session_doc provenance (Luyi 2026-10-07).
     /// e.g. {"weekend": ["doc-1"], "food": ["doc-2"]}. STORED only.
     pub(crate) tag_links_f: Field,
+}
+
+/// Lexical changes to apply to a stable on-disk segment index. `None` means
+/// reconcile the index from the complete record set; a delta updates only
+/// these IDs and removes IDs that no longer belong to the segment.
+pub(crate) struct LexicalIndexDelta {
+    pub(crate) changed_doc_ids: HashSet<String>,
+    pub(crate) removed_doc_ids: HashSet<String>,
 }
 
 /// A live corpus-wide BM25 statistics provider assembled from shard searchers.

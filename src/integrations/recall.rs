@@ -711,7 +711,7 @@ mod tests {
         SectionChunk {
             chunk_id: "chunk:test".to_string(),
             heading: "(document)".to_string(),
-            content: content.to_string(),
+            content: content.into(),
             start_line,
             end_line,
             timestamp: None,
@@ -730,7 +730,7 @@ mod tests {
         DocRecord {
             doc_id: doc_id.to_string(),
             source: source.to_string(),
-            content: content.to_string(),
+            content: content.into(),
             timestamp: Some("2026-08-21T23:46:12+00:00".to_string()),
             doc_length: content.len(),
             author_agent: None,
@@ -843,8 +843,7 @@ mod tests {
             memory.upsert(SourceDocument {
                 doc_id: format!("{provider}-session-1"),
                 source: format!("{provider}://project/session-1/outcome"),
-                content: "The provider-aware recall decision was recorded in this session."
-                    .to_string(),
+                content: "The provider-aware recall decision was recorded in this session.".into(),
                 concept: "outcome".to_string(),
                 group_id: Some(format!("{provider}-session:session-1")),
                 filters: memory_filters(),

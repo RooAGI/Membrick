@@ -168,7 +168,26 @@ pub(crate) fn cached_doc_rerank_text(index: &MemoryIndex, doc_u32: usize) -> Opt
     index.doc_rerank_texts.get(doc_u32).map(|s| s.as_str())
 }
 
-pub(crate) fn cached_doc_rerank_tokens(index: &MemoryIndex, doc_u32: usize) -> Option<&[String]> {
+pub(crate) fn intern_rerank_tokens(
+    tokens: Vec<String>,
+    lexicon: &mut Vec<String>,
+    token_ids: &mut HashMap<String, u32>,
+) -> Vec<u32> {
+    tokens
+        .into_iter()
+        .map(|token| {
+            if let Some(&token_id) = token_ids.get(&token) {
+                return token_id;
+            }
+            let token_id = lexicon.len() as u32;
+            lexicon.push(token.clone());
+            token_ids.insert(token, token_id);
+            token_id
+        })
+        .collect()
+}
+
+pub(crate) fn cached_doc_rerank_tokens(index: &MemoryIndex, doc_u32: usize) -> Option<&[u32]> {
     index
         .doc_rerank_tokens
         .get(doc_u32)
@@ -235,7 +254,14 @@ pub(crate) fn seed_routing_candidates(
         }
         let matched_terms = content_terms
             .iter()
-            .filter(|term| doc_terms.iter().any(|tok| tok == *term))
+            .filter(|term| {
+                doc_terms.iter().any(|token_id| {
+                    index
+                        .rerank_token_lexicon
+                        .get(*token_id as usize)
+                        .is_some_and(|token| token == *term)
+                })
+            })
             .count() as f32;
         let doc_entities = index
             .doc_key_entities
@@ -248,9 +274,14 @@ pub(crate) fn seed_routing_candidates(
             .count() as f32;
         let has_number = index.doc_has_number.get(doc_u32).copied().unwrap_or(false);
         let has_unit = !unit_terms.is_empty()
-            && unit_terms
-                .iter()
-                .any(|unit| doc_terms.iter().any(|tok| tok == unit));
+            && unit_terms.iter().any(|unit| {
+                doc_terms.iter().any(|token_id| {
+                    index
+                        .rerank_token_lexicon
+                        .get(*token_id as usize)
+                        .is_some_and(|token| token == unit)
+                })
+            });
         let has_date = doc_temporal_date(doc).is_some();
         let has_temporal_terms = !doc.temporal_terms.is_empty();
 

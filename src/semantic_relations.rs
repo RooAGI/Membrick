@@ -1,7 +1,9 @@
+use crate::index::{ClaimEvidence, ClaimStatus};
 use crate::source::SourceDocument;
 use crate::temporal::parse_temporal_date;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -65,6 +67,24 @@ pub struct SemanticClaim {
     pub effective_at: Option<String>,
     pub scope: String,
     pub confidence: f32,
+    // Claims are written to the binary relation cache, which reads fields by
+    // position, so these optional fields are always written, never skipped.
+    /// Assertion polarity/modality from the shared claim contract.
+    #[serde(default)]
+    pub assertion_status: Option<ClaimStatus>,
+    #[serde(default)]
+    pub event_time: Option<String>,
+    /// Exact supporting span and its source location when extraction provides it.
+    #[serde(default)]
+    pub claim_evidence: Option<ClaimEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SemanticClaimState {
+    pub claim: SemanticClaim,
+    pub status: SemanticStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by_claim_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,7 +103,7 @@ pub struct SemanticRelation {
     pub scope: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DocumentSemanticState {
     pub status: Option<SemanticStatus>,
     pub superseded_by: Option<String>,
@@ -91,7 +111,9 @@ pub struct DocumentSemanticState {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Serializable so a store can cache it across restarts; see
+/// `pipeline::persistence::load_semantic_relations`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SemanticRelationStore {
     claims: Vec<SemanticClaim>,
     relations: Vec<SemanticRelation>,
@@ -214,10 +236,11 @@ impl SemanticRelationStore {
         }
 
         let mut chain_relations = HashMap::<RelationKey, Vec<SemanticRelation>>::new();
+        let mut cues = DocCueCache::new();
         for (key, chain) in &chains {
             chain_relations.insert(
                 key.clone(),
-                build_chain_relations(chain, &claim_by_id, &docs_by_id),
+                build_chain_relations(chain, &claim_by_id, &docs_by_id, &mut cues),
             );
         }
 
@@ -265,6 +288,16 @@ impl SemanticRelationStore {
         removed: &[String],
         options: SupersessionOptions,
     ) -> anyhow::Result<()> {
+        self.update_documents_borrowed(all_docs, changed, removed, options)
+    }
+
+    pub(crate) fn update_documents_borrowed<D: Borrow<SourceDocument>>(
+        &mut self,
+        all_docs: &HashMap<String, D>,
+        changed: &[&SourceDocument],
+        removed: &[String],
+        options: SupersessionOptions,
+    ) -> anyhow::Result<()> {
         if !options.enabled {
             *self = Self::default();
             return Ok(());
@@ -272,14 +305,14 @@ impl SemanticRelationStore {
         options.validate()?;
         let docs_by_id = all_docs
             .iter()
-            .map(|(id, doc)| (id.as_str(), doc))
+            .map(|(id, doc)| (id.as_str(), doc.borrow()))
             .collect::<HashMap<_, _>>();
 
         // Defensive: a store that was never built falls back to the oracle.
         // (`initialized`, not claim emptiness: a store built from a
         // claim-free corpus must stay on the incremental path.)
         if !self.initialized && (!changed.is_empty() || !removed.is_empty()) {
-            *self = Self::try_from_documents(all_docs.values(), options)?;
+            *self = Self::try_from_documents(all_docs.values().map(Borrow::borrow), options)?;
             return Ok(());
         }
 
@@ -463,6 +496,7 @@ impl SemanticRelationStore {
         let mut affected_keys: Vec<RelationKey> = affected_keys.into_iter().collect();
         affected_keys.sort();
         let mut fresh_chain = Vec::<SemanticRelation>::new();
+        let mut cues = DocCueCache::new();
         for key in affected_keys {
             if let Some(old) = self.chain_relations.get(&key) {
                 for relation in old {
@@ -475,7 +509,7 @@ impl SemanticRelationStore {
             if chain.is_empty() {
                 self.chains.remove(&key);
             }
-            let rebuilt = build_chain_relations(&chain, &self.claim_by_id, &docs_by_id);
+            let rebuilt = build_chain_relations(&chain, &self.claim_by_id, &docs_by_id, &mut cues);
             for relation in &rebuilt {
                 affected_docs.insert(relation.source_doc_id.clone());
                 affected_docs.insert(relation.target_doc_id.clone());
@@ -574,6 +608,41 @@ impl SemanticRelationStore {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Claim state is independent of document state so one retired fact in a
+    /// note does not retire unrelated facts from that same note.
+    pub fn claim_states_for_document(&self, doc_id: &str) -> Vec<SemanticClaimState> {
+        self.claims_by_doc
+            .get(doc_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|claim_id| self.claim_by_id.get(claim_id))
+            .map(|claim| {
+                let superseding = self.relations.iter().find(|relation| {
+                    relation.kind == SemanticRelationKind::Supersedes
+                        && relation.target_claim_id == claim.claim_id
+                        && relation.confidence >= SupersessionOptions::default().suppress_confidence
+                });
+                let conflicted = self.relations.iter().any(|relation| {
+                    relation.kind == SemanticRelationKind::ConflictsWith
+                        && (relation.target_claim_id == claim.claim_id
+                            || relation.source_claim_id == claim.claim_id)
+                });
+                SemanticClaimState {
+                    claim: claim.clone(),
+                    status: if superseding.is_some() {
+                        SemanticStatus::Superseded
+                    } else if conflicted {
+                        SemanticStatus::Conflicted
+                    } else {
+                        SemanticStatus::Current
+                    },
+                    superseded_by_claim_id: superseding
+                        .map(|relation| relation.source_claim_id.clone()),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Canonical claim order: (effective date, doc id, claim id). Shared by the
@@ -644,12 +713,13 @@ fn explicit_relation_claims(
 /// Decides the relation between a claim and its predecessor on the same
 /// canonical-claim chain. Extracted verbatim from the full rebuild so both
 /// paths share the decision logic.
-fn push_chain_pair_relation(
+fn push_chain_pair_relation<'a>(
     relations: &mut Vec<SemanticRelation>,
     seen: &mut HashSet<String>,
     claim: &SemanticClaim,
     previous: &SemanticClaim,
-    docs_by_id: &HashMap<&str, &SourceDocument>,
+    docs_by_id: &HashMap<&'a str, &'a SourceDocument>,
+    cues: &mut DocCueCache<'a>,
 ) {
     if normalize(&previous.object) == normalize(&claim.object) {
         push_relation(
@@ -671,8 +741,8 @@ fn push_chain_pair_relation(
     // ("instead of X") is the corrector and must be the relation source.
     // Without this, cue-driven supersession is a coin flip on same-day writes.
     let (claim, previous, source_doc, target_doc) = if claim_date(claim) == claim_date(previous) {
-        let claim_has_cue = source_doc.is_some_and(|doc| has_correction_cue(&doc.content));
-        let previous_has_cue = target_doc.is_some_and(|doc| has_correction_cue(&doc.content));
+        let claim_has_cue = source_doc.is_some_and(|doc| cues.get(doc).correction);
+        let previous_has_cue = target_doc.is_some_and(|doc| cues.get(doc).correction);
         if previous_has_cue && !claim_has_cue {
             (previous, claim, target_doc, source_doc)
         } else {
@@ -681,16 +751,16 @@ fn push_chain_pair_relation(
     } else {
         (claim, previous, source_doc, target_doc)
     };
-    let direct_correction = source_doc.is_some_and(|doc| has_correction_cue(&doc.content));
+    let direct_correction = source_doc.is_some_and(|doc| cues.get(doc).correction);
     // A cue that names a specific old value only corrects the claim with
     // that value ("instead of Postgres" retires Postgres, not SQLite).
     // A cue naming a different value is a genuine clash, not a directed
     // correction. Cues that name no value ("no longer", "previously") or
     // only a generic anaphor remain general corrections. A cue whose value
     // cannot be extracted never authorizes supersession.
-    let cue_directed = match source_doc.map(|doc| cue_reference(&doc.content)) {
+    let cue_directed = match source_doc.map(|doc| &cues.get(doc).reference) {
         Some(CueReference::Named(referenced)) => {
-            normalize(&referenced) == normalize(&previous.object)
+            normalize(referenced) == normalize(&previous.object)
         }
         Some(CueReference::General) => true,
         Some(CueReference::Unparseable) | None => false,
@@ -741,10 +811,11 @@ fn push_chain_pair_relation(
 /// Rebuilds the relations for one canonical-claim chain: consecutive claims in
 /// canonical order (from different docs) relate to each other, exactly as the
 /// full rebuild's per-key pass does.
-fn build_chain_relations(
+fn build_chain_relations<'a>(
     chain: &[String],
     claim_by_id: &HashMap<String, SemanticClaim>,
-    docs_by_id: &HashMap<&str, &SourceDocument>,
+    docs_by_id: &HashMap<&'a str, &'a SourceDocument>,
+    cues: &mut DocCueCache<'a>,
 ) -> Vec<SemanticRelation> {
     let mut relations = Vec::new();
     let mut seen = HashSet::new();
@@ -762,16 +833,23 @@ fn build_chain_relations(
         };
         if let Some(previous) = latest {
             if previous.source_doc_id != claim.source_doc_id {
-                push_chain_pair_relation(&mut relations, &mut seen, claim, previous, docs_by_id);
+                push_chain_pair_relation(
+                    &mut relations,
+                    &mut seen,
+                    claim,
+                    previous,
+                    docs_by_id,
+                    cues,
+                );
             }
         }
         // Cue-directed lookback: if this claim's cue names a specific value,
         // pair it with the most recent previous claim bearing that value.
         // The `seen` set dedupes the case where it matches the immediate
         // predecessor (already paired above).
-        if let Some(source_doc) = docs_by_id.get(claim.source_doc_id.as_str()) {
-            if let CueReference::Named(named) = cue_reference(&source_doc.content) {
-                let named_norm = normalize(&named);
+        if let Some(source_doc) = docs_by_id.get(claim.source_doc_id.as_str()).copied() {
+            if let CueReference::Named(named) = &cues.get(source_doc).reference {
+                let named_norm = normalize(named);
                 for prev in history.iter().rev() {
                     if prev.source_doc_id != claim.source_doc_id
                         && normalize(&prev.object) == named_norm
@@ -782,6 +860,7 @@ fn build_chain_relations(
                             claim,
                             prev,
                             docs_by_id,
+                            cues,
                         );
                         break;
                     }
@@ -1081,6 +1160,30 @@ fn push_relation(
 
 fn extract_claims(doc: &SourceDocument) -> Vec<SemanticClaim> {
     let mut claims = Vec::new();
+    for span in crate::claim_extractor::extract_personal_claim_spans(&doc.content) {
+        let claim_index = claims.len();
+        let mut claim = make_claim(
+            doc,
+            &doc.content[span.start_byte..span.end_byte],
+            &span.claim.subject,
+            &span.claim.predicate,
+            &span.claim.object,
+            claim_index,
+        );
+        claim.confidence = span.claim.confidence;
+        claim.assertion_status = span.claim.status;
+        claim.event_time = span.claim.event_time;
+        claim.claim_evidence = Some(ClaimEvidence {
+            source_document_id: doc.doc_id.clone(),
+            source: doc.source.clone(),
+            source_turn_id: None,
+            source_chunk_id: None,
+            text: doc.content[span.start_byte..span.end_byte].to_string(),
+            start_byte: Some(span.start_byte),
+            end_byte: Some(span.end_byte),
+        });
+        claims.push(claim);
+    }
     for sentence in sentences(&doc.content) {
         if let Some((subject, predicate, object)) = ownership_claim(sentence) {
             claims.push(make_claim(
@@ -1181,6 +1284,9 @@ fn make_claim_in_scope(
             .flatten(),
         scope,
         confidence: 0.85,
+        assertion_status: None,
+        event_time: None,
+        claim_evidence: None,
     }
 }
 
@@ -1459,11 +1565,47 @@ const CORRECTION_CUES: &[&str] = &[
     "formerly",
 ];
 
+#[cfg(test)]
 fn has_correction_cue(content: &str) -> bool {
-    let lower = content.to_lowercase();
+    has_correction_cue_lower(&content.to_lowercase())
+}
+
+fn has_correction_cue_lower(lower: &str) -> bool {
     CORRECTION_CUES
         .iter()
-        .any(|cue| find_cue_word(&lower, cue).is_some())
+        .any(|cue| find_cue_word(lower, cue).is_some())
+}
+
+/// Correction-cue analysis of one document's content. Chain pairing asks the
+/// same questions about a document for every claim it holds, so a relation
+/// rebuild computes this once per document instead of once per pair.
+struct DocCues {
+    correction: bool,
+    reference: CueReference,
+}
+
+impl DocCues {
+    fn analyze(content: &str) -> Self {
+        let lower = content.to_lowercase();
+        Self {
+            correction: has_correction_cue_lower(&lower),
+            reference: cue_reference_lower(&lower),
+        }
+    }
+}
+
+struct DocCueCache<'a>(HashMap<&'a str, DocCues>);
+
+impl<'a> DocCueCache<'a> {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    fn get(&mut self, doc: &'a SourceDocument) -> &DocCues {
+        self.0
+            .entry(doc.doc_id.as_str())
+            .or_insert_with(|| DocCues::analyze(&doc.content))
+    }
 }
 
 /// Finds a cue phrase at word boundaries and outside double-quoted spans, so
@@ -1522,8 +1664,12 @@ enum CueReference {
 /// Classify what a correction cue says about the old value. Quoted values
 /// (`instead of "Postgres"`) are unquoted before comparison so they still
 /// direct the correction.
+#[cfg(test)]
 fn cue_reference(content: &str) -> CueReference {
-    let lower = content.to_lowercase();
+    cue_reference_lower(&content.to_lowercase())
+}
+
+fn cue_reference_lower(lower: &str) -> CueReference {
     for pattern in [
         "supersedes",
         "instead of",
@@ -1532,7 +1678,7 @@ fn cue_reference(content: &str) -> CueReference {
         "changed from",
         "moved from",
     ] {
-        if let Some(pos) = find_cue_word(&lower, pattern) {
+        if let Some(pos) = find_cue_word(lower, pattern) {
             let mut rest = lower[pos + pattern.len()..].trim_start();
             // Frontmatter `supersedes: decision-a.md` is an explicit link
             // (handled via supersedes_id), not a natural-language correction
@@ -1628,7 +1774,7 @@ mod tests {
         SourceDocument {
             doc_id: id.to_string(),
             source: source.to_string(),
-            content: content.to_string(),
+            content: content.into(),
             concept: "decision".to_string(),
             group_id: None,
             headings: vec!["Decision".to_string()],
@@ -2114,7 +2260,7 @@ mod scalar_configuration_supersession_tests {
         SourceDocument {
             doc_id: id.to_string(),
             source: format!("docs/{id}.md"),
-            content: content.to_string(),
+            content: content.into(),
             concept: "gateway retry policy".to_string(),
             group_id: None,
             filters: BTreeMap::new(),
@@ -2689,7 +2835,7 @@ mod incremental_update_tests {
         SourceDocument {
             doc_id: id.to_string(),
             source: format!("docs/{id}.md"),
-            content: content.to_string(),
+            content: content.into(),
             concept: "decision".to_string(),
             group_id: None,
             headings: vec![],
@@ -2916,7 +3062,7 @@ mod incremental_update_tests {
         // Retarget the link to c.
         let mut x = docs.get("x").unwrap().clone();
         x.filters.insert("supersedes_id".into(), "c".into());
-        x.content = "Completely new direction v2.".to_string();
+        x.content = "Completely new direction v2.".into();
         docs.insert("x".to_string(), x);
         check(&mut store, &docs, &["x"], &[], ids);
         assert_eq!(

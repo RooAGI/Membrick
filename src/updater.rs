@@ -67,7 +67,7 @@ fn start_release_check_if_due() {
             now_seconds(),
             fetch_available_version,
         ) {
-            eprintln!("Membrick update check unavailable: {error:#}");
+            tracing::warn!("Membrick update check unavailable: {error:#}");
         }
     });
 }
@@ -430,7 +430,7 @@ pub(crate) fn check_for_update() {
     }
     let _ = fs::write(&checked_at, now_seconds().to_string());
     if let Err(error) = update_installed_binary(&exe) {
-        eprintln!("Membrick update check failed: {error:#}");
+        tracing::warn!("Membrick update check failed: {error:#}");
     }
 }
 

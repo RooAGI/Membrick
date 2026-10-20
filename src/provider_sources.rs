@@ -94,9 +94,47 @@ pub(crate) fn is_operational_provider_source(source: &str, group_id: Option<&str
     is_provider_source(source) && !is_provider_session(source, group_id)
 }
 
+const SESSION_EPOCH_SEPARATOR: &str = ":epoch-";
+
+/// Segment key for one compaction epoch of a provider session. Epoch 0, the
+/// part before the first compaction, keeps the session's own key so sessions
+/// that never compact are unchanged.
+pub(crate) fn session_epoch_group(session_group: &str, epoch: u64) -> String {
+    if epoch == 0 {
+        session_group.to_string()
+    } else {
+        format!("{session_group}{SESSION_EPOCH_SEPARATOR}{epoch}")
+    }
+}
+
+/// The session key of a group, without any compaction epoch suffix.
+pub(crate) fn session_group(group_id: &str) -> &str {
+    match group_id.rsplit_once(SESSION_EPOCH_SEPARATOR) {
+        Some((session, epoch))
+            if !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            session
+        }
+        _ => group_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_epoch_groups_round_trip_to_their_session() {
+        assert_eq!(
+            session_epoch_group("codex-session:p:s1", 0),
+            "codex-session:p:s1"
+        );
+        let later = session_epoch_group("codex-session:p:s1", 3);
+        assert_eq!(later, "codex-session:p:s1:epoch-3");
+        assert_eq!(session_group(&later), "codex-session:p:s1");
+        assert_eq!(session_group("codex-session:p:s1"), "codex-session:p:s1");
+        assert_eq!(session_group("note:epoch-draft"), "note:epoch-draft");
+    }
 
     #[test]
     fn provider_registry_has_unique_prefixes_and_session_tags() {

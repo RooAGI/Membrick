@@ -111,31 +111,34 @@ def remove_membrick_mcp_server(codex_home: Path) -> None:
     config_path.write_text("".join(retained).rstrip() + "\n", encoding="utf-8")
 
 
-def configure_mcp_diagnostics(codex_home: Path, executable: Path, trace_path: Path) -> None:
-    """Make the MCP launch observable without changing the server protocol."""
+def configure_mcp_diagnostics(codex_home: Path, executable: Path, worktree: Path) -> None:
+    """Make the MCP launch observable without changing the server protocol.
+
+    Points Codex at the benchmark binary and turns on Membrick debug logging
+    for the worktree, so MCP requests appear in Codex's MCP server log.
+    """
     config_path = codex_home / "config.toml"
     lines = config_path.read_text(encoding="utf-8").splitlines()
     updated: list[str] = []
     in_membrick_server = False
-    env_written = False
     for line in lines:
         stripped = line.strip()
         if stripped == "[mcp_servers.membrick]":
             in_membrick_server = True
         elif in_membrick_server and stripped.startswith("["):
-            if not env_written:
-                updated.append(
-                    f'env = {{ MEMBRICK_MCP_TRACE_PATH = {json.dumps(str(trace_path))} }}'
-                )
-                env_written = True
             in_membrick_server = False
         if in_membrick_server and stripped.startswith("command"):
             updated.append(f"command = {json.dumps(str(executable))}")
             continue
         updated.append(line)
-    if in_membrick_server and not env_written:
-        updated.append(f'env = {{ MEMBRICK_MCP_TRACE_PATH = {json.dumps(str(trace_path))} }}')
     config_path.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
+
+    settings_path = worktree / ".membrick" / "server.toml"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = settings_path.read_text(encoding="utf-8") if settings_path.exists() else ""
+    if "[logging]" not in settings:
+        settings = settings.rstrip() + ("\n\n" if settings.strip() else "") + '[logging]\nlevel = "debug"\n'
+        settings_path.write_text(settings, encoding="utf-8")
 
 
 def capture_codex_diagnostics(codex_home: Path, env: dict[str, str], output_dir: Path) -> None:
@@ -364,11 +367,10 @@ def main() -> None:
                 )
 
             if args.profile == "production" and arm != "codex-native":
-                trace_path = arm_results / "mcp-trace.log"
                 configure_mcp_diagnostics(
                     codex_home,
                     binary,
-                    trace_path,
+                    worktree,
                 )
             capture_codex_diagnostics(codex_home, env, arm_results / "client-diagnostics")
             print(

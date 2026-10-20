@@ -193,7 +193,7 @@ fn build_conv_index(conv: &LocomoConversation) -> Result<ConvIndex> {
             docs.push(SourceDocument {
                 doc_id,
                 source: format!("locomo/{}/session/{n}/turn/{turn_idx}", conv.sample_id),
-                content: line,
+                content: line.into(),
                 concept: "locomo-turn".to_string(),
                 group_id: Some(group_id.clone()),
                 filters,
@@ -461,7 +461,7 @@ mod tests {
         service.upsert(SourceDocument {
             doc_id: "conv-1::session_1::turn0".to_string(),
             source: "locomo/conv-1/session/1/turn/0".to_string(),
-            content: "Ted: I visited the Eiffel Tower in Paris".to_string(),
+            content: "Ted: I visited the Eiffel Tower in Paris".into(),
             concept: "locomo-turn".to_string(),
             group_id: Some("conv-1::session_1".to_string()),
             filters,

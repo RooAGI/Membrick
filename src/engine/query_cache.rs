@@ -232,10 +232,7 @@ pub(crate) fn load_cached_query_index(
     ) {
         Ok(index) => return Some(index),
         Err(err) => {
-            eprintln!(
-                "warning: binary core cache load failed (falling back): {}",
-                err
-            );
+            tracing::warn!("binary core cache load failed (falling back): {}", err);
         }
     }
     Some(MemoryIndex::from_records_with_lexical_dir(
@@ -256,7 +253,11 @@ pub(crate) fn save_cached_query_index(
     if let Some(parent) = cache_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    let records = index.docs.values().cloned().collect::<Vec<_>>();
+    let records = index
+        .docs
+        .values()
+        .map(|record| record.as_ref().clone())
+        .collect::<Vec<_>>();
     let payload = CachedQueryIndex {
         version: QUERY_CACHE_VERSION.to_string(),
         path: s.root_path.to_string(),

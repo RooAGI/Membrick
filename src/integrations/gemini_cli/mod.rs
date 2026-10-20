@@ -143,7 +143,8 @@ pub fn run_server_for(
     provider_display_name: &'static str,
     options: GeminiCliServerOptions<'_>,
 ) -> Result<()> {
-    mcp_index::trace_event("gemini-server-start");
+    crate::local_ipc::ensure_provider_resident(root, provider_label)?;
+    tracing::debug!("MCP server starting");
     let server = GeminiMcp {
         root: root.to_path_buf(),
         store: Mutex::new(None),
@@ -220,7 +221,7 @@ impl GeminiMcp {
                     file_changes,
                 )
             {
-                eprintln!("warning: failed to save workspace file changes: {error:#}");
+                tracing::warn!("failed to save workspace file changes: {error:#}");
             }
             if workspace_index_changed {
                 *store = None;
@@ -693,7 +694,8 @@ mod tests {
                 source: format!("{}://session-1/outcome", provider.as_str()),
                 content: format!(
                     "{label} deployment runbook: rotate the staging API key every Friday"
-                ),
+                )
+                .into(),
                 concept: "outcome".to_string(),
                 group_id: Some(format!("{}-session:session-1", provider.as_str())),
                 filters,
@@ -807,7 +809,7 @@ mod tests {
             memory.upsert(SourceDocument {
                 doc_id: "memory-1".to_string(),
                 source: format!("{}://session-1/outcome", provider.as_str()),
-                content: format!("{label} durable routing decision"),
+                content: format!("{label} durable routing decision").into(),
                 concept: "outcome".to_string(),
                 group_id: Some(format!("{}-session:session-1", provider.as_str())),
                 filters: BTreeMap::new(),

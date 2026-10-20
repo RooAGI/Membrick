@@ -15,7 +15,7 @@ fn sample_doc(id: &str, content: &str) -> SourceDocument {
     SourceDocument {
         doc_id: id.to_string(),
         source: format!("artifact://{}", id),
-        content: content.to_string(),
+        content: content.into(),
         concept: id.to_string(),
         group_id: None,
         filters: std::collections::BTreeMap::new(),
@@ -950,7 +950,8 @@ fn segmented_persistent_store_reuses_unchanged_lexical_cache_and_refreshes_chang
         .unwrap()
         .iter()
         .any(|hit| hit.doc_id == "doc-1"));
-    assert_eq!(cache_count(), initial_cache_count + 1);
+    // A segment keeps one folder; changed content is committed inside it.
+    assert_eq!(cache_count(), initial_cache_count);
     drop(reopened);
 
     let mut final_open = IndexStore::at_path(&index_root, options).unwrap();
@@ -959,7 +960,7 @@ fn segmented_persistent_store_reuses_unchanged_lexical_cache_and_refreshes_chang
         .unwrap()
         .iter()
         .any(|hit| hit.doc_id == "doc-1"));
-    assert_eq!(cache_count(), initial_cache_count + 1);
+    assert_eq!(cache_count(), initial_cache_count);
     drop(final_open);
     let _ = fs::remove_dir_all(index_root);
 }
@@ -1029,7 +1030,7 @@ fn index_store_persists_and_reloads_semantic_state() {
     drop(first);
 
     let semantic_dir = corpus_root.join(".membrick").join("semantic");
-    assert!(semantic_dir.join("records.json").exists());
+    assert!(semantic_dir.join("records-shards/manifest.json").exists());
     assert!(semantic_dir.join("core.bin").exists());
 
     let mut second =
@@ -1074,7 +1075,7 @@ fn segmented_store_reloads_without_a_compatibility_core() {
     drop(first);
 
     let semantic_dir = index_root.join("semantic");
-    assert!(semantic_dir.join("records.json").exists());
+    assert!(semantic_dir.join("records-shards/manifest.json").exists());
     assert!(!semantic_dir.join("core.bin").exists());
     let manifest: SegmentManifest = serde_json::from_str(
         &fs::read_to_string(semantic_dir.join("segments.json"))
@@ -1090,6 +1091,7 @@ fn segmented_store_reloads_without_a_compatibility_core() {
         segments: vec![crate::segments::SegmentManifestEntry {
             segment_id: "combined".to_string(),
             doc_ids: vec!["doc-1".to_string(), "doc-2".to_string()],
+            lexical_dir: None,
         }],
     };
     fs::write(
@@ -1535,6 +1537,47 @@ fn segment_index_ptrs(index: &IndexStore) -> Vec<*const crate::index::MemoryInde
 }
 
 #[test]
+fn a_single_chunk_record_keeps_one_copy_of_its_text() {
+    let options = PipelineOptions::default();
+    let doc = sample_doc("doc-1", "one short paragraph");
+    let record = build_doc_records(std::slice::from_ref(&doc), &options)
+        .unwrap()
+        .remove(0);
+    assert_eq!(record.section_chunks.len(), 1);
+    assert!(record.content.shares_with(&doc.content));
+    assert!(record.section_chunks[0]
+        .content
+        .shares_with(&record.content));
+
+    // A record read back from records.json shares its text the same way, and
+    // so does the source document a reopened store rebuilds from it.
+    let json = serde_json::to_string(&PersistedDocRecord::from(record)).unwrap();
+    let reloaded =
+        crate::index::DocRecord::from(serde_json::from_str::<PersistedDocRecord>(&json).unwrap());
+    assert_eq!(reloaded.content, "one short paragraph");
+    assert!(reloaded.section_chunks[0]
+        .content
+        .shares_with(&reloaded.content));
+    let rebuilt = source_document_from_record(&reloaded);
+    assert!(rebuilt.content.shares_with(&reloaded.content));
+}
+
+#[test]
+fn a_chunk_with_other_text_keeps_its_own_copy() {
+    let options = PipelineOptions::default();
+    let doc = sample_doc("doc-1", "one short paragraph");
+    let mut record = build_doc_records(std::slice::from_ref(&doc), &options)
+        .unwrap()
+        .remove(0);
+    record.section_chunks[0].content = "a different part".into();
+    record.share_whole_record_chunks();
+    assert_eq!(record.section_chunks[0].content, "a different part");
+    assert!(!record.section_chunks[0]
+        .content
+        .shares_with(&record.content));
+}
+
+#[test]
 fn doc_record_content_hash_matches_built_record() {
     let options = PipelineOptions::default();
     let doc = sample_doc("doc-1", "hash agreement probe");
@@ -1559,7 +1602,7 @@ fn doc_record_content_hash_is_stable_and_sensitive() {
     assert_eq!(baseline, doc_record_content_hash(&doc, &options));
 
     let mut changed = doc.clone();
-    changed.content = "hello mars".to_string();
+    changed.content = "hello mars".into();
     changed.doc_length = changed.content.len();
     assert_ne!(baseline, doc_record_content_hash(&changed, &options));
 

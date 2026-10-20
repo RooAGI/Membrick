@@ -40,9 +40,24 @@ pub struct StagedAddResponse {
 
 impl MemoryService {
     pub(crate) fn published_read_view(&self) -> anyhow::Result<Self> {
+        self.published_read_view_with_previous(None)
+    }
+
+    pub(crate) fn published_read_view_with_previous(
+        &self,
+        previous: Option<&Self>,
+    ) -> anyhow::Result<Self> {
         let provider_view = self.read_view_with_store(self.store.published_read_view());
         if let Some(workspace) = &self.workspace_store {
-            return Self::compose_segmented(workspace.published_read_view()?, Some(provider_view));
+            let workspace_view = workspace.published_read_view()?;
+            if let Some(previous) = previous {
+                return Self::compose_segmented_read_view_with_previous(
+                    workspace_view,
+                    Some(provider_view),
+                    previous.store.published_read_view(),
+                );
+            }
+            return Self::compose_segmented(workspace_view, Some(provider_view));
         }
         Ok(provider_view)
     }
@@ -59,6 +74,7 @@ impl MemoryService {
             request_fingerprints: HashMap::new(),
             request_receipts: HashMap::new(),
             receipts_path: None,
+            pending_receipt_persistence: HashSet::new(),
             pending_adds: HashMap::new(),
             publication: None,
             conversation_states: Arc::clone(&self.conversation_states),
@@ -151,6 +167,7 @@ impl MemoryService {
         anyhow::ensure!(self.publication.is_none(), "publication already in flight");
         self.drain_enrichment_inbox();
         let store = self.store.publication_build_view()?;
+        let segment_lexical_root = self.store.segment_lexical_root();
         let changed = self.store.pending_snapshot_changes();
         let mut view = self.read_view_with_store(store);
         let pending = self.pending_adds.clone();
@@ -174,7 +191,8 @@ impl MemoryService {
             .spawn(move || {
                 before_build();
                 let result = (|| -> anyhow::Result<PublicationResult> {
-                    view.store.build_prepared_snapshot()?;
+                    view.store
+                        .build_prepared_snapshot_in(segment_lexical_root.as_deref())?;
                     let prepared_checkpoint = if prepare_checkpoint {
                         Some(view.store.prepare_checkpoint()?)
                     } else {
@@ -262,6 +280,7 @@ impl MemoryService {
         for key in keys {
             self.pending_adds.remove(&key);
         }
+        self.trim_receipt_cache();
         Ok(Some(*result.view))
     }
 
@@ -456,6 +475,7 @@ impl MemoryService {
             }
         }
         self.pending_adds.clear();
+        self.trim_receipt_cache();
         if checkpoint {
             self.store
                 .complete_checkpoint(self.store.snapshot_revision());

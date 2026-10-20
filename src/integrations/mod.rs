@@ -1,5 +1,15 @@
 #[cfg(feature = "agy")]
 pub mod agy;
+#[cfg(any(
+    feature = "claude-code",
+    feature = "codex",
+    feature = "gemini-cli",
+    feature = "agy",
+    feature = "openclaw",
+    feature = "hermes",
+    feature = "roo-runtime"
+))]
+pub(crate) mod capture_text;
 #[cfg(feature = "claude-code")]
 pub mod claude_code;
 #[cfg(feature = "codex")]
@@ -18,6 +28,7 @@ pub mod hermes;
 pub mod muse_code;
 #[cfg(feature = "openclaw")]
 pub mod openclaw;
+pub(crate) mod provider_lifecycle;
 #[cfg(feature = "roo-runtime")]
 pub mod roo_runtime;
 

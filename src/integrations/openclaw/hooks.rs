@@ -15,6 +15,7 @@
 
 use super::document::{OpenClawDocument, OpenClawDocumentType};
 use crate::ids::stable_doc_id_from_source;
+use crate::integrations::capture_text;
 use crate::integrations::recall::{relevant_excerpt, truncate_utf8};
 use crate::integrations::session_recording::{
     membrick_enabled, record_event_if_enabled, RecordingProvider,
@@ -104,7 +105,7 @@ pub fn run_hook(kind: OpenClawHookKind, fallback_root: &Path) -> Result<()> {
             // Unparseable stdin: there is no safe mutation to return (for
             // bootstrap we cannot know the existing files), so emit a sentinel
             // the shims treat as "leave the event untouched".
-            eprintln!("warning: Membrick OpenClaw hook received invalid input: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook received invalid input: {error:#}");
             emit(&json!({ "ok": false, "error": "invalid hook input" }))?;
             return Ok(());
         }
@@ -141,7 +142,7 @@ pub fn process_http_hook_with_writer(
     let input: OpenClawHookInput = match serde_json::from_value(value) {
         Ok(input) => input,
         Err(error) => {
-            eprintln!("warning: Membrick OpenClaw hook received invalid input: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook received invalid input: {error:#}");
             return json!({ "ok": false, "error": "invalid hook input" });
         }
     };
@@ -156,7 +157,7 @@ fn process_hook(kind: OpenClawHookKind, input: OpenClawHookInput, fallback_root:
     let root = match resolve_root(&input, kind, fallback_root) {
         Ok(root) => root,
         Err(error) => {
-            eprintln!("warning: Membrick OpenClaw hook failed open: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook failed open: {error:#}");
             return default_output(kind, &input);
         }
     };
@@ -190,12 +191,12 @@ fn process_hook_at_root(
         kind.event_name(),
         telemetry_payload(kind, &input),
     ) {
-        eprintln!("warning: Membrick OpenClaw session recording failed open: {error:#}");
+        tracing::warn!("Membrick OpenClaw session recording failed open: {error:#}");
     }
     let output = match handle_hook(kind, &input, &root, publish) {
         Ok(output) => output,
         Err(error) => {
-            eprintln!("warning: Membrick OpenClaw hook failed open: {error:#}");
+            tracing::warn!("Membrick OpenClaw hook failed open: {error:#}");
             default_output(kind, &input)
         }
     };
@@ -277,8 +278,8 @@ fn resolve_root(
     let path = candidate
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback_root.to_path_buf());
-    path.canonicalize()
-        .with_context(|| format!("failed to canonicalize OpenClaw root {}", path.display()))
+    crate::state_paths::find_project_root(&path)?
+        .context("no installed Membrick project covers OpenClaw workspace")
 }
 
 /// Best-effort session identity for telemetry and registry keys.
@@ -417,7 +418,10 @@ fn retrieve_memories(root: &Path, query: &str) -> Result<String> {
         }
         output.push_str(&format!("\n- Source: {}\n  {}\n", source, excerpt));
     }
-    Ok(output)
+    if output.is_empty() {
+        return Ok(output);
+    }
+    Ok(capture_text::mark_memory_context(&output))
 }
 
 // ---------------------------------------------------------------------------
@@ -472,28 +476,11 @@ fn is_internal_context(message: &Value) -> bool {
     false
 }
 
+/// Message text with tool blocks kept in bounded form and injected memory
+/// context dropped.
 fn content_text(content: &Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(blocks) => {
-            let mut out = String::new();
-            for block in blocks {
-                if matches!(
-                    block.get("type").and_then(Value::as_str),
-                    Some("text" | "input_text" | "output_text")
-                ) {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        out.push_str(text);
-                    }
-                } else {
-                    out.push_str(&serde_json::to_string(block).unwrap_or_default());
-                }
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-            }
-            Some(out)
-        }
+        Value::String(_) | Value::Array(_) => Some(capture_text::content_text(content)),
         _ => None,
     }
 }
@@ -675,7 +662,9 @@ mod tests {
             id
         ));
         fs::create_dir_all(&root).unwrap();
-        fs::canonicalize(root).unwrap()
+        let root = fs::canonicalize(root).unwrap();
+        crate::state_paths::record_install_settings(&root).unwrap();
+        root
     }
 
     fn test_publish(root: &Path, document: crate::SourceDocument) -> Result<()> {
@@ -991,7 +980,7 @@ mod tests {
         let texts = message_texts(messages);
         assert_eq!(texts.len(), 2);
         assert!(texts.iter().any(|(_, text)| text.contains("default route")));
-        assert!(texts.iter().any(|(_, text)| text.contains("toolCall")));
+        assert!(texts.iter().any(|(_, text)| text.contains("[tool call:")));
     }
 
     #[test]

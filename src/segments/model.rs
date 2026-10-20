@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use super::catalog::*;
 use super::query::*;
@@ -64,6 +64,125 @@ pub struct MemoryIndexSegment {
     /// timestamp is parsed at most once per segment instead of once per
     /// anchored query.
     pub(crate) record_dates: OnceLock<Vec<NaiveDate>>,
+    /// This segment's folder under the store's `segment-lexical` directory,
+    /// or `None` when its lexical index lives only in memory.
+    pub(crate) lexical_dir: Option<Arc<SegmentLexicalDir>>,
+}
+
+/// One hold on a stable logical segment folder under `segment-lexical`.
+/// Multiple generations share the folder; Tantivy commits provide the reader
+/// generations. A folder is deleted only when its segment disappears and the
+/// last snapshot that references it is released.
+pub(crate) struct SegmentLexicalDir {
+    path: PathBuf,
+}
+
+#[derive(Default)]
+struct SegmentLexicalDirHolds {
+    counts: HashMap<PathBuf, usize>,
+    retired: HashSet<PathBuf>,
+    removable_roots: HashSet<PathBuf>,
+}
+
+fn segment_lexical_dir_holds() -> MutexGuard<'static, SegmentLexicalDirHolds> {
+    static HOLDS: OnceLock<Mutex<SegmentLexicalDirHolds>> = OnceLock::new();
+    HOLDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Let this process delete folders under `lexical_root` once nothing in it
+/// holds them. Only the workspace owner may call this: it is the one process
+/// that rebuilds segments, so no other process starts using an old folder.
+pub(crate) fn remove_segment_lexical_dirs_when_unused(lexical_root: &Path) {
+    segment_lexical_dir_holds()
+        .removable_roots
+        .insert(lexical_root.to_path_buf());
+}
+
+/// Mark the folders `previous` used and `next` does not as replaced. Each is
+/// deleted once the readers still holding the older snapshot let it go.
+pub(crate) fn retire_replaced_segment_lexical_dirs(
+    previous: &[MemoryIndexSegment],
+    next: &[MemoryIndexSegment],
+) {
+    let kept = next
+        .iter()
+        .filter_map(|segment| segment.lexical_dir.as_deref())
+        .map(SegmentLexicalDir::path)
+        .collect::<HashSet<_>>();
+    let replaced = previous
+        .iter()
+        .filter_map(|segment| segment.lexical_dir.as_deref())
+        .map(SegmentLexicalDir::path)
+        .filter(|path| !kept.contains(path))
+        .collect::<Vec<_>>();
+    if replaced.is_empty() {
+        return;
+    }
+    let mut holds = segment_lexical_dir_holds();
+    for path in replaced {
+        holds.retired.insert(path.to_path_buf());
+    }
+}
+
+impl SegmentLexicalDir {
+    /// Take a hold before the folder is opened or built, so the folder cannot
+    /// be deleted under the build by an older segment dropping its last hold.
+    /// A folder built again for current content is no longer replaced.
+    fn hold(path: PathBuf) -> Arc<Self> {
+        let mut holds = segment_lexical_dir_holds();
+        holds.retired.remove(&path);
+        *holds.counts.entry(path.clone()).or_default() += 1;
+        Arc::new(Self { path })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for SegmentLexicalDir {
+    fn drop(&mut self) {
+        let mut holds = segment_lexical_dir_holds();
+        let Some(count) = holds.counts.get_mut(&self.path) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
+        }
+        holds.counts.remove(&self.path);
+        let replaced = holds.retired.remove(&self.path);
+        let removable = self
+            .path
+            .parent()
+            .is_some_and(|root| holds.removable_roots.contains(root));
+        if !replaced || !removable {
+            return;
+        }
+        // Deleted while the lock is held, so a new hold on the same folder
+        // waits and then rebuilds it from scratch.
+        match std::fs::remove_dir_all(&self.path) {
+            Ok(()) => tracing::debug!(
+                folder = %self.path.display(),
+                "removed unused segment lexical folder"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                folder = %self.path.display(),
+                "could not remove unused segment lexical folder: {error}"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +195,10 @@ pub struct SegmentManifest {
 pub struct SegmentManifestEntry {
     pub segment_id: String,
     pub doc_ids: Vec<String>,
+    /// The segment's `segment-lexical` folder when the snapshot that wrote
+    /// this manifest had one on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,12 +308,28 @@ pub(crate) fn build_memory_index_segment(
     segment_id: String,
     segment_records: Vec<DocRecord>,
 ) -> MemoryIndexSegment {
-    build_memory_index_segment_with_lexical_root(segment_id, segment_records, None)
+    build_memory_index_segment_with_shared_records(
+        segment_id,
+        segment_records.into_iter().map(Arc::new).collect(),
+        None,
+    )
 }
 
 pub(crate) fn build_memory_index_segment_with_lexical_root(
     segment_id: String,
-    mut segment_records: Vec<DocRecord>,
+    segment_records: Vec<DocRecord>,
+    lexical_root: Option<&Path>,
+) -> MemoryIndexSegment {
+    build_memory_index_segment_with_shared_records(
+        segment_id,
+        segment_records.into_iter().map(Arc::new).collect(),
+        lexical_root,
+    )
+}
+
+pub(crate) fn build_memory_index_segment_with_shared_records(
+    segment_id: String,
+    mut segment_records: Vec<Arc<DocRecord>>,
     lexical_root: Option<&Path>,
 ) -> MemoryIndexSegment {
     segment_records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
@@ -199,42 +338,73 @@ pub(crate) fn build_memory_index_segment_with_lexical_root(
         .map(|record| record.doc_id.clone())
         .collect::<Vec<_>>();
     let lexical_dir =
-        lexical_root.map(|root| segment_lexical_dir(root, &segment_id, &segment_records));
+        lexical_root.map(|root| SegmentLexicalDir::hold(segment_lexical_dir(root, &segment_id)));
     let index = Arc::new(if let Some(lexical_dir) = lexical_dir.as_deref() {
-        MemoryIndex::from_records_with_lexical_dir(
+        MemoryIndex::from_shared_records_with_lexical_dir(
             segment_records,
-            Some(lexical_dir),
+            Some(lexical_dir.path()),
             false,
             false,
             false,
         )
     } else {
-        MemoryIndex::from_records(segment_records)
+        MemoryIndex::from_shared_records_with_lexical_dir(
+            segment_records,
+            None,
+            false,
+            false,
+            false,
+        )
     });
     MemoryIndexSegment {
         segment_id,
         doc_ids,
         index,
         record_dates: OnceLock::new(),
+        lexical_dir,
     }
 }
 
-fn segment_lexical_dir(root: &Path, segment_id: &str, records: &[DocRecord]) -> PathBuf {
-    // Include the segment's complete record identity in the cache path. The
-    // lexical index is immutable once built; writes produce a new directory
-    // for the changed content while existing readers keep their old snapshot.
-    let mut hasher = Sha256::new();
-    // Preserve the legacy schema tag so existing segment IDs remain stable.
-    hasher.update(b"lint-ai-segment-lexical-v1");
-    hasher.update(segment_id.as_bytes());
-    for record in records {
-        hasher.update(record.doc_id.as_bytes());
-        hasher.update(record.content_hash.as_bytes());
-        for tag in &record.semantic_tags {
-            hasher.update(tag.as_bytes());
-            hasher.update(&[0]);
-        }
+pub(crate) fn build_memory_index_segment_with_lexical_delta(
+    segment_id: String,
+    mut segment_records: Vec<Arc<DocRecord>>,
+    lexical_root: Option<&Path>,
+    changed_doc_ids: HashSet<String>,
+    removed_doc_ids: HashSet<String>,
+    rebuild: bool,
+) -> MemoryIndexSegment {
+    segment_records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+    let doc_ids = segment_records
+        .iter()
+        .map(|record| record.doc_id.clone())
+        .collect::<Vec<_>>();
+    let lexical_dir =
+        lexical_root.map(|root| SegmentLexicalDir::hold(segment_lexical_dir(root, &segment_id)));
+    let index = Arc::new(MemoryIndex::from_shared_records_with_lexical_delta(
+        segment_records,
+        lexical_dir.as_deref().map(SegmentLexicalDir::path),
+        changed_doc_ids,
+        removed_doc_ids,
+        rebuild,
+        false,
+        false,
+        false,
+    ));
+    MemoryIndexSegment {
+        segment_id,
+        doc_ids,
+        index,
+        record_dates: OnceLock::new(),
+        lexical_dir,
     }
+}
+
+fn segment_lexical_dir(root: &Path, segment_id: &str) -> PathBuf {
+    // The directory identifies the logical segment. Document changes are
+    // committed inside this stable Tantivy index instead of changing paths.
+    let mut hasher = Sha256::new();
+    hasher.update(b"membrick-segment-lexical-v2");
+    hasher.update(segment_id.as_bytes());
     root.join(format!("{:x}", hasher.finalize()))
 }
 

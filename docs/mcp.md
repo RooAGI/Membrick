@@ -8,17 +8,22 @@ Bundled Rust provider MCP adapters and hook subcommands reach one shared
 resident workspace owner. They try the user-private local IPC endpoint first
 (Unix socket on macOS/Linux, named pipe on Windows), then an optional loopback
 HTTP listener configured in `.membrick/server.toml`, then an atomic filesystem
-request queue under `.membrick/runtime/requests`. The first request starts the
-resident automatically. Every transport feeds the same router and
+request queue under `.membrick/runtime/requests`. Provider startup or the first
+request starts the resident automatically. Every transport feeds the same router and
 `MemoryService`; a project ownership lock prevents a second resident from
 opening the same workspace. The bundled adapters do not read environment
 variables to select a server or transport.
 Resident sockets, startup coordination files, and diagnostics are kept in the
 project's `.membrick/runtime/` directory. At resident startup, logs over 1 MiB
 are rotated to `.membrick/runtime/resident.log.1`.
-See [Local IPC server architecture](local-ipc-architecture.md) for the request
-flow, endpoint permissions, and its relationship to the standalone HTTP
-server.
+
+The provider-launched MCP process starts the resident and holds a crash-safe
+project lease for as long as the provider keeps that MCP process open. Multiple
+providers share the same resident. Once the final provider exits, the resident
+shuts down after a short reconnect grace period; a later MCP connection starts
+it again. One-shot hook requests also hold a lease while their request is in
+flight. See [Local IPC server architecture](local-ipc-architecture.md) for
+startup, crash recovery, endpoint permissions, and manual-server behavior.
 
 ## Where each mode applies
 

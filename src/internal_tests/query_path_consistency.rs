@@ -6,7 +6,7 @@ fn document(id: &str, content: &str, timestamp: &str, group: &str) -> SourceDocu
     SourceDocument {
         doc_id: id.to_string(),
         source: format!("memory://{id}"),
-        content: content.to_string(),
+        content: content.into(),
         concept: "deployment memory".to_string(),
         group_id: Some(group.to_string()),
         headings: vec!["Deployment".to_string()],

@@ -7,7 +7,7 @@ meta:
   - property: og:description
     content: "Your project says one thing on Monday and something different on Friday. Membrick keeps track of what is still true."
   - property: og:image
-    content: https://rooagi.github.io/Membrick/assets/images/social/stale-memory.png
+    content: https://rooagi.github.io/Membrick/assets/images/social/stale-memory-membrick.png
   - property: og:image:width
     content: "1200"
   - property: og:image:height

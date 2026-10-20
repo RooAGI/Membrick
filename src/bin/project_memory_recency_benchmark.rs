@@ -3,22 +3,19 @@ use crate::{build_query_snapshot, parse_temporal_date, PipelineOptions, SourceDo
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 #[derive(Debug, Parser)]
 #[command(about = "Evaluate freshness on a persisted Membrick project memory corpus")]
 struct Args {
-    /// Path to semantic/records.json produced by IndexStore.
-    #[arg(long, default_value = ".membrick/memory/semantic/records.json")]
-    records: PathBuf,
+    /// The semantic directory of a persisted IndexStore.
+    #[arg(long, default_value = ".membrick/memory/semantic")]
+    semantic_dir: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
 struct PersistedRecords {
     records: Vec<DocRecord>,
 }
@@ -50,7 +47,7 @@ fn source_document(record: DocRecord) -> SourceDocument {
     SourceDocument {
         doc_id: record.doc_id,
         source: record.source,
-        content: record.content,
+        content: record.content.into(),
         concept: record.probable_topic.unwrap_or_default(),
         group_id: record.group_id,
         filters: record.filters,
@@ -66,7 +63,9 @@ fn source_document(record: DocRecord) -> SourceDocument {
 
 pub(crate) fn main() -> Result<()> {
     let args = Args::parse();
-    let payload: PersistedRecords = serde_json::from_str(&fs::read_to_string(&args.records)?)?;
+    let payload = PersistedRecords {
+        records: crate::pipeline::load_persisted_records(&args.semantic_dir)?,
+    };
     let now = DateTime::<Utc>::from(SystemTime::now());
     let today = now.date_naive();
     let timestamp_by_id = payload
@@ -123,7 +122,7 @@ pub(crate) fn main() -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "benchmark": "membrick-project-memory-recency",
-            "records_path": args.records,
+            "semantic_dir": args.semantic_dir,
             "record_count": timestamp_by_id.len(),
             "query_count": QUERIES.len(),
             "age_buckets": {"fresh": "0-30 days", "warm": "31-90 days", "cold": "91+ days"},

@@ -8,7 +8,6 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -21,8 +20,6 @@ const STORE_INIT_LOCK_RETRY: Duration = Duration::from_millis(100);
 /// provider stores. Kept by the resident runtime while it serves requests.
 pub(crate) struct WorkspaceOwnerLock {
     _file: File,
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
 }
 
 impl WorkspaceOwnerLock {
@@ -36,30 +33,16 @@ impl WorkspaceOwnerLock {
             STORE_INIT_LOCK_RETRY,
             "workspace resident owner",
         )?;
-        Ok(Self {
-            _file: file,
-            #[cfg(not(unix))]
-            path,
-        })
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for WorkspaceOwnerLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        Ok(Self { _file: file })
     }
 }
 
 /// Kernel-released file-lock primitive shared by both guards below.
 ///
-/// On Unix this is an advisory exclusive lock via `File::try_lock` (std):
-/// the kernel releases the lock when the holding process dies for any
-/// reason — including SIGKILL — so a crashed writer can never wedge the
-/// store with an orphaned lock file. The lock file itself is never deleted;
-/// only the lock state matters. Holding the returned `File` open holds the
-/// lock; dropping it releases.
-#[cfg(unix)]
+/// `File::try_lock` uses an OS lock on Unix and Windows. The OS releases the
+/// lock when the holding process exits or crashes, so a leftover lock file is
+/// harmless and never blocks recovery. Holding the returned `File` open holds
+/// the lock; dropping it releases.
 fn acquire_file_lock(path: &Path, wait: Duration, retry: Duration, what: &str) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -87,37 +70,8 @@ fn acquire_file_lock(path: &Path, wait: Duration, retry: Duration, what: &str) -
     }
 }
 
-/// Non-Unix fallback: the create_new + remove-on-Drop scheme. Keeps the
-/// crate building on targets without `flock`; carries the old crash caveat
-/// (an orphaned file wedges later writers until manually removed).
-#[cfg(not(unix))]
-fn acquire_file_lock(path: &Path, wait: Duration, retry: Duration, what: &str) -> Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let started = std::time::Instant::now();
-    loop {
-        match OpenOptions::new().write(true).create_new(true).open(path) {
-            Ok(file) => return Ok(file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if started.elapsed() >= wait {
-                    return Err(anyhow::anyhow!(
-                        "timed out waiting for {what} at {}",
-                        path.display()
-                    ));
-                }
-                thread::sleep(retry);
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
 struct StoreInitLock {
     _file: File,
-    // Only the non-Unix fallback deletes the lock file on release.
-    #[cfg(not(unix))]
-    path: std::path::PathBuf,
 }
 
 impl StoreInitLock {
@@ -130,18 +84,7 @@ impl StoreInitLock {
             STORE_INIT_LOCK_RETRY,
             "persistent store initialization lock",
         )?;
-        Ok(Self {
-            _file: file,
-            #[cfg(not(unix))]
-            path,
-        })
-    }
-}
-
-#[cfg(not(unix))]
-impl Drop for StoreInitLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        Ok(Self { _file: file })
     }
 }
 
@@ -175,13 +118,21 @@ pub(super) fn with_shared_memory_service<T>(
     root: &Path,
     operation: impl FnOnce(&mut MemoryService) -> Result<T>,
 ) -> Result<T> {
+    with_shared_memory_service_timeout(root, SHARED_STORE_WRITE_LOCK_WAIT, operation)
+}
+
+fn with_shared_memory_service_timeout<T>(
+    root: &Path,
+    lock_wait: Duration,
+    operation: impl FnOnce(&mut MemoryService) -> Result<T>,
+) -> Result<T> {
     crate::state_paths::migrate_legacy_state_dir(root)?;
     let memory_root = shared_memory_root(root);
     fs::create_dir_all(&memory_root)?;
     let lock_path = memory_root.join(".board-operation.lock");
     let _lock = acquire_file_lock(
         &lock_path,
-        SHARED_STORE_WRITE_LOCK_WAIT,
+        lock_wait,
         SHARED_STORE_WRITE_LOCK_RETRY,
         "shared store write lock",
     )?;
@@ -278,7 +229,7 @@ pub(super) fn migrate_legacy_provider_memory_dirs(root: &Path) -> Result<()> {
         migrated_any = true;
     }
     if migrated_any {
-        trace_event("migrated legacy provider memory stores into shared memory");
+        tracing::info!("migrated legacy provider memory stores into shared memory");
     }
     Ok(())
 }
@@ -320,14 +271,6 @@ pub fn segmented_store_options() -> PipelineOptions {
 /// live in the shared memory store. One resident owner publishes both stores
 /// into the immutable view searched by every provider.
 pub const WORKSPACE_MEMORY_NAME: &str = "workspace-memory";
-pub fn trace_event(event: &str) {
-    let Some(path) = std::env::var_os("MEMBRICK_MCP_TRACE_PATH") else {
-        return;
-    };
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{event}");
-    }
-}
 
 /// Open the project index, rebuilding it only when the workspace it describes
 /// has moved on. `ignore_paths` is part of that description: the documents the
@@ -461,6 +404,25 @@ pub(super) fn open_workspace_memory_owner_with_options_at(
 
     let memory_root = root.join(".membrick").join(memory_name);
     let provider_memory = MemoryService::at_path(&memory_root, options)?;
+    // Opening rebuilt any segment that changed since the last owner ran, into
+    // a new folder. The owner lock guarantees nothing still reads the old one.
+    for (store, store_root) in [
+        (&workspace, workspace_root),
+        (&provider_memory, &memory_root),
+    ] {
+        match store.remove_unused_segment_lexical_dirs() {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(
+                removed,
+                store = %store_root.display(),
+                "removed unused segment lexical folders"
+            ),
+            Err(error) => tracing::warn!(
+                store = %store_root.display(),
+                "could not remove unused segment lexical folders: {error:#}"
+            ),
+        }
+    }
     Ok(MemoryService::retain_workspace_store(
         provider_memory,
         workspace,
@@ -636,6 +598,107 @@ mod tests {
     }
 
     #[test]
+    fn reveals_bug_owner_startup_keeps_lexical_folders_of_earlier_segment_versions() {
+        let root = board_test_root("lexical-folder-sweep");
+        fs::create_dir_all(&root).unwrap();
+        let open = || {
+            open_workspace_memory_owner(&root, SHARED_MEMORY_DIR, &[], || {
+                Ok(vec![document(
+                    "workspace-initial",
+                    "docs/readme.md",
+                    "guide",
+                )])
+            })
+            .unwrap()
+        };
+        // Each owner run changes one session segment, so each start builds
+        // that segment's lexical index into a new content-addressed folder.
+        for content in ["first capture", "second capture", "third capture"] {
+            let mut owner = open();
+            let mut turn = document("session-turn", "session/turn.md", content);
+            turn.group_id = Some("session-a".to_string());
+            owner.upsert(turn);
+            owner.refresh_index().unwrap();
+        }
+        drop(open());
+
+        let memory_root = root.join(".membrick").join(SHARED_MEMORY_DIR);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(memory_root.join("semantic").join("segments.json")).unwrap(),
+        )
+        .unwrap();
+        let entries = manifest["segments"].as_array().unwrap();
+        let mut on_disk = fs::read_dir(memory_root.join("segment-lexical"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        on_disk.sort();
+        assert_eq!(
+            on_disk.len(),
+            entries.len(),
+            "one lexical folder per live segment, found {on_disk:?}"
+        );
+        let mut listed = entries
+            .iter()
+            .map(|entry| entry["lexical_dir"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert_eq!(
+            on_disk, listed,
+            "only the folders the manifest lists should remain after an owner start"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reveals_bug_running_owner_keeps_rebuilt_segments_off_disk_and_old_folders_on_disk() {
+        let root = board_test_root("lexical-folder-runtime");
+        fs::create_dir_all(&root).unwrap();
+        let mut owner = open_workspace_memory_owner(&root, SHARED_MEMORY_DIR, &[], || {
+            Ok(vec![document(
+                "workspace-initial",
+                "docs/readme.md",
+                "guide",
+            )])
+        })
+        .unwrap();
+        // One running owner rebuilds the session segment on every change,
+        // through the same staged write and background publication the
+        // resident uses.
+        for content in ["first capture", "second capture", "third capture"] {
+            let mut turn = document("session-turn", "session/turn.md", content);
+            turn.group_id = Some("session-a".to_string());
+            owner.stage_upsert_batch(vec![turn]).unwrap();
+            owner.begin_checkpoint_publication().unwrap();
+            owner.wait_publication().unwrap();
+        }
+
+        let live = owner.store.segment_lexical_dir_names();
+        assert!(
+            live.iter().all(Option::is_some),
+            "rebuilt segments should keep their lexical index on disk, got {live:?}"
+        );
+        let mut live = live.into_iter().flatten().collect::<Vec<_>>();
+        live.sort();
+        let memory_root = root.join(".membrick").join(SHARED_MEMORY_DIR);
+        let mut on_disk = fs::read_dir(memory_root.join("segment-lexical"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        on_disk.sort();
+        assert_eq!(
+            on_disk, live,
+            "a folder no snapshot uses should be removed while the owner runs"
+        );
+        drop(owner);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn only_one_resident_can_own_a_project_at_a_time() {
         let root = board_test_root("exclusive-resident-owner");
         fs::create_dir_all(&root).unwrap();
@@ -688,9 +751,10 @@ mod tests {
     #[test]
     fn shared_board_lock_serializes_writers_across_service_instances() {
         const WRITERS: usize = 6;
+        const TEST_LOCK_WAIT: Duration = Duration::from_secs(60);
         let root = board_test_root("concurrent");
         let workspace = root.to_string_lossy().into_owned();
-        let board = with_shared_memory_service(&root, |service| {
+        let board = with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
             service.board_open("mcp", &workspace, "parallel", "Parallel")
         })
         .unwrap();
@@ -701,7 +765,7 @@ mod tests {
             let workspace = workspace.clone();
             let board_id = board.board_id.clone();
             writers.push(std::thread::spawn(move || {
-                with_shared_memory_service(&root, |service| {
+                with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
                     service.board_post(
                         Some(&board_id),
                         "mcp",
@@ -725,7 +789,7 @@ mod tests {
         sequences.sort_unstable();
         assert_eq!(sequences, (1..=WRITERS as u64).collect::<Vec<_>>());
 
-        let posts = with_shared_memory_service(&root, |service| {
+        let posts = with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
             service.board_read(Some(&board.board_id), "mcp", &workspace, None, None, 100)
         })
         .unwrap();
@@ -791,7 +855,7 @@ mod tests {
         SourceDocument {
             doc_id: doc_id.to_string(),
             source: source.to_string(),
-            content: content.to_string(),
+            content: content.into(),
             concept: "test".to_string(),
             group_id: None,
             filters: BTreeMap::new(),

@@ -63,7 +63,7 @@ One bounded freshness adjustment within each score tier
 Stable final ranking, evidence, and score diagnostics
 ```
 
-Eligibility constraints must take effect before ineligible documents consume the candidate budget where supported. An audit must identify any late filtering and test that it does not starve eligible results. Observation documents remain retained evidence; freshness must not reopen automatic retrieval eligibility for raw observations.
+Eligibility constraints must take effect before ineligible documents consume the candidate budget where supported. An audit must identify any late filtering and test that it does not starve eligible results. Raw provider transcripts remain outside the search index; freshness operates on the searchable turn and context documents.
 
 ## Ranking contract
 

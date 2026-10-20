@@ -7,7 +7,7 @@ meta:
   - property: og:description
     content: "Membrick exposes persistent agent memory as an MCP server: search, session recording, and memory controls as tools any MCP-capable client can call."
   - property: og:image
-    content: https://rooagi.github.io/Membrick/assets/images/social/mcp-memory-server.png
+    content: https://rooagi.github.io/Membrick/assets/images/social/mcp-memory-server-membrick.png
   - property: og:image:width
     content: "1200"
   - property: og:image:height

@@ -328,7 +328,7 @@ mod tests {
         SourceDocument {
             doc_id: "doc-1".to_string(),
             source: "docs/install.md".to_string(),
-            content: "install guide for linux hosts".to_string(),
+            content: "install guide for linux hosts".to_string().into(),
             concept: "install guide".to_string(),
             group_id: None,
             filters: std::collections::BTreeMap::new(),

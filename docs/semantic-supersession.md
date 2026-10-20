@@ -68,19 +68,18 @@ can therefore confirm, conflict with, or explicitly correct facts from earlier
 sessions in the same project. Ordinary captures and provider summaries retain
 their per-session scope.
 
-Hooks send the session-context document in the same upsert batch as the
-observations it links through the existing `links` field. Claims retain
+Hooks send the session-context document in the same upsert batch as the turn
+document it links through the existing `links` field. Claims retain
 evidence text from the context and relations use the core semantic detector.
 When claim evidence appears verbatim inside a linked turn document, the receipt
 adds that turn's document ID and byte span to the evidence text.
 
-Claude Code and Codex hook ingestion now sends one ordered `session-observation`
-document per parsed message and one linked `session-context` document. The
-observation documents stay scoped to their originating session, so claims in
-different turns can be compared without mixing sessions. The context documents
-use the existing shared project-and-user scope for cross-session comparisons,
-including sessions captured by different providers.
-Both document types are searchable by automatic hooks. Hooks select bounded,
+Claude Code and Codex hook ingestion sends one ordered turn document per
+captured transcript slice and one linked `session-context` document. It does
+not index separate raw observation documents. Turn documents stay scoped to
+their originating session, while context documents use the existing shared
+project-and-user scope for cross-session comparisons, including sessions
+captured by different providers. Hooks select bounded,
 query-matched excerpts rather than returning complete source documents, and
 exclude conflicted search results. Explicit search remains available for
 inspecting conflicts and complete source documents.

@@ -8,7 +8,7 @@ fn query_baseline_still_works_without_semantic_match() {
     let index = MemoryIndex::from_records(vec![DocRecord {
         doc_id: "d1".to_string(),
         source: "d1.md".to_string(),
-        content: "docker install on linux".to_string(),
+        content: "docker install on linux".into(),
         timestamp: None,
         doc_length: 24,
         author_agent: None,
@@ -196,7 +196,7 @@ fn semantic_expansion_improves_recall_for_synonyms() {
     let index = MemoryIndex::from_records(vec![DocRecord {
         doc_id: "d2".to_string(),
         source: "d2.md".to_string(),
-        content: "job role and occupation details".to_string(),
+        content: "job role and occupation details".into(),
         timestamp: None,
         doc_length: 31,
         author_agent: None,

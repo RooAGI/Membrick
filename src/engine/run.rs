@@ -249,6 +249,18 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         }
     }
 
+    if let Some(session_id) = args.recapture_session.as_deref() {
+        #[cfg(any(feature = "claude-code", feature = "codex"))]
+        {
+            return run_recapture_session(&args, session_id);
+        }
+        #[cfg(not(any(feature = "claude-code", feature = "codex")))]
+        {
+            let _ = session_id;
+            anyhow::bail!("session recapture requires the Claude Code or Codex feature");
+        }
+    }
+
     if args.replay_session.is_some() {
         #[cfg(any(
             feature = "claude-code",
@@ -850,7 +862,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             )?;
             if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built)
             {
-                eprintln!("warning: unable to persist query cache: {}", err);
+                tracing::warn!("unable to persist query cache: {}", err);
             }
             built
         };
@@ -1001,7 +1013,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             Some(&lexical_dir),
         )?;
         if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &index) {
-            eprintln!("warning: unable to persist query cache: {}", err);
+            tracing::warn!("unable to persist query cache: {}", err);
         }
         if args.index_redacted {
             println!(
@@ -1225,7 +1237,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             Some(&lexical_dir),
         )?;
         if let Err(err) = save_cached_query_index(&cache_settings, &corpus_fingerprint, &built) {
-            eprintln!("warning: unable to persist review search index: {}", err);
+            tracing::warn!("unable to persist review search index: {}", err);
         }
         built
     };
@@ -1239,6 +1251,71 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
 }
 
 /// CLI index diagnostics use the same MemoryService boundary as serving paths.
+/// `--recapture-session`: rebuild one session's documents from its transcript
+/// and, with `--recapture-apply`, swap them in for the stored ones.
+#[cfg(any(feature = "claude-code", feature = "codex"))]
+fn run_recapture_session(args: &crate::cli::Args, session_id: &str) -> Result<()> {
+    use crate::memory_api::transcript_capture::{
+        rebuild_session_documents, replace_session_documents, CaptureRequest,
+    };
+    use anyhow::Context;
+    let provider = match args.session_provider {
+        crate::cli::SessionProvider::Claude => "claude",
+        crate::cli::SessionProvider::Codex => "codex",
+        _ => anyhow::bail!("recapture supports the claude and codex session providers"),
+    };
+    let root = std::fs::canonicalize(&args.path)?;
+    let transcript = std::fs::canonicalize(
+        args.recapture_transcript
+            .as_deref()
+            .context("--recapture-transcript is required")?,
+    )?;
+    let request = CaptureRequest {
+        provider: provider.into(),
+        document_type: "outcome".into(),
+        input: serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript,
+            "cwd": root,
+            "hook_event_name": "Stop",
+        }),
+    };
+    let started = Instant::now();
+    let rebuilt = rebuild_session_documents(&root, &request)?;
+    let bytes: usize = rebuilt.documents.iter().map(|d| d.content.len()).sum();
+    let largest = rebuilt
+        .documents
+        .iter()
+        .map(|d| d.content.len())
+        .max()
+        .unwrap_or(0);
+    let groups: HashSet<_> = rebuilt
+        .documents
+        .iter()
+        .filter_map(|d| d.group_id.as_deref())
+        .collect();
+    let encoded = serde_json::to_vec(&rebuilt.documents)?.len();
+    let mut report = serde_json::json!({
+        "provider": provider,
+        "session_id": session_id,
+        "transcript_bytes": std::fs::metadata(&transcript)?.len(),
+        "batches": rebuilt.batches,
+        "documents": rebuilt.documents.len(),
+        "content_bytes": bytes,
+        "largest_document_bytes": largest,
+        "groups": groups.len(),
+        "request_body_bytes": encoded,
+        "rebuild_ms": started.elapsed().as_millis() as u64,
+        "applied": false,
+    });
+    if args.recapture_apply {
+        replace_session_documents(&root, &request, rebuilt.documents)?;
+        report["applied"] = serde_json::Value::Bool(true);
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 fn inspect_index_store(index_path: &Path, view: IndexInspectView) -> Result<()> {
     if !index_path.exists() {
         anyhow::bail!("index path does not exist: {}", index_path.display());

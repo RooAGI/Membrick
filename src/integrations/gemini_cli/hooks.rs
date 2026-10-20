@@ -1,3 +1,4 @@
+use crate::integrations::capture_text;
 use crate::integrations::session_recording::{
     membrick_enabled, record_event_if_enabled, RecordingProvider,
 };
@@ -91,15 +92,23 @@ pub fn run_hook_for(
         crate::integrations::read_bounded_json().context("failed to parse Gemini hook input")?;
     let input: GeminiHookInput =
         serde_json::from_value(raw.clone()).context("failed to decode Gemini hook input")?;
-    let root = resolve_root(&input.cwd, fallback_root)?;
+    let root = match resolve_root(&input.cwd, fallback_root) {
+        Ok(Some(root)) => root,
+        // No Membrick install covers this folder: nothing to recall or capture.
+        Ok(None) => return write_output(&GeminiHookOutput::default()),
+        Err(error) => {
+            tracing::warn!("Membrick {provider_label} hook skipped: {error:#}");
+            return write_output(&GeminiHookOutput::default());
+        }
+    };
     if let Err(error) =
         record_event_if_enabled(provider, &root, &input.session_id, kind.event_name(), raw)
     {
-        eprintln!("warning: Membrick {provider_label} session recording failed open: {error:#}");
+        tracing::warn!("Membrick {provider_label} session recording failed open: {error:#}");
     }
     let mut output =
         handle_hook(kind, &input, &root, provider, provider_label).unwrap_or_else(|error| {
-            eprintln!("warning: Membrick {provider_label} hook failed open: {error:#}");
+            tracing::warn!("Membrick {provider_label} hook failed open: {error:#}");
             GeminiHookOutput::default()
         });
     if kind == GeminiHookKind::SessionEnd {
@@ -115,8 +124,12 @@ pub fn run_hook_for(
     if kind == GeminiHookKind::SessionStart {
         output.system_message = crate::updater::take_update_notice();
     }
+    write_output(&output)
+}
+
+fn write_output(output: &GeminiHookOutput) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &output)?;
+    serde_json::to_writer(&mut stdout, output)?;
     stdout.write_all(b"\n")?;
     Ok(())
 }
@@ -240,7 +253,7 @@ fn handle_hook(
     Ok(GeminiHookOutput {
         hook_specific_output: Some(GeminiHookSpecificOutput {
             hook_event_name: kind.event_name().into(),
-            additional_context: context,
+            additional_context: capture_text::mark_memory_context(&context),
         }),
         system_message: None,
     })
@@ -282,7 +295,7 @@ fn capture(
     let document = SourceDocument {
         doc_id: crate::ids::stable_doc_id_from_source(&source),
         source,
-        content: format!("{} {document_type}\n{content}", provider.as_str()),
+        content: format!("{} {document_type}\n{content}", provider.as_str()).into(),
         concept: document_type.to_string(),
         group_id: Some(format!(
             "{}-session:{}",
@@ -339,20 +352,37 @@ fn capture_content(input: &GeminiHookInput) -> Result<String> {
         Value::Object(value)
     };
     let mut text = Vec::new();
-    collect_capture_text(&value, &mut text);
+    collect_capture_text(&value, None, &mut text);
     Ok(redact_capture_text(&text.join("\n")))
 }
 
-fn collect_capture_text(value: &Value, output: &mut Vec<String>) {
+/// Collect transcript text. Tool output (the `output`, `response` and
+/// `result` fields) keeps only its start and end, and injected memory
+/// context is dropped.
+fn collect_capture_text(value: &Value, max_bytes: Option<usize>, output: &mut Vec<String>) {
     match value {
-        Value::String(text) if !text.trim().is_empty() => output.push(text.trim().to_string()),
+        Value::String(text) => {
+            let text = capture_text::strip_memory_context(text);
+            let text = text.trim();
+            if !text.is_empty() {
+                output.push(match max_bytes {
+                    Some(max_bytes) => capture_text::clip(text, max_bytes),
+                    None => text.to_string(),
+                });
+            }
+        }
         Value::Array(values) => values
             .iter()
-            .for_each(|value| collect_capture_text(value, output)),
+            .for_each(|value| collect_capture_text(value, max_bytes, output)),
         Value::Object(values) => {
             for key in ["content", "text", "message", "output", "response", "result"] {
                 if let Some(value) = values.get(key) {
-                    collect_capture_text(value, output);
+                    let max_bytes = if matches!(key, "output" | "response" | "result") {
+                        Some(capture_text::MAX_TOOL_OUTPUT_BYTES)
+                    } else {
+                        max_bytes
+                    };
+                    collect_capture_text(value, max_bytes, output);
                 }
             }
         }
@@ -383,22 +413,15 @@ fn redact_capture_text(value: &str) -> String {
         .join("\n")
 }
 
-fn resolve_root(cwd: &Path, fallback: &Path) -> Result<PathBuf> {
-    let fallback = fallback.canonicalize().with_context(|| {
-        format!(
-            "failed to resolve Gemini fallback root {}",
-            fallback.display()
-        )
-    })?;
-    let candidate = if cwd.as_os_str().is_empty() {
-        fallback.clone()
+/// The installed project root that covers the hook's cwd, or None when no
+/// Membrick install covers it.
+fn resolve_root(cwd: &Path, fallback: &Path) -> Result<Option<PathBuf>> {
+    let start = if cwd.as_os_str().is_empty() {
+        fallback
     } else {
-        cwd.canonicalize()?
+        cwd
     };
-    if !candidate.starts_with(&fallback) {
-        anyhow::bail!("Gemini hook cwd is outside configured project root")
-    }
-    Ok(candidate)
+    crate::state_paths::find_project_root(start)
 }
 
 #[cfg(test)]
@@ -418,6 +441,7 @@ mod tests {
             .join("target")
             .join(format!("membrick-gemini-hook-{name}-{nonce}"));
         fs::create_dir_all(&root).unwrap();
+        crate::state_paths::record_install_settings(&root).unwrap();
         root
     }
     #[test]

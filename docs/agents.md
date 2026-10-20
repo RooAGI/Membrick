@@ -34,10 +34,10 @@ the legacy directory untouched, so no memory is lost.
 1. A lifecycle hook receives the agent event and transcript context.
 2. Retrieval hooks query the existing `MemoryService` and return relevant context
    to the agent.
-3. Claude Code and Codex capture hooks preserve every parsed transcript
-   observation with its speaker and source order, including structured tool
-   and image blocks serialized from the transcript. Other adapters capture the
-   observations available in their provider payloads.
+3. Claude Code and Codex capture hooks preserve every parsed transcript message
+   with its speaker and source order inside one searchable turn document,
+   including structured tool and image blocks serialized from the transcript.
+   Other adapters capture the messages available in their provider payloads.
 4. The adapter upserts the document and refreshes the index snapshot.
 5. The next prompt can query the newly refreshed snapshot.
 
@@ -70,7 +70,7 @@ sequenceDiagram
     H-->>A: Inject context for next decision
     A-->>U: Complete response
     A->>H: Stop / AfterAgent
-    H->>H: Preserve available session observations
+    H->>H: Preserve available messages in one searchable turn
     H->>I: Upsert outcome + refresh snapshot
 ```
 
@@ -196,9 +196,10 @@ not update the searchable `MemoryService`:
 
 At a capture event, Claude Code and Codex read only complete transcript lines
 appended since the previous durable capture. They preserve every parsed message
-and structured block in source order, after credential redaction. Each message
-becomes an observation document; the captured slice also becomes a turn
-document, and a stable session-context document links the observations. The
+and structured block in source order, after credential redaction. The captured
+slice becomes one searchable turn document, and a stable session-context
+document links that turn. Separate `session-observation` documents are not
+indexed because they duplicate the turn document. The
 cursor advances only after the batch is accepted by the resident `MemoryService`.
 Other adapters capture the session data exposed in their hook payloads. Claude
 and Codex send each batch as one upsert. The hook returns once the batch is

@@ -130,6 +130,118 @@ impl CaptureRequest {
     }
 }
 
+/// Every document a transcript yields under the current capture rules.
+pub(crate) struct SessionRebuild {
+    pub documents: Vec<SourceDocument>,
+    pub batches: usize,
+}
+
+/// Rebuild a session's documents from its whole transcript, in order, without
+/// touching the session's real cursor: a scratch cursor under the project is
+/// removed afterwards. Documents that share an ID keep the last one, as the
+/// resident's upsert would.
+///
+/// Document IDs depend on where each capture batch started, so a rebuild does
+/// not reproduce the IDs of documents captured earlier in other slices. Use
+/// [`replace_session_documents`] to swap the rebuilt set in for the old one.
+pub(crate) fn rebuild_session_documents(
+    root: &Path,
+    request: &CaptureRequest,
+) -> Result<SessionRebuild> {
+    request.validate(root)?;
+    let scratch = root
+        .join(".membrick")
+        .join(format!("recapture-scratch-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch)?;
+    let result = (|| {
+        let mut by_id: BTreeMap<String, SourceDocument> = BTreeMap::new();
+        let batches = transcript_cursor::replay_batches(
+            &scratch,
+            request.session_id()?,
+            &request.transcript()?,
+            |slice| {
+                for document in request.documents(root, slice)? {
+                    by_id.insert(document.doc_id.clone(), document);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(SessionRebuild {
+            documents: by_id.into_values().collect(),
+            batches,
+        })
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// The resident rejects request bodies over 16 MiB; keep each write well under.
+const REPLACE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Swap a session's stored documents for a rebuilt set. The first write
+/// replaces: every stored document of the session that it does not contain is
+/// removed. The rest follow as plain upserts, so a set too large for one
+/// request still ends up whole. Every ID is stable, so running the swap again
+/// after a failure converges on the same documents.
+pub(crate) fn replace_session_documents(
+    root: &Path,
+    request: &CaptureRequest,
+    documents: Vec<SourceDocument>,
+) -> Result<()> {
+    replace_session_documents_in_chunks(root, request, documents, REPLACE_CHUNK_BYTES)
+}
+
+fn replace_session_documents_in_chunks(
+    root: &Path,
+    request: &CaptureRequest,
+    documents: Vec<SourceDocument>,
+    chunk_limit: usize,
+) -> Result<()> {
+    let session_id = request.session_id()?.to_string();
+    anyhow::ensure!(
+        !documents.is_empty(),
+        "refusing to replace a session with no documents"
+    );
+    anyhow::ensure!(
+        documents
+            .iter()
+            .all(|document| document.filters.get("session_id") == Some(&session_id)),
+        "a rebuilt document does not belong to session {session_id}"
+    );
+    let mut chunks: Vec<Vec<SourceDocument>> = vec![vec![]];
+    let mut chunk_bytes = 0;
+    for document in documents {
+        let size = serde_json::to_vec(&document)?.len();
+        if chunk_bytes > 0 && chunk_bytes + size > chunk_limit {
+            chunks.push(vec![]);
+            chunk_bytes = 0;
+        }
+        chunk_bytes += size;
+        chunks
+            .last_mut()
+            .expect("a chunk always exists")
+            .push(document);
+    }
+    let mut chunks = chunks.into_iter();
+    crate::integrations::mcp_tools::replace_hook_documents(
+        root,
+        &request.provider,
+        &session_id,
+        "session_id",
+        &session_id,
+        chunks.next().expect("a chunk always exists"),
+    )?;
+    for chunk in chunks {
+        crate::integrations::mcp_tools::upsert_hook_documents(
+            root,
+            &request.provider,
+            &session_id,
+            chunk,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingCapture {
     request: CaptureRequest,
@@ -236,7 +348,7 @@ impl MemoryService {
                 }
                 Err(error) => {
                     let error = format!("invalid pending capture {}: {error:#}", path.display());
-                    eprintln!("{error}");
+                    tracing::warn!("{error}");
                     load_errors.push(CaptureStatus {
                         provider: "unknown".into(),
                         session_id: path
@@ -476,7 +588,7 @@ fn worker_loop(queue: Arc<Queue>, persist: &Persist) {
                 if let Err(error) = save_record(&queue.root, &key, record) {
                     record.last_error = Some(format!("failed to save capture progress: {error:#}"));
                     record.retry_after_ms = now_ms() + 1000;
-                    eprintln!("{}", record.last_error.as_deref().unwrap());
+                    tracing::warn!("{}", record.last_error.as_deref().unwrap());
                 }
             }
             drop(records);
@@ -551,6 +663,83 @@ mod tests {
             .unwrap()
             .iter()
             .all(|s| s.status == "caught-up")
+    }
+
+    #[test]
+    fn rebuild_swaps_in_new_documents_and_drops_the_old_ones() {
+        let f = Fixture::new();
+        let session = "rebuild-session";
+        let request = f.request(session, false);
+        // A document an earlier capture stored for the same session, under an
+        // ID the rebuild will not reproduce, plus one from another session.
+        let stored = |source: &str, session: &str| {
+            let mut document = SourceDocument::with_stable_doc_id_from_source(
+                source.into(),
+                format!("old {source}"),
+                "outcome".into(),
+                Some(format!("codex-session:p:{session}")),
+                vec![],
+                vec![],
+                None,
+                Some("codex".into()),
+            );
+            document.filters = BTreeMap::from([
+                ("provider".to_string(), "codex".to_string()),
+                ("session_id".to_string(), session.to_string()),
+            ]);
+            document
+        };
+        let stale = stored("codex://p/rebuild-session/old-slice", session);
+        let other = stored("codex://p/other-session/outcome", "other-session");
+        crate::integrations::mcp_tools::upsert_hook_documents(
+            &f.0,
+            "codex",
+            session,
+            vec![stale.clone(), other.clone()],
+        )
+        .unwrap();
+
+        let rebuilt = rebuild_session_documents(&f.0, &request).unwrap();
+        assert!(rebuilt.documents.len() >= 2, "a turn and a session context");
+        assert!(rebuilt.documents.iter().all(|d| d.doc_id != stale.doc_id));
+        // The session's real cursor and the scratch cursor are left alone.
+        let state = provider_state_dir(RecordingProvider::Codex, &f.0);
+        assert!(!state.join("capture-cursors").exists());
+        assert!(!f
+            .0
+            .join(".membrick")
+            .join(format!("recapture-scratch-{}", std::process::id()))
+            .exists());
+
+        // One document per chunk forces a replace followed by plain upserts.
+        replace_session_documents_in_chunks(&f.0, &request, rebuilt.documents.clone(), 1).unwrap();
+        MemoryService::with_shared_memory(&f.0, |memory| {
+            let ids = |wanted: &str| {
+                memory
+                    .source_documents()
+                    .into_iter()
+                    .filter(|d| d.filters.get("session_id").map(String::as_str) == Some(wanted))
+                    .map(|d| d.doc_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let expected = rebuilt
+                .documents
+                .iter()
+                .map(|d| d.doc_id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(ids(session), expected, "old document gone, all new present");
+            assert_eq!(
+                ids("other-session").len(),
+                1,
+                "other sessions are untouched"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        // A second run converges on the same set.
+        replace_session_documents(&f.0, &request, rebuilt.documents).unwrap();
+        assert!(replace_session_documents(&f.0, &request, vec![]).is_err());
     }
 
     #[test]

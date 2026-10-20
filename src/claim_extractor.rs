@@ -1,5 +1,7 @@
 use crate::index::{Claim, ClaimEvidence, ClaimStatus, DocRecord, SectionChunk};
 use crate::reasoning_rules::reasoning_rules;
+use regex::Regex;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default)]
 pub struct ExtractedClaims {
@@ -21,6 +23,7 @@ pub(crate) fn extract_native_event_claims(record: &DocRecord) -> Vec<Claim> {
     for chunk in &record.section_chunks {
         let mut event_claims = extract_event_relations(&chunk.content);
         event_claims.extend(extract_acquisition_relations(&chunk.content));
+        event_claims.extend(personal_claims_for_chunk(record, chunk));
         let timestamp = chunk.timestamp.as_ref().or(record.timestamp.as_ref());
         if let Some(timestamp) = timestamp {
             let event_subjects: Vec<String> = event_claims
@@ -33,7 +36,9 @@ pub(crate) fn extract_native_event_claims(record: &DocRecord) -> Vec<Claim> {
             }
         }
         for claim in &mut event_claims {
-            claim.evidence = Some(claim_evidence(record, chunk, &chunk.content, None, None));
+            if claim.evidence.is_none() {
+                claim.evidence = Some(claim_evidence(record, chunk, &chunk.content, None, None));
+            }
         }
         claims.extend(event_claims);
     }
@@ -78,6 +83,7 @@ fn chunk_claims(record: &DocRecord, chunk: &SectionChunk) -> Vec<Claim> {
 
     out.extend(extract_event_relations(&chunk.content));
     out.extend(extract_acquisition_relations(&chunk.content));
+    out.extend(personal_claims_for_chunk(record, chunk));
 
     if let Some(topic) = record
         .probable_topic
@@ -146,6 +152,23 @@ fn chunk_claims(record: &DocRecord, chunk: &SectionChunk) -> Vec<Claim> {
     out
 }
 
+fn personal_claims_for_chunk(record: &DocRecord, chunk: &SectionChunk) -> Vec<Claim> {
+    extract_personal_claim_spans(&chunk.content)
+        .into_iter()
+        .map(|span| {
+            let mut claim = span.claim;
+            claim.evidence = Some(claim_evidence(
+                record,
+                chunk,
+                &chunk.content[span.start_byte..span.end_byte],
+                Some(span.start_byte),
+                Some(span.end_byte),
+            ));
+            claim
+        })
+        .collect()
+}
+
 fn claim_evidence(
     record: &DocRecord,
     chunk: &SectionChunk,
@@ -162,6 +185,242 @@ fn claim_evidence(
         start_byte,
         end_byte,
     }
+}
+
+/// One conservative personal-fact assertion grounded in a byte range of its
+/// source text. This feeds both the index's existing `Claim` model and the
+/// semantic supersession layer, so those paths cannot silently develop
+/// different claim vocabularies.
+#[derive(Debug, Clone)]
+pub(crate) struct ClaimSpan {
+    pub claim: Claim,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// Extract profile and location relations used by the generic claim pipeline.
+/// Rules are intentionally explicit and fail closed: unknown language stays
+/// searchable as source text without being treated as a state-changing fact.
+pub(crate) fn extract_personal_claim_spans(text: &str) -> Vec<ClaimSpan> {
+    static RESIDENCE: OnceLock<Regex> = OnceLock::new();
+    static MOVE: OnceLock<Regex> = OnceLock::new();
+    static FAVORITE: OnceLock<Regex> = OnceLock::new();
+    static FOOD_PREFERENCE: OnceLock<Regex> = OnceLock::new();
+    static DIETARY: OnceLock<Regex> = OnceLock::new();
+    static WALK: OnceLock<Regex> = OnceLock::new();
+    static NO_REGULAR_PLACE: OnceLock<Regex> = OnceLock::new();
+
+    let residence = RESIDENCE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:i(?:['’]?m)?|we(?:['’]?re)?)\s+(?:currently\s+)?(?:live|living)\s+in\s+(?P<city>[^,.;!?]+?)(?:,\s+in\s+(?P<neighborhood>[^.;!?]+))?(?:[.!?]|$)")
+            .expect("valid residence rule")
+    });
+    let moved = MOVE.get_or_init(|| {
+        Regex::new(
+            r"(?i)\b(?:i(?:['’]?m)?|we(?:['’]?re)?)\s+moved\s+to\s+(?P<city>[^,.;!?]+)(?:[.!?]|$)",
+        )
+        .expect("valid move rule")
+    });
+    let favorite = FAVORITE.get_or_init(|| {
+        Regex::new(r"(?i)\bmy\s+favo[u]?rite\s+place\s+to\s+eat\s+is\s+(?P<place>[^.;!?]+)")
+            .expect("valid favorite restaurant rule")
+    });
+    let food_preference = FOOD_PREFERENCE.get_or_init(|| {
+        Regex::new(r"(?i)\btheir\s+(?P<food>[^.;!?]+?)\s+(?:is|are)\s+(?:the\s+)?best\b")
+            .expect("valid food preference rule")
+    });
+    let dietary = DIETARY.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:i['’]?m|i\s+am|we['’]?re|we\s+are)\s+(?P<diet>vegetarian|vegan|pescatarian)\b")
+            .expect("valid dietary rule")
+    });
+    let walk = WALK.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:a\s+)?(?P<minutes>\d+|one|two|three|four|five|ten|fifteen|twenty)[- ]minute\s+walk\s+from\s+(?:my|our)\s+flat\b")
+            .expect("valid home-walk rule")
+    });
+    let no_regular_place = NO_REGULAR_PLACE.get_or_init(|| {
+        Regex::new(r"(?i)\bhaven['’]?t\s+found\s+a\s+regular\s+place\s+to\s+eat\s+yet\b")
+            .expect("valid no-regular-place rule")
+    });
+
+    let mut output = Vec::new();
+    let mut city = None::<String>;
+    let mut neighborhood = None::<String>;
+    let mut restaurant = None::<String>;
+    for (start, end, sentence) in sentence_spans(text) {
+        if let Some(captures) = residence.captures(sentence) {
+            let city_value = clean_profile_value(captures.name("city").unwrap().as_str());
+            if !city_value.is_empty() {
+                let predicate = if city.is_some() && captures.name("neighborhood").is_none() {
+                    neighborhood = Some(city_value.clone());
+                    "resides_in_neighborhood"
+                } else {
+                    city = Some(city_value.clone());
+                    "resides_in_city"
+                };
+                output.push(profile_claim(
+                    "user",
+                    predicate,
+                    &city_value,
+                    None,
+                    start,
+                    end,
+                ));
+            }
+            if let Some(value) = captures.name("neighborhood") {
+                let neighborhood_value = clean_profile_value(value.as_str());
+                if !neighborhood_value.is_empty() {
+                    neighborhood = Some(neighborhood_value.clone());
+                    output.push(profile_claim(
+                        "user",
+                        "resides_in_neighborhood",
+                        &neighborhood_value,
+                        None,
+                        start,
+                        end,
+                    ));
+                }
+            }
+        } else if let Some(captures) = moved.captures(sentence) {
+            let city_value = clean_profile_value(captures.name("city").unwrap().as_str());
+            if !city_value.is_empty() {
+                city = Some(city_value.clone());
+                output.push(profile_claim(
+                    "user",
+                    "resides_in_city",
+                    &city_value,
+                    None,
+                    start,
+                    end,
+                ));
+            }
+        }
+
+        if let Some(captures) = favorite.captures(sentence) {
+            let value = clean_profile_value(captures.name("place").unwrap().as_str());
+            if !value.is_empty() {
+                restaurant = Some(value.clone());
+                output.push(profile_claim(
+                    "user",
+                    "favorite_restaurant",
+                    &value,
+                    None,
+                    start,
+                    end,
+                ));
+            }
+        }
+        if let Some(captures) = food_preference.captures(sentence) {
+            let value = clean_profile_value(captures.name("food").unwrap().as_str());
+            if !value.is_empty() {
+                output.push(profile_claim(
+                    "user",
+                    "likes_food",
+                    &value,
+                    None,
+                    start,
+                    end,
+                ));
+            }
+        }
+        if let Some(captures) = dietary.captures(sentence) {
+            output.push(profile_claim(
+                "user",
+                "dietary_preference",
+                &captures.name("diet").unwrap().as_str().to_lowercase(),
+                None,
+                start,
+                end,
+            ));
+        }
+        if let Some(captures) = walk.captures(sentence) {
+            if let (Some(place), Some(area)) = (restaurant.as_deref(), neighborhood.as_deref()) {
+                let minutes = captures.name("minutes").unwrap().as_str().to_lowercase();
+                output.push(profile_claim(
+                    place,
+                    "walk_minutes_from_residence",
+                    &format!("{minutes} minutes; residence={area}"),
+                    None,
+                    start,
+                    end,
+                ));
+            }
+        }
+        if no_regular_place.is_match(sentence) {
+            if let Some(area) = neighborhood.as_deref().or(city.as_deref()) {
+                output.push(profile_claim(
+                    "user",
+                    "has_regular_restaurant_in",
+                    area,
+                    Some(ClaimStatus::Negated),
+                    start,
+                    end,
+                ));
+            }
+        }
+    }
+    output
+}
+
+fn profile_claim(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    status: Option<ClaimStatus>,
+    start_byte: usize,
+    end_byte: usize,
+) -> ClaimSpan {
+    ClaimSpan {
+        claim: Claim {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            confidence: 0.9,
+            status,
+            event_time: None,
+            evidence: None,
+        },
+        start_byte,
+        end_byte,
+    }
+}
+
+fn clean_profile_value(value: &str) -> String {
+    let mut value = value
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .to_string();
+    for suffix in [" now", " last month", " this month", " recently"] {
+        if value.to_lowercase().ends_with(suffix) {
+            value.truncate(value.len() - suffix.len());
+            break;
+        }
+    }
+    value.trim().to_lowercase()
+}
+
+fn sentence_spans(text: &str) -> Vec<(usize, usize, &str)> {
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?' | '\n') {
+            let end = index + ch.len_utf8();
+            let leading = text[start..index].len() - text[start..index].trim_start().len();
+            let trailing = text[start..index].trim_end().len();
+            let span_start = start + leading;
+            let span_end = start + trailing;
+            if span_start < span_end {
+                spans.push((span_start, end, &text[span_start..end]));
+            }
+            start = end;
+        }
+    }
+    if start < text.len() {
+        let leading = text[start..].len() - text[start..].trim_start().len();
+        let span_start = start + leading;
+        if span_start < text.len() {
+            spans.push((span_start, text.len(), &text[span_start..]));
+        }
+    }
+    spans
 }
 
 /// Extract a small set of high-confidence event relations from first-person
@@ -452,7 +711,7 @@ mod tests {
         DocRecord {
             doc_id: "doc-1".to_string(),
             source: "source://doc-1".to_string(),
-            content: "Alice works at Acme".to_string(),
+            content: "Alice works at Acme".into(),
             timestamp: Some("2024-05-01".to_string()),
             doc_length: 20,
             author_agent: None,
@@ -481,7 +740,7 @@ mod tests {
             section_chunks: vec![SectionChunk {
                 chunk_id: "doc-1::chunk-0".to_string(),
                 heading: "Overview".to_string(),
-                content: "Alice works at Acme".to_string(),
+                content: "Alice works at Acme".into(),
                 start_line: 1,
                 end_line: 1,
                 timestamp: Some("2024-05-01".to_string()),

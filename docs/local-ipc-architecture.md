@@ -61,18 +61,83 @@ open promptly instead of holding the provider hook for the queue's full
 request timeout.
 
 Each workspace keeps its resident socket (macOS and Linux), startup marker,
-and diagnostics under its own `.membrick/runtime/` directory. On Unix-like
-systems the directory is restricted to the current user and the socket is
-restricted to its owner. Windows uses a workspace-specific named pipe, with
-its startup marker and diagnostics in the project runtime directory. Different
-project roots therefore use separate runtime state and endpoints without
-requiring access to the user's home directory.
+owner lock, and diagnostics under its own `.membrick/runtime/` directory. On
+Unix-like systems the directory is restricted to the current user and the
+socket is restricted to its owner. Windows uses a workspace-specific named
+pipe and the same project-scoped OS file locks for startup and resident
+ownership. The OS releases these locks when a process exits or crashes; the
+lock files may remain and are reused by the next owner. Different project roots
+therefore use separate runtime state and endpoints without requiring access to
+the user's home directory.
 
-On Ctrl-C or SIGTERM the resident stops accepting connections, flushes its
+The provider-launched MCP adapter requests resident startup when its stdio MCP
+process begins. That warm-up uses a short-lived kernel-locked lease in
+`.membrick/runtime/provider-leases/`. Hooks and other one-shot clients hold
+leases while a request is in flight. A Codex adapter also holds a lease while
+it has one or more bound active sessions; `SessionEnd` releases the lease when
+the adapter's final session ends. Other provider adapters do not hold a lease
+for their full process lifetime. The resident is shared by Claude, Codex, and
+other providers using the same project. After all request and session leases
+are released, the resident waits for `resident_idle_timeout_seconds` (60
+seconds by default, clamped to 5–3600) before flushing its writer and shutting
+down. A later provider or hook request starts a fresh resident automatically.
+Stale lease files are detected by testing the kernel lock and removed during
+the resident's lease scan. Lease registration and the resident's final
+empty-lease check share the kernel lock at
+`.membrick/runtime/provider-lifecycle.lock`. If a request starts while the
+resident is shutting down, registration waits until the old resident has
+closed its endpoints and flushed its writer; the request then starts a fresh
+owner. The resident holds this lock through its shutdown path. Manual
+`--resident-server` mode remains signal-controlled rather than idle-controlled.
+
+The dashboard and direct HTTP listener are served by the resident. Once it has
+idled out, direct browser access does not start it; a provider, hook, or other
+Membrick client request must wake the resident first.
+
+The shared `integrations::provider_lifecycle` manager stores adapter ownership
+under `.membrick/runtime/provider-adapters`. Each ownership token contains the
+provider, conversation ID, and provider-issued instance ID. End events match
+all three fields. Ending an earlier instance cannot release a resumed instance
+or another provider's ownership. Each provider integration translates its own
+signals into these tokens; dropping an adapter releases its ownership record.
+
+Codex adapters also bind the session IDs supplied by installed `SessionStart`
+and `UserPromptSubmit` MCP hooks, or by a tool call's `_meta.threadId`. The
+command `SessionEnd` hook releases that session's ownership under a project
+lock. Once a bound adapter has no remaining sessions, its MCP loop returns
+even if a Codex daemon still holds stdin open. Adapters shared by several
+bound sessions stay up until the final session ends. `SubagentStop` releases a
+bound subagent ID as well.
+
+Codex currently supplies only a conversation ID in its end hook. Its bridge
+therefore uses conversation-scoped ownership, without instance fencing. A
+delayed end event for an earlier resume of the same conversation remains
+ambiguous. The shared manager supports exact instance fencing, but the Codex
+bridge cannot use it until the host supplies a matching instance ID on both
+binding and end events. MCP tool metadata alone does not resolve that gap.
+
+This requires the updated, trusted Codex hooks. `SessionStart` can run before
+MCP initialization, so `UserPromptSubmit` retries binding. Clients without a
+session binding retain the usual stdin-EOF lifecycle; Membrick cannot infer
+their owning terminal. An abrupt disconnect that does not emit `SessionEnd`
+still relies on the host closing the MCP connection. See the
+[Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
+Codex emits this event.
+
+Published read views share immutable temporal facts and semantic relationships
+with the writer through copy-on-write ownership. Segmented stores keep search
+postings in their segments instead of retaining a second corpus-wide posting
+aggregate. Compatibility exports build the global aggregate only on demand.
+Prepared checkpoints stream records through a compressed buffer, then stream
+them back to ordinary JSON at the atomic disk write. This avoids retaining a
+full serialized corpus string beside the live records.
+This reduces duplication; document records, source text and active segment
+indexes still occupy memory, and publishing changed segments can raise peaks.
+
+On normal shutdown the resident stops accepting connections, flushes its
 writer, and removes its socket file if the path still refers to the socket it
 created. A socket left by a process that was killed outright is removed by the
-next owner when it fails to connect to it. The resident does not exit on its
-own when idle; stop it with SIGTERM.
+next owner when it fails to connect to it.
 
 Project installation creates `.membrick/server.toml` when it does not already
 exist. It preserves an existing file. The installed port is selected for the
@@ -83,6 +148,7 @@ one possible assignment:
 bind = "127.0.0.1:8080"
 resident_http_bind = "127.0.0.1:8465"
 resident_http_auto_port = true
+resident_idle_timeout_seconds = 60
 dashboard_url = "http://127.0.0.1:8465/dashboard"
 ```
 
@@ -107,6 +173,33 @@ are retained for 24 hours, then removed; incomplete temporary files follow the
 same retention period. Cleanup runs at resident startup and every 15 minutes.
 The startup recovery handles claims only after the previous resident has lost
 the project owner lock, so an active request is never mistaken for an orphan.
+
+## Resident memory ownership
+
+`MemoryService` remains the only entry point for reads and writes. The writer
+and published search views share immutable source documents and processed
+records through `Arc`. Replacing one document copies that document when an
+older reader still uses it; an unrelated write does not copy every document's
+content. Retired views release their entries when their last reader finishes.
+
+Published combined views reuse the segment indexes and omit the writer's
+semantic posting aggregate. Cross-document semantic relations and temporal
+facts remain available to retrieval. Checkpoints serialize borrowed records,
+and startup parses persisted JSON through a buffered reader, avoiding an extra
+copy of the complete file. The persisted record format is unchanged.
+
+Removing or replacing documents also removes obsolete pending posting keys.
+Persistent services cache at most 512 adjudication receipts after successful
+persistence. The existing receipt snapshot and journal retain the full history;
+older retries stream that history to recover the exact receipt. Failed receipt
+writes remain pinned in memory and are retried before eviction. Services with
+no persistent backing retain their receipts to preserve retry behavior.
+Request fingerprints remain the compact idempotency ledger, so the service can
+reject a reused request ID with different content.
+
+These changes reduce retained and temporary copies without discarding captured
+observations, source documents, or recorded MCP calls. Resident footprint still
+depends on corpus size, derived indexes, concurrent readers, and publication.
 
 ## Relationship to the HTTP server
 

@@ -310,7 +310,7 @@ pub(crate) fn record_mcp_tool_response(
         ),
     };
     if let Err(error) = record {
-        eprintln!("Membrick could not append MCP call history: {error:#}");
+        tracing::warn!("Membrick could not append MCP call history: {error:#}");
         if tool == "search"
             && response
                 .as_ref()
@@ -742,6 +742,7 @@ fn format_search_results(
                 "relation_confidence": result.relation_confidence,
                 "relation_evidence": result.relation_evidence,
                 "comparison_operands": result.comparison_operands,
+                "claim_states": service.semantic_claim_states(&result.doc_id),
                 "document_type": document.filters.get("document_type"),
                 "branch": document.filters.get("branch"),
                 "revision": document.filters.get("revision"),
@@ -1852,7 +1853,7 @@ mod tests {
         let target = SourceDocument {
             doc_id: "router-enrich-target".to_string(),
             source: "test://router-enrich-target".to_string(),
-            content: "The target contains a project decision.".to_string(),
+            content: "The target contains a project decision.".into(),
             concept: "decision".to_string(),
             group_id: None,
             filters: Default::default(),
@@ -1867,7 +1868,7 @@ mod tests {
         let evidence = SourceDocument {
             doc_id: "router-enrich-evidence".to_string(),
             source: "test://router-enrich-evidence".to_string(),
-            content: "The supporting evidence confirms the project decision.".to_string(),
+            content: "The supporting evidence confirms the project decision.".into(),
             concept: "evidence".to_string(),
             group_id: None,
             filters: Default::default(),
@@ -2218,7 +2219,7 @@ mod tests {
             SourceDocument {
                 doc_id: doc_id.to_string(),
                 source: format!("{provider}://project/session/outcome"),
-                content: "The deployment pipeline codename is cobalt".to_string(),
+                content: "The deployment pipeline codename is cobalt".into(),
                 concept: "outcome".to_string(),
                 group_id: Some(format!("{provider}-session:session")),
                 filters: BTreeMap::from([("provider".to_string(), provider.to_string())]),
@@ -2266,7 +2267,7 @@ mod tests {
         store.upsert(SourceDocument {
             doc_id: "memory-1".to_string(),
             source: "codex://project/session-1/outcome".to_string(),
-            content: "memory content".to_string(),
+            content: "memory content".into(),
             concept: "decision".to_string(),
             group_id: Some("session-1".to_string()),
             filters: BTreeMap::new(),
@@ -2281,7 +2282,7 @@ mod tests {
         store.upsert(SourceDocument {
             doc_id: "workspace-file".to_string(),
             source: "file:///workspace/README.md".to_string(),
-            content: "workspace content".to_string(),
+            content: "workspace content".into(),
             concept: "source-file".to_string(),
             group_id: None,
             filters: BTreeMap::new(),
@@ -2309,7 +2310,7 @@ mod tests {
         let document = SourceDocument {
             doc_id: "claude-session".to_string(),
             source: "claude-code://project/session/outcome".to_string(),
-            content: "captured Claude session".to_string(),
+            content: "captured Claude session".into(),
             concept: "outcome".to_string(),
             group_id: None,
             headings: vec![],
@@ -2330,7 +2331,7 @@ mod tests {
         let document = SourceDocument {
             doc_id: "muse-session".to_string(),
             source: "muse://project/session/outcome".to_string(),
-            content: "captured Muse session".to_string(),
+            content: "captured Muse session".into(),
             concept: "outcome".to_string(),
             group_id: Some("muse-session:project:session".to_string()),
             headings: vec![],
@@ -2380,7 +2381,7 @@ mod tests {
             SourceDocument {
                 doc_id: doc_id.to_string(),
                 source: "codex://project/session-1/outcome".to_string(),
-                content: "we deployed yesterday".to_string(),
+                content: "we deployed yesterday".into(),
                 concept: "outcome".to_string(),
                 group_id: Some("codex-session:project:session-1".to_string()),
                 filters: BTreeMap::new(),
@@ -2420,7 +2421,7 @@ mod tests {
         file.group_id = None;
         file.filters
             .insert("timestamp_kind".to_string(), "source_modified".to_string());
-        file.content = "Repository guide contents".to_string();
+        file.content = "Repository guide contents".into();
         store.upsert(file);
         let mut event = memory("file-event", Some("1792220974000"));
         event.source = "membrick://workspace/file-change/abc".to_string();
@@ -2432,7 +2433,7 @@ mod tests {
         event
             .filters
             .insert("timestamp_kind".to_string(), "workspace_event".to_string());
-        event.content = "Workspace file change".to_string();
+        event.content = "Workspace file change".into();
         store.upsert(event);
         let service = MemoryService::new(store);
         let payload = search_results(

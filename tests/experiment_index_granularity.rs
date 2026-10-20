@@ -20,7 +20,7 @@ fn source_doc(doc_id: &str, content: &str, group_id: &str) -> SourceDocument {
     SourceDocument {
         doc_id: doc_id.to_string(),
         source: format!("test/{doc_id}"),
-        content: content.to_string(),
+        content: content.into(),
         concept: "test-turn".to_string(),
         group_id: Some(group_id.to_string()),
         headings: vec![],

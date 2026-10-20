@@ -1,5 +1,6 @@
 pub mod document;
 pub mod hooks;
+mod lifecycle;
 
 use crate::adapters::{
     apply_ignore_paths, build_project_graph, graph_to_source_documents, AdapterInput,
@@ -25,7 +26,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use toml::map::Map as TomlMap;
@@ -76,6 +77,7 @@ struct CodexConfig {
 }
 
 struct CodexMcp {
+    lifecycle: lifecycle::AdapterLifecycle,
     root: PathBuf,
     max_bytes: usize,
     max_files: usize,
@@ -441,6 +443,15 @@ pub fn install_hook_settings(root: &Path, settings_path: Option<&Path>) -> Resul
                 "command": format!("{} {HOOK_MARKER} {hook_name}", shell_quote(&executable))
             }]
         }));
+        if matches!(*event_name, "SessionStart" | "UserPromptSubmit") {
+            entries.last_mut().unwrap()["hooks"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "type": "mcp_tool", "server": SERVER_NAME, "tool": "membrick_session",
+                    "input": {"session_id": "${session_id}"}, "timeout": 2
+                }));
+        }
     }
 
     write_json_object(&settings_path, &settings)?;
@@ -448,8 +459,10 @@ pub fn install_hook_settings(root: &Path, settings_path: Option<&Path>) -> Resul
 }
 
 pub fn run_server(root: &Path, options: CodexServerOptions<'_>) -> Result<()> {
-    mcp_index::trace_event("server-start");
+    crate::local_ipc::ensure_provider_resident(root, "codex")?;
+    tracing::debug!("MCP server starting");
     let mcp = CodexMcp {
+        lifecycle: lifecycle::AdapterLifecycle::new(root),
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
         max_files: options.max_files,
@@ -495,7 +508,7 @@ impl CodexMcp {
                     file_changes,
                 )
             {
-                eprintln!("warning: failed to save workspace file changes: {error:#}");
+                tracing::warn!("failed to save workspace file changes: {error:#}");
             }
             if workspace_index_changed {
                 *store = None;
@@ -530,18 +543,16 @@ impl CodexMcp {
     }
 
     fn serve(self) -> Result<()> {
-        let stdin = io::stdin();
         let stdout = io::stdout();
-        let mut reader = BufReader::new(stdin.lock());
         let mut writer = stdout.lock();
 
-        mcp_transport::serve_requests(
-            &mut reader,
+        mcp_transport::serve_stdin_until(
             &mut writer,
-            |request| self.handle_request(request),
-            |method| mcp_index::trace_event(&format!("request:{method}")),
-            |method, error| mcp_index::trace_event(&format!("request-error:{method}:{error:#}")),
-            || mcp_index::trace_event("response-written"),
+            || self.lifecycle.stopped(),
+            |request| {
+                tracing::debug!(method = request.method, "MCP request received");
+                self.handle_request(request)
+            },
         )
     }
 
@@ -579,6 +590,11 @@ impl CodexMcp {
             }
             "tools/call" => {
                 let params = request.params.unwrap_or_else(|| json!({}));
+                if let Some(session) = params.pointer("/_meta/threadId").and_then(Value::as_str) {
+                    if let Err(error) = self.lifecycle.bind(session) {
+                        tracing::warn!("could not bind Codex adapter session: {error:#}");
+                    }
+                }
                 let tool = params
                     .get("name")
                     .and_then(Value::as_str)
@@ -627,6 +643,23 @@ impl CodexMcp {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+
+        if tool_name == "membrick_session" {
+            self.lifecycle.bind(
+                arguments
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .context("session_id is required")?,
+            )?;
+            return Ok(JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                error: None,
+                result: Some(
+                    json!({"content":[{"type":"text","text":"{}"}],"structuredContent":{}}),
+                ),
+            });
+        }
 
         if tool_name == "update_membrick" {
             return mcp_tools::call_update_tool(id, &arguments);
@@ -986,6 +1019,11 @@ impl CodexMcp {
     fn tools(&self) -> Vec<ToolDefinition> {
         vec![
             ToolDefinition {
+                name: "membrick_session".into(),
+                description: "Bind this MCP connection to a Codex session. Called automatically by installed lifecycle hooks.".into(),
+                input_schema: json!({"type":"object","properties":{"session_id":{"type":"string","minLength":1,"maxLength":256}},"required":["session_id"],"additionalProperties":false}),
+            },
+            ToolDefinition {
                 name: "search".to_string(),
                 description:
                     "Search the indexed workspace and return concise, self-contained relevant memories."
@@ -1210,6 +1248,7 @@ mod tests {
         }
         store.refresh().unwrap();
         CodexMcp {
+            lifecycle: lifecycle::AdapterLifecycle::new(&root),
             root,
             max_bytes: 0,
             max_files: 0,
@@ -1271,6 +1310,7 @@ mod tests {
         .unwrap();
 
         let mcp = CodexMcp {
+            lifecycle: lifecycle::AdapterLifecycle::new(&root),
             root: root.clone(),
             max_bytes: 5_000_000,
             max_files: 50_000,
@@ -1489,6 +1529,13 @@ args = ["old"]
             .unwrap()
             .contains("--codex-hook stop"));
         assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
+        for event in ["SessionStart", "UserPromptSubmit"] {
+            let hooks = settings["hooks"][event][0]["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 2, "binding must remain idempotent");
+            assert_eq!(hooks[1]["type"], "mcp_tool");
+            assert_eq!(hooks[1]["tool"], "membrick_session");
+            assert_eq!(hooks[1]["input"]["session_id"], "${session_id}");
+        }
         assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 60);
         assert_eq!(
             settings["hooks"]["UserPromptExpansion"]
@@ -1521,6 +1568,7 @@ args = ["old"]
         assert_eq!(
             names,
             vec![
+                "membrick_session".to_string(),
                 "search".to_string(),
                 "info".to_string(),
                 "list_memories".to_string(),
@@ -1601,6 +1649,7 @@ args = ["old"]
     fn tools_list_does_not_initialize_store() {
         let root = temp_dir("mcp-lazy-store");
         let mcp = CodexMcp {
+            lifecycle: lifecycle::AdapterLifecycle::new(&root),
             root: root.clone(),
             max_bytes: 1_000_000,
             max_files: 100,
@@ -1633,7 +1682,7 @@ args = ["old"]
         let document = SourceDocument {
             doc_id: "doc-1".to_string(),
             source: "docs/install.md".to_string(),
-            content: "docker install guide".to_string(),
+            content: "docker install guide".into(),
             concept: "Install".to_string(),
             group_id: None,
             filters: std::collections::BTreeMap::new(),
@@ -1732,7 +1781,7 @@ args = ["old"]
         memory.upsert(SourceDocument {
             doc_id: "memory-1".to_string(),
             source: "codex://project/session/outcome".to_string(),
-            content: "The durable routing codename is cobalt".to_string(),
+            content: "The durable routing codename is cobalt".into(),
             concept: "Codex Code outcome".to_string(),
             group_id: Some("codex-session:session".to_string()),
             filters: std::collections::BTreeMap::new(),

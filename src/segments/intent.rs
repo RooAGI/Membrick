@@ -1333,7 +1333,7 @@ mod tests {
         DocRecord {
             doc_id: doc_id.to_string(),
             source: format!("memory://{doc_id}"),
-            content: content.to_string(),
+            content: content.to_string().into(),
             timestamp: None,
             doc_length: content.len(),
             author_agent: None,

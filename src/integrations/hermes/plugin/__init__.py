@@ -103,6 +103,14 @@ def automatic_retrieval_enabled(workspace_root=None):
 # --------------------------------------------------------------------------
 
 MAX_FIELD_CHARS = 2000
+MAX_HISTORY_CHARS = 4000
+
+# Recalled memory is wrapped in these markers so a later capture can drop it;
+# storing it again would only copy earlier memories into new ones. They match
+# the markers the Rust hook adapters use.
+MEMORY_CONTEXT_START = "<membrick-memory>"
+MEMORY_CONTEXT_END = "</membrick-memory>"
+_LEGACY_RECALL_HEADER = "[membrick memory — recalled for this turn]"
 
 
 def truncate(text, limit=MAX_FIELD_CHARS):
@@ -112,6 +120,27 @@ def truncate(text, limit=MAX_FIELD_CHARS):
     if len(text) <= limit:
         return text
     return text[:limit] + "…[truncated]"
+
+
+def strip_memory_context(text):
+    """Remove recalled memory that Hermes stamped into a message."""
+    if text is None:
+        return ""
+    text = str(text)
+    kept = []
+    while True:
+        start = text.find(MEMORY_CONTEXT_START)
+        if start < 0:
+            kept.append(text)
+            break
+        kept.append(text[:start])
+        end = text.find(MEMORY_CONTEXT_END, start)
+        if end < 0:
+            break
+        text = text[end + len(MEMORY_CONTEXT_END):]
+    text = "".join(kept)
+    legacy = text.find(_LEGACY_RECALL_HEADER)
+    return text if legacy < 0 else text[:legacy]
 
 
 # --------------------------------------------------------------------------
@@ -141,7 +170,7 @@ def build_turn_record(session_id, turn_id, user_message, assistant_response,
          "content": _meta_preamble(model=model, platform=platform,
                                    task_id=task_id,
                                    is_first_turn=is_first_turn)
-                    + "\n" + ("" if user_message is None else str(user_message))},
+                    + "\n" + strip_memory_context(user_message)},
         {"role": "assistant", "timestamp": None,
          "content": "" if assistant_response is None else str(assistant_response)},
     ]
@@ -172,8 +201,15 @@ def _history_text(conversation_history):
             content = " ".join(
                 str(p.get("text", "")) if isinstance(p, dict) else str(p)
                 for p in content)
-        lines.append("[%s] %s" % (role, "" if content is None else str(content)))
-    return "\n".join(lines)
+        content = strip_memory_context(content).strip()
+        if content:
+            lines.append("[%s] %s" % (role, content))
+    # The history repeats every earlier turn, which already has its own
+    # record; keep only its most recent part.
+    text = "\n".join(lines)
+    if len(text) > MAX_HISTORY_CHARS:
+        text = "…[earlier history omitted]\n" + text[-MAX_HISTORY_CHARS:]
+    return text
 
 
 
@@ -186,8 +222,8 @@ def build_tool_record(session_id, turn_id, tool_call_id, function_name,
     header += ("tool_call function_name=%s status=%s duration_ms=%s"
                % (function_name, status, duration_ms))
     parts = [header,
-             "args:\n" + ("" if function_args is None else str(function_args)),
-             "result:\n" + ("" if result is None else str(result))]
+             "args:\n" + truncate(function_args, MAX_FIELD_CHARS // 2),
+             "result:\n" + truncate(strip_memory_context(result))]
     if error_type or error_message:
         parts.append("error: %s %s" % (truncate(error_type, 200),
                                        truncate(error_message)))
@@ -325,7 +361,8 @@ def format_recall_context(hits, max_hits=5):
         lines.append("- " + truncate(content, 500).replace("\n", " ") + suffix)
     if len(lines) == 1:
         return ""
-    return "\n".join(lines)
+    return "%s\n%s\n%s" % (MEMORY_CONTEXT_START, "\n".join(lines),
+                           MEMORY_CONTEXT_END)
 
 
 # --------------------------------------------------------------------------

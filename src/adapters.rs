@@ -86,7 +86,7 @@ pub fn graph_to_source_documents(graph: &Graph) -> Vec<SourceDocument> {
             SourceDocument {
                 doc_id: p.rel_path.clone(),
                 source: p.rel_path.clone(),
-                content: p.content.clone(),
+                content: p.content.as_str().into(),
                 concept: p.raw_concept.clone(),
                 group_id: None,
                 filters,

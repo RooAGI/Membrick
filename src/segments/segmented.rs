@@ -1,7 +1,7 @@
 use crate::index::{
     DocRecord, GlobalBm25Statistics, QueryTimings, SearchResult, TemporalQueryContext,
 };
-use sha2::{Digest, Sha256};
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,41 +19,17 @@ pub struct SegmentedMemoryIndex {
     pub(crate) generation: u64,
 }
 
-fn segment_catalog_cache_identity(
-    segments: &[MemoryIndexSegment],
-    lexical_root: &Path,
-) -> (Option<PathBuf>, String) {
-    let mut ordered = segments.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
-    let mut hasher = Sha256::new();
-    hasher.update(b"lint-ai-segment-catalog-v1");
-    for segment in ordered {
-        hasher.update(segment.segment_id.as_bytes());
-        hasher.update([0]);
-        for doc_id in &segment.doc_ids {
-            hasher.update(doc_id.as_bytes());
-            hasher.update([0]);
-            if let Some(record) = segment.index.docs.get(doc_id) {
-                hasher.update(record.content_hash.as_bytes());
-                for tag in &record.semantic_tags {
-                    hasher.update(tag.as_bytes());
-                    hasher.update([0]);
-                }
-            }
-        }
-    }
-    let fingerprint = format!("{:x}", hasher.finalize());
-    let cache_root = lexical_root
-        .parent()
-        .unwrap_or(lexical_root)
-        .join("segment-catalog");
-    (
-        Some(cache_root.join(format!("{fingerprint}.bin"))),
-        fingerprint,
-    )
+/// The catalog cache sits beside the store's `segment-lexical` directory.
+fn segment_catalog_cache_path_for_lexical_root(lexical_root: &Path) -> PathBuf {
+    segment_catalog_cache_path(lexical_root.parent().unwrap_or(lexical_root))
 }
 
 impl SegmentedMemoryIndex {
+    /// The catalog cache for this snapshot, for a store checkpoint to write.
+    pub(crate) fn encode_catalog_cache(&self) -> anyhow::Result<Vec<u8>> {
+        self.catalog.encode_cache(&self.segments)
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
@@ -128,15 +104,8 @@ impl SegmentedMemoryIndex {
         lexical_root: Option<&Path>,
     ) -> Result<Self, String> {
         validate_segments(&segments)?;
-        let (cache_path, fingerprint) = lexical_root
-            .map(|root| segment_catalog_cache_identity(&segments, root))
-            .unwrap_or_else(|| (None, String::new()));
-        let catalog = SegmentCatalog::load_or_build(
-            &segments,
-            generation,
-            cache_path.as_deref(),
-            &fingerprint,
-        );
+        let cache_path = lexical_root.map(segment_catalog_cache_path_for_lexical_root);
+        let catalog = SegmentCatalog::load_or_build(&segments, generation, cache_path.as_deref());
         let global_statistics = GlobalBm25Statistics::from_indexes_with_generation(
             segments.iter().map(|segment| segment.index.as_ref()),
             generation,
@@ -171,6 +140,7 @@ impl SegmentedMemoryIndex {
                     doc_ids: segment.doc_ids.clone(),
                     index: Arc::clone(&segment.index),
                     record_dates: segment.record_dates.clone(),
+                    lexical_dir: segment.lexical_dir.clone(),
                 });
                 if let Some(summary) = index.catalog.summaries.get(old_id) {
                     summaries.insert(next_id.clone(), Arc::clone(summary));
@@ -211,7 +181,16 @@ impl SegmentedMemoryIndex {
         generation: u64,
         lexical_root: Option<&Path>,
     ) -> Self {
-        let mut grouped: HashMap<String, Vec<DocRecord>> = HashMap::new();
+        let records = records.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        Self::from_shared_records_by_group_id_with_lexical_root(&records, generation, lexical_root)
+    }
+
+    pub(crate) fn from_shared_records_by_group_id_with_lexical_root(
+        records: &[Arc<DocRecord>],
+        generation: u64,
+        lexical_root: Option<&Path>,
+    ) -> Self {
+        let mut grouped: HashMap<String, Vec<Arc<DocRecord>>> = HashMap::new();
         for record in records {
             grouped
                 .entry(
@@ -221,12 +200,12 @@ impl SegmentedMemoryIndex {
                         .unwrap_or_else(|| "ungrouped".to_string()),
                 )
                 .or_default()
-                .push(record.clone());
+                .push(Arc::clone(record));
         }
         let mut segments = grouped
             .into_iter()
             .map(|(segment_id, records)| {
-                build_memory_index_segment_with_lexical_root(segment_id, records, lexical_root)
+                build_memory_index_segment_with_shared_records(segment_id, records, lexical_root)
             })
             .collect::<Vec<_>>();
         segments.sort_by(|left, right| left.segment_id.cmp(&right.segment_id));
@@ -244,6 +223,21 @@ impl SegmentedMemoryIndex {
 
     pub(crate) fn from_records_by_manifest_with_lexical_root(
         records: &[DocRecord],
+        manifest: &SegmentManifest,
+        generation: u64,
+        lexical_root: Option<&Path>,
+    ) -> Result<Self, String> {
+        let shared_records = records.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        Self::from_shared_records_by_manifest_with_lexical_root(
+            &shared_records,
+            manifest,
+            generation,
+            lexical_root,
+        )
+    }
+
+    pub(crate) fn from_shared_records_by_manifest_with_lexical_root(
+        records: &[Arc<DocRecord>],
         manifest: &SegmentManifest,
         generation: u64,
         lexical_root: Option<&Path>,
@@ -274,9 +268,9 @@ impl SegmentedMemoryIndex {
                 let Some(record) = records_by_id.get(doc_id.as_str()) else {
                     return Err(format!("manifest references missing document: {doc_id}"));
                 };
-                segment_records.push((*record).clone());
+                segment_records.push(Arc::clone(record));
             }
-            segments.push(build_memory_index_segment_with_lexical_root(
+            segments.push(build_memory_index_segment_with_shared_records(
                 entry.segment_id.clone(),
                 segment_records,
                 lexical_root,
@@ -318,15 +312,16 @@ impl SegmentedMemoryIndex {
         )
     }
 
-    pub(crate) fn refresh_incremental_with_lexical_root(
+    pub(crate) fn refresh_incremental_with_lexical_root<R: Borrow<DocRecord>>(
         previous: &Self,
-        records: &HashMap<String, DocRecord>,
+        records: &HashMap<String, R>,
         reprocessed_doc_ids: &HashSet<String>,
         generation: u64,
         lexical_root: Option<&Path>,
     ) -> Result<Self, String> {
         let mut grouped: HashMap<&str, Vec<&str>> = HashMap::new();
         for record in records.values() {
+            let record = record.borrow();
             let segment_id = record.group_id.as_deref().unwrap_or("ungrouped");
             grouped
                 .entry(segment_id)
@@ -362,13 +357,19 @@ impl SegmentedMemoryIndex {
                     doc_ids: previous_segment.doc_ids.clone(),
                     index: Arc::clone(&previous_segment.index),
                     record_dates: std::sync::OnceLock::new(),
+                    lexical_dir: previous_segment.lexical_dir.clone(),
                 }),
                 None => {
                     let mut segment_records = Vec::with_capacity(new_doc_ids.len());
                     for doc_id in &new_doc_ids {
-                        segment_records.push(records.get(*doc_id).cloned().ok_or_else(|| {
-                            format!("grouped document missing from records: {doc_id}")
-                        })?);
+                        segment_records.push(
+                            records
+                                .get(*doc_id)
+                                .map(|r| r.borrow().clone())
+                                .ok_or_else(|| {
+                                    format!("grouped document missing from records: {doc_id}")
+                                })?,
+                        );
                     }
                     segments.push(build_memory_index_segment_with_lexical_root(
                         segment_id.to_string(),
@@ -400,15 +401,19 @@ impl SegmentedMemoryIndex {
     /// Refresh using a complete change set, including removed documents.
     /// Unlike `refresh_incremental`, this path does not regroup the corpus.
     /// Membership of unchanged documents comes from the previous generation.
-    pub(crate) fn refresh_changed(
+    pub(crate) fn refresh_changed<R: Borrow<DocRecord>>(
         previous: &Self,
-        records: &HashMap<String, DocRecord>,
+        records: &HashMap<String, R>,
         changed_doc_ids: &HashSet<String>,
         generation: u64,
     ) -> Result<Self, String> {
+        let records = records
+            .iter()
+            .map(|(doc_id, record)| (doc_id.clone(), Arc::new(record.borrow().clone())))
+            .collect::<HashMap<_, _>>();
         Self::refresh_changed_with_lexical_root(
             previous,
-            records,
+            &records,
             changed_doc_ids,
             generation,
             None,
@@ -417,7 +422,7 @@ impl SegmentedMemoryIndex {
 
     pub(crate) fn refresh_changed_with_lexical_root(
         previous: &Self,
-        records: &HashMap<String, DocRecord>,
+        records: &HashMap<String, Arc<DocRecord>>,
         changed_doc_ids: &HashSet<String>,
         generation: u64,
         lexical_root: Option<&Path>,
@@ -447,13 +452,14 @@ impl SegmentedMemoryIndex {
                     doc_ids: segment.doc_ids.clone(),
                     index: Arc::clone(&segment.index),
                     record_dates: std::sync::OnceLock::new(),
+                    lexical_dir: segment.lexical_dir.clone(),
                 });
                 continue;
             }
             let mut segment_records = Vec::with_capacity(segment.doc_ids.len());
             for doc_id in &segment.doc_ids {
                 if !changed_doc_ids.contains(doc_id) {
-                    segment_records.push(records.get(doc_id).cloned().ok_or_else(|| {
+                    segment_records.push(records.get(doc_id).map(Arc::clone).ok_or_else(|| {
                         format!("unchanged document missing from records: {doc_id}")
                     })?);
                 }
@@ -462,22 +468,55 @@ impl SegmentedMemoryIndex {
                 .remove(segment.segment_id.as_str())
                 .unwrap_or_default()
             {
-                segment_records.push(records[doc_id].clone());
+                segment_records.push(Arc::clone(&records[doc_id]));
             }
             if !segment_records.is_empty() {
-                segments.push(build_memory_index_segment_with_lexical_root(
+                let mut changed_in_segment = HashSet::new();
+                let mut removed_from_segment = HashSet::new();
+                for doc_id in changed_doc_ids {
+                    let target_segment = records
+                        .get(doc_id)
+                        .map(|record| record.group_id.as_deref().unwrap_or("ungrouped"));
+                    let previous = segment.index.docs.get(doc_id).map(AsRef::as_ref);
+                    let current = records.get(doc_id).map(AsRef::as_ref);
+                    let lexical_fields_unchanged = match (previous, current) {
+                        (Some(previous), Some(current)) => lexical_fields_match(previous, current),
+                        _ => false,
+                    };
+                    let remains_in_segment = target_segment == Some(segment.segment_id.as_str());
+                    if previous.is_some() && (!remains_in_segment || !lexical_fields_unchanged) {
+                        removed_from_segment.insert(doc_id.clone());
+                    }
+                    if remains_in_segment && (previous.is_none() || !lexical_fields_unchanged) {
+                        changed_in_segment.insert(doc_id.clone());
+                    }
+                }
+                segments.push(build_memory_index_segment_with_lexical_delta(
                     segment.segment_id.clone(),
                     segment_records,
                     lexical_root,
+                    changed_in_segment,
+                    removed_from_segment,
+                    false,
                 ));
             }
         }
         for (segment_id, doc_ids) in additions {
-            let segment_records = doc_ids.into_iter().map(|id| records[id].clone()).collect();
-            segments.push(build_memory_index_segment_with_lexical_root(
+            let changed_doc_ids = doc_ids
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<HashSet<_>>();
+            let segment_records = doc_ids
+                .into_iter()
+                .map(|id| Arc::clone(&records[id]))
+                .collect();
+            segments.push(build_memory_index_segment_with_lexical_delta(
                 segment_id.to_string(),
                 segment_records,
                 lexical_root,
+                changed_doc_ids,
+                HashSet::new(),
+                true,
             ));
         }
         segments.sort_unstable_by(|a, b| a.segment_id.cmp(&b.segment_id));
@@ -511,6 +550,7 @@ impl SegmentedMemoryIndex {
                 .map(|segment| SegmentManifestEntry {
                     segment_id: segment.segment_id.clone(),
                     doc_ids: segment.doc_ids.clone(),
+                    lexical_dir: segment.lexical_dir.as_deref().map(SegmentLexicalDir::name),
                 })
                 .collect(),
         }
@@ -895,6 +935,38 @@ impl SegmentedMemoryIndex {
             self.generation,
         )
     }
+}
+
+/// Session-context records are refreshed as their links and bookkeeping grow.
+/// Those changes do not alter the Tantivy document; leave its existing postings
+/// in place and append only the new turn's document. Other edits still use the
+/// normal delete-and-add path when their indexed fields change.
+fn lexical_fields_match(left: &DocRecord, right: &DocRecord) -> bool {
+    left.temporal_terms == right.temporal_terms
+        && left.section_chunks.len() == right.section_chunks.len()
+        && left
+            .section_chunks
+            .iter()
+            .zip(&right.section_chunks)
+            .all(|(left, right)| {
+                left.heading == right.heading
+                    && left.content == right.content
+                    && left.important_terms == right.important_terms
+                    && left.key_entities == right.key_entities
+            })
+        && semantic_tags(left) == semantic_tags(right)
+}
+
+fn semantic_tags(record: &DocRecord) -> Vec<&str> {
+    let mut tags = record
+        .key_phrases
+        .iter()
+        .filter(|phrase| phrase.kind == "semantic_tag")
+        .map(|phrase| phrase.text.as_str())
+        .collect::<Vec<_>>();
+    tags.sort_unstable();
+    tags.dedup();
+    tags
 }
 
 /// Uniform reciprocal rank fusion over several retrieval modes' ranked
