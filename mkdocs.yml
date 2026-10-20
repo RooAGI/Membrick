@@ -64,7 +64,6 @@ nav:
       - Overview: connect-agent.md
       - How Membrick remembers: agent-memory.md
       - Agent Integration: agents.md
-      - Project planning and coordination: agent-project-planning-plan.md
       - Stale Agent Memory: stale-memory.md
       - Session Recording: session-recording-design.md
   - Observability:
