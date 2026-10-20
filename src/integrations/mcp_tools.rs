@@ -742,6 +742,7 @@ fn format_search_results(
                 "relation_confidence": result.relation_confidence,
                 "relation_evidence": result.relation_evidence,
                 "comparison_operands": result.comparison_operands,
+                "claim_states": service.semantic_claim_states(&result.doc_id),
                 "document_type": document.filters.get("document_type"),
                 "branch": document.filters.get("branch"),
                 "revision": document.filters.get("revision"),

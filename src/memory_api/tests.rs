@@ -1159,6 +1159,198 @@ fn semantic_supersession_hides_stale_doc_in_single_segment_corpus() {
 }
 
 #[test]
+fn reddit_superseded_city_memory_keeps_fact_scope_and_current_preferences() {
+    // Regression fixture from https://www.reddit.com/r/AIMemory/comments/1wx8p9m/
+    // superseded_memory_test_the_user_moves_to_another/ . A move retires the
+    // old residence, but should not move the old flat's walking distance to
+    // the new city or erase durable food preferences.
+    let mut options = crate::default_production_pipeline_options();
+    options.claim_extraction = true;
+    let mut service = MemoryService::in_memory(options);
+
+    let old = service
+        .add(AddRequest {
+            request_id: "reddit-move-old".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                timestamp: Some(1_788_523_200_000), // 2026-09-04
+                content: "I live in Delhi, in Lajpat Nagar. My favourite place to eat is Sandeep’s Curry House. It’s a ten-minute walk from my flat. Their paneer tikka is the best I’ve had. I’m vegetarian, so keep that in mind when you suggest food.".into(),
+                expires_at_ms: None,
+                supersedes_id: None,
+            }],
+            user_id: "reddit-move-user".into(),
+            session_id: "reddit-move-session".into(),
+        })
+        .unwrap()
+        .adjudication
+        .expect("write receipt");
+
+    let new = service
+        .add(AddRequest {
+            request_id: "reddit-move-new".into(),
+            messages: vec![Message {
+                role: "user".into(),
+                timestamp: Some(1_789_905_600_000), // 2026-09-20
+                content: "I moved to Mumbai last month. I’m living in Bandra now. I’m still figuring out the neighbourhood and haven’t found a regular place to eat yet.".into(),
+                expires_at_ms: None,
+                supersedes_id: None,
+            }],
+            user_id: "reddit-move-user".into(),
+            session_id: "reddit-move-session".into(),
+        })
+        .unwrap()
+        .adjudication
+        .expect("write receipt");
+
+    assert!(
+        !old.claims.is_empty(),
+        "the old note should be decomposed into separately attributable facts"
+    );
+    assert!(
+        !new.claims.is_empty(),
+        "the move note should produce current residence and restaurant-search claims"
+    );
+    assert!(
+        old.claims.iter().all(|claim| {
+            claim.confidence > 0.0
+                && claim.claim_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.start_byte.is_some()
+                        && evidence.end_byte.is_some()
+                        && evidence.text == claim.evidence
+                })
+        }),
+        "the adjudication receipt should carry confidence and exact evidence spans"
+    );
+    assert!(
+        new.claims
+            .iter()
+            .any(|claim| { claim.assertion_status == Some(crate::index::ClaimStatus::Negated) }),
+        "the adjudication receipt should preserve assertion polarity"
+    );
+
+    let current_residence = service
+        .search(SearchRequest {
+            query: "Where does the user live now?".into(),
+            options: None,
+            user_id: "reddit-move-user".into(),
+            top_k: 10,
+            session_id: None,
+            scope: None,
+            filters: None,
+            reference_date: Some("2026/09/20".into()),
+        })
+        .unwrap();
+    assert!(
+        current_residence
+            .data
+            .iter()
+            .any(|hit| hit.content.contains("Bandra")),
+        "current residence should resolve to Bandra"
+    );
+    let claims = old
+        .doc_ids
+        .iter()
+        .chain(new.doc_ids.iter())
+        .flat_map(|doc_id| service.semantic_claim_states(doc_id))
+        .collect::<Vec<_>>();
+    let has_claim_state = |predicate: &str, object: &str, status| {
+        claims.iter().any(|state| {
+            state.claim.predicate == predicate
+                && state.claim.object.eq_ignore_ascii_case(object)
+                && state.status == status
+        })
+    };
+    assert!(has_claim_state(
+        "resides_in_city",
+        "Delhi",
+        crate::semantic_relations::SemanticStatus::Superseded
+    ));
+    assert!(has_claim_state(
+        "resides_in_neighborhood",
+        "Lajpat Nagar",
+        crate::semantic_relations::SemanticStatus::Superseded
+    ));
+    assert!(has_claim_state(
+        "resides_in_city",
+        "Mumbai",
+        crate::semantic_relations::SemanticStatus::Current
+    ));
+    assert!(has_claim_state(
+        "resides_in_neighborhood",
+        "Bandra",
+        crate::semantic_relations::SemanticStatus::Current
+    ));
+
+    let current_neighborhood = service
+        .search(SearchRequest {
+            query: "What is a short walk from the user's current flat?".into(),
+            options: None,
+            user_id: "reddit-move-user".into(),
+            top_k: 10,
+            session_id: None,
+            scope: None,
+            filters: None,
+            reference_date: Some("2026/09/20".into()),
+        })
+        .unwrap();
+    assert!(
+        claims.iter().any(|state| {
+            state.claim.predicate == "walk_minutes_from_residence"
+                && state.claim.object.contains("residence=lajpat nagar")
+                && state.status == crate::semantic_relations::SemanticStatus::Current
+        }),
+        "the old flat's walking distance must retain its Lajpat Nagar qualifier"
+    );
+    assert!(
+        current_neighborhood.data.iter().any(|hit| {
+            hit.claim_states.iter().any(|state| {
+                state.claim.predicate == "walk_minutes_from_residence"
+                    && state.claim.object.contains("residence=lajpat nagar")
+            })
+        }),
+        "search results should expose the scoped fact with its source document"
+    );
+
+    let food_preferences = service
+        .search(SearchRequest {
+            query: "What food does the user like and what dietary preference should be considered?"
+                .into(),
+            options: None,
+            user_id: "reddit-move-user".into(),
+            top_k: 10,
+            session_id: None,
+            scope: None,
+            filters: None,
+            reference_date: Some("2026/09/20".into()),
+        })
+        .unwrap();
+    assert!(
+        food_preferences
+            .data
+            .iter()
+            .any(|hit| hit.content.contains("vegetarian") && hit.content.contains("paneer tikka")),
+        "durable vegetarian and food preferences should remain retrievable"
+    );
+    assert!(claims.iter().any(|state| {
+        state.claim.predicate == "likes_food"
+            && state.claim.object == "paneer tikka"
+            && state.status == crate::semantic_relations::SemanticStatus::Current
+    }));
+    assert!(claims.iter().any(|state| {
+        state.claim.predicate == "dietary_preference"
+            && state.claim.object == "vegetarian"
+            && state.status == crate::semantic_relations::SemanticStatus::Current
+    }));
+    assert!(
+        claims.iter().any(|state| {
+            state.claim.predicate == "has_regular_restaurant_in"
+                && state.claim.assertion_status == Some(crate::index::ClaimStatus::Negated)
+        }),
+        "the claim contract's assertion polarity should survive extraction"
+    );
+}
+
+#[test]
 fn decimal_config_backfill_hides_stale_value() {
     // End-to-end for the decimal sentence-splitting regression: the older
     // effective value (written later, as a backfill) must be superseded.

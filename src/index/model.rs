@@ -47,14 +47,16 @@ impl ClaimStatus {
 pub struct ClaimEvidence {
     pub source_document_id: String,
     pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Evidence is also written to the binary relation cache, which reads
+    // fields by position, so the optional fields are always written.
+    #[serde(default)]
     pub source_turn_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub source_chunk_id: Option<String>,
     pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub start_byte: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub end_byte: Option<usize>,
 }
 

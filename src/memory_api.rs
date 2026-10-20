@@ -137,6 +137,14 @@ pub struct AdjudicatedClaim {
     pub object: String,
     pub scope: String,
     pub evidence: String,
+    #[serde(default)]
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertion_status: Option<crate::index::ClaimStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_evidence: Option<crate::index::ClaimEvidence>,
 }
 
 /// One clash decision involving a written document: what the semantic layer
@@ -294,6 +302,9 @@ pub struct SearchMemory {
     /// Comparison sides for which this document was independently retrieved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comparison_operands: Vec<String>,
+    /// Claim level lifecycle and assertion state for the returned source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_states: Vec<crate::semantic_relations::SemanticClaimState>,
 }
 
 /// Backing corpus selected by the resident workspace owner. Callers enqueue
@@ -795,6 +806,15 @@ impl MemoryService {
         self.store.semantic_document_state(doc_id)
     }
 
+    /// Claim states preserve independently current and superseded facts within
+    /// a compound source note.
+    pub fn semantic_claim_states(
+        &self,
+        doc_id: &str,
+    ) -> Vec<crate::semantic_relations::SemanticClaimState> {
+        self.store.semantic_claim_states(doc_id)
+    }
+
     /// Return temporal facts whose validity interval includes `date`.
     /// `recorded_at` on each fact records when Membrick learned it, while
     /// `valid_from` and `valid_to` describe when it was true in the world.
@@ -935,6 +955,10 @@ impl MemoryService {
                 object: c.object.clone(),
                 scope: c.scope.clone(),
                 evidence: self.linked_turn_evidence_from_store(store, c),
+                confidence: c.confidence,
+                assertion_status: c.assertion_status.clone(),
+                event_time: c.event_time.clone(),
+                claim_evidence: c.claim_evidence.clone(),
             })
             .collect();
         let mut decisions = Vec::new();
@@ -1786,7 +1810,7 @@ impl MemoryService {
                     .source_document_by_id(&result.doc_id)
                     .filter(|doc| self.is_visible(doc))
                     .map(|doc| SearchMemory {
-                        id: result.doc_id,
+                        id: result.doc_id.clone(),
                         content: doc.content.to_string(),
                         score: result.score,
                         created_at: doc.timestamp.clone(),
@@ -1795,6 +1819,7 @@ impl MemoryService {
                         session_id: doc.group_id.clone(),
                         relation_evidence: result.relation_evidence.clone(),
                         comparison_operands: result.comparison_operands.clone(),
+                        claim_states: self.store.semantic_claim_states(&result.doc_id),
                     })
             })
             .collect();

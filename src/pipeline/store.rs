@@ -1633,6 +1633,13 @@ impl IndexStore {
         self.semantic_relations.claims()
     }
 
+    pub fn semantic_claim_states(
+        &self,
+        doc_id: &str,
+    ) -> Vec<crate::semantic_relations::SemanticClaimState> {
+        self.semantic_relations.claim_states_for_document(doc_id)
+    }
+
     pub fn semantic_relations(&self) -> &[crate::semantic_relations::SemanticRelation] {
         self.semantic_relations.relations()
     }
