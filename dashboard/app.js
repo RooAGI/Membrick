@@ -6,10 +6,12 @@ const VIEWS = {
   overview: { title: 'Overview', sub: 'How the memory index is serving agents right now.' },
   index: { title: 'Index', sub: 'Segment topology and document distribution of the primary query index.' },
   providers: { title: 'Providers', sub: 'Per-integration sessions, tool use, and private memory stores.' },
+  boards: { title: 'Boards', sub: 'Project structure and updates posted by agents.' },
+  flows: { title: 'Flows', sub: 'Provider-neutral workflow runs, task state, and review history.' },
   reviews: { title: 'Search reviews', sub: 'Submitted feedback and offline ranking evaluation.' }
 };
 
-const state = { view: 'overview', status: null, series: [], provider: null, tool: null, hover: null, reviewOffset: 0, reviewTotal: 0 };
+const state = { view: 'overview', status: null, series: [], provider: null, tool: null, hover: null, reviewOffset: 0, reviewTotal: 0, boards: [], boardTemplates: [], selectedBoardId: null, boardSnapshot: null, flows: [], flowTemplates: [], selectedFlowId: null, flowSnapshot: null };
 
 const tokenInput = document.querySelector('#token');
 tokenInput.value = localStorage.getItem('membrick-dashboard-token') || '';
@@ -81,7 +83,7 @@ function renderDelta(element, values, polarity) {
 
 /* ── view routing ──────────────────────────────────────────────── */
 
-function showView(view) {
+function showView(view, loadData = true) {
   if (!VIEWS[view]) view = 'overview';
   state.view = view;
   document.querySelectorAll('.view').forEach(section => { section.hidden = section.id !== `view-${view}`; });
@@ -95,6 +97,8 @@ function showView(view) {
   document.querySelector('.viewport').scrollTop = 0;
   if (view === 'overview') drawSparks();
   if (view === 'reviews') loadSearchReviews(state.reviewOffset);
+  if (loadData && view === 'boards') loadBoards();
+  if (loadData && view === 'flows') loadFlows();
 }
 
 document.querySelectorAll('.navitem').forEach(item => item.addEventListener('click', () => showView(item.dataset.view)));
@@ -195,12 +199,289 @@ async function refresh() {
     renderIndexTopology(projectIndex);
     renderProviders(integrations, projectIndex);
     renderFeed(integrations);
+    if (state.view === 'boards' && state.boardSnapshot) {
+      const viewport = document.querySelector('.viewport');
+      const scrollTop = viewport.scrollTop;
+      renderBoardDetail(state.boardSnapshot);
+      viewport.scrollTop = scrollTop;
+    }
+    if (state.view === 'flows') loadFlows();
     drawSparks();
   } catch (error) {
     pill.className = 'pill bad';
     pill.querySelector('span').textContent = 'Unavailable';
     document.querySelector('#last-updated').textContent = error.message;
   }
+}
+
+/* ── agent-authored boards ────────────────────────────────────── */
+
+async function loadBoards(preferredId = state.selectedBoardId) {
+  const list = document.querySelector('#boards-list');
+  list.innerHTML = '<div class="empty-state">Loading boards…</div>';
+  try {
+    const [result, templateResult] = await Promise.all([api('/api/boards'), api('/api/board-templates')]);
+    state.boardTemplates = templateResult.templates || [];
+    state.boards = (result.boards || []).slice().sort((a, b) => {
+      const rank = value => value.type === 'project' ? 0 : 1;
+      return rank(a) - rank(b) || String(a.key).localeCompare(String(b.key));
+    });
+    document.querySelector('#boards-count').textContent = `${fmt(state.boards.length)} boards`;
+    list.innerHTML = state.boards.length ? state.boards.map(board => `
+      <button class="board-choice ${board.board_id === preferredId ? 'is-selected' : ''}" type="button" data-board-id="${esc(board.board_id)}">
+        <span class="board-choice__type">${esc(board.type || 'general')}</span>
+        <strong>${esc(board.title || board.key)}</strong>
+        <small>${esc(board.key)}</small>
+      </button>`).join('') : '<div class="empty-state">No boards yet. Agents can open a project board and link planning, task, and milestone boards.</div>';
+    list.querySelectorAll('[data-board-id]').forEach(button => button.addEventListener('click', () => selectBoard(button.dataset.boardId)));
+    const next = state.boards.some(board => board.board_id === preferredId)
+      ? preferredId
+      : state.boards.find(board => board.type === 'project')?.board_id || state.boards[0]?.board_id;
+    if (next) await selectBoard(next);
+    else {
+      state.selectedBoardId = null;
+      document.querySelector('#board-detail').innerHTML = '<div class="empty-state">No agent-authored boards in this workspace.</div>';
+    }
+  } catch (error) {
+    document.querySelector('#boards-count').textContent = '';
+    list.innerHTML = `<div class="empty-state">Could not load boards: ${esc(error.message)}</div>`;
+  }
+}
+
+async function selectBoard(boardId, postSequence = null) {
+  state.selectedBoardId = boardId;
+  document.querySelectorAll('.board-choice').forEach(button => button.classList.toggle('is-selected', button.dataset.boardId === boardId));
+  document.querySelector('#board-detail').innerHTML = '<div class="empty-state">Loading board…</div>';
+  state.boardSnapshot = null;
+  await loadBoardPosts(boardId, postSequence == null ? null : Math.max(0, postSequence - 2), false);
+  if (postSequence != null && state.selectedBoardId === boardId) {
+    document.querySelector(`#post-${postSequence}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+async function loadBoardPosts(boardId, afterSequence, append) {
+  const params = new URLSearchParams({ limit: '100' });
+  if (afterSequence != null) params.set('after_sequence', String(afterSequence));
+  try {
+    const result = await api(`/api/boards/${encodeURIComponent(boardId)}?${params}`);
+    if (state.selectedBoardId !== boardId) return;
+    if (append && state.boardSnapshot) state.boardSnapshot.posts.push(...(result.posts || []));
+    else state.boardSnapshot = { board: result.board, posts: result.posts || [] };
+    state.boardSnapshot.hasMore = result.has_more;
+    state.boardSnapshot.nextAfter = result.next_after_sequence;
+    renderBoardDetail(state.boardSnapshot);
+  } catch (error) {
+    if (state.selectedBoardId === boardId) document.querySelector('#board-detail').innerHTML = `<div class="empty-state">Could not load board: ${esc(error.message)}</div>`;
+  }
+}
+
+/* ── provider-neutral flow runs ───────────────────────────────── */
+
+async function loadFlows(preferredId = state.selectedFlowId) {
+  const list = document.querySelector('#flows-list');
+  list.innerHTML = '<div class="empty-state">Loading Flows…</div>';
+  try {
+    const [result, templateResult] = await Promise.all([api('/api/flows'), api('/api/flow-templates')]);
+    state.flows = result.flows || [];
+    state.flowTemplates = templateResult.templates || [];
+    state.flows.sort((a, b) => String(a.run?.updated_at || '').localeCompare(String(b.run?.updated_at || '')) || String(a.run?.flow_id || '').localeCompare(String(b.run?.flow_id || ''))).reverse();
+    document.querySelector('#flows-count').textContent = `${fmt(state.flows.length)} flows`;
+    list.innerHTML = state.flows.length ? state.flows.map(snapshot => {
+      const run = snapshot.run || {};
+      const template = state.flowTemplates.find(item => item.id === run.template_id && item.version === run.template_version);
+      const selected = run.flow_id === preferredId;
+      return `<button class="flow-choice ${selected ? 'is-selected' : ''}" type="button" data-flow-id="${esc(run.flow_id || '')}">
+        <span class="flow-choice__meta"><span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span><small>${esc(run.stage || 'No stage')}</small></span>
+        <strong>${esc(run.goal || 'Untitled Flow')}</strong>
+        <small>${esc(template?.name || run.template_id || 'Unknown template')} · v${esc(run.template_version || '—')}</small>
+      </button>`;
+    }).join('') : '<div class="empty-state">No Flows in this workspace yet.</div>';
+    list.querySelectorAll('[data-flow-id]').forEach(button => button.addEventListener('click', () => selectFlow(button.dataset.flowId)));
+    const next = state.flows.some(snapshot => snapshot.run?.flow_id === preferredId)
+      ? preferredId
+      : state.flows[0]?.run?.flow_id;
+    if (next) await selectFlow(next);
+    else {
+      state.selectedFlowId = null;
+      state.flowSnapshot = null;
+      document.querySelector('#flow-detail').innerHTML = '<div class="empty-state">No Flow runs in this workspace.</div>';
+    }
+  } catch (error) {
+    document.querySelector('#flows-count').textContent = '';
+    list.innerHTML = `<div class="empty-state">Could not load Flows: ${esc(error.message)}</div>`;
+  }
+}
+
+async function selectFlow(flowId) {
+  state.selectedFlowId = flowId;
+  document.querySelectorAll('.flow-choice').forEach(button => button.classList.toggle('is-selected', button.dataset.flowId === flowId));
+  document.querySelector('#flow-detail').innerHTML = '<div class="empty-state">Loading Flow history…</div>';
+  try {
+    const result = await api(`/api/flows/${encodeURIComponent(flowId)}`);
+    if (state.selectedFlowId !== flowId) return;
+    state.flowSnapshot = { run: result.flow, events: result.events || [] };
+    renderFlowDetail(state.flowSnapshot);
+  } catch (error) {
+    if (state.selectedFlowId === flowId) document.querySelector('#flow-detail').innerHTML = `<div class="empty-state">Could not load Flow: ${esc(error.message)}</div>`;
+  }
+}
+
+function flowTaskEntries(tasks) {
+  if (Array.isArray(tasks)) return tasks;
+  if (tasks && typeof tasks === 'object') return Object.entries(tasks).map(([taskId, task]) => ({ task_id: taskId, ...task }));
+  return [];
+}
+
+function flowDataRows(data) {
+  if (data == null || typeof data !== 'object' || Array.isArray(data)) return `<p>${esc(data == null ? '' : JSON.stringify(data))}</p>`;
+  const entries = Object.entries(data).filter(([key]) => !['coordinator_fence'].includes(key));
+  if (!entries.length) return '<span class="muted">No additional event data</span>';
+  return `<dl>${entries.map(([key, value]) => `<div><dt>${esc(key.replaceAll('_', ' '))}</dt><dd>${esc(Array.isArray(value) ? value.join(', ') : typeof value === 'string' ? value : JSON.stringify(value))}</dd></div>`).join('')}</dl>`;
+}
+
+function flowBoardLabel(boardId) {
+  const board = state.boards.find(item => item.board_id === boardId);
+  return board ? `${board.title || board.key} · ${board.type || 'general'}` : boardId;
+}
+
+function flowPostLink(postId, label = 'Linked board post') {
+  const target = String(postId || '');
+  const marker = ':post:';
+  const separator = target.lastIndexOf(marker);
+  const boardId = separator > 0 ? target.slice(0, separator) : '';
+  const sequence = separator > 0 ? Number(target.slice(separator + marker.length)) : NaN;
+  if (!boardId || !Number.isInteger(sequence) || sequence < 1) return `<span class="mono">${esc(label)} · ${esc(target || 'post unavailable')}</span>`;
+  return `<button type="button" class="board-link" data-flow-board-id="${esc(boardId)}" data-flow-post-sequence="${sequence}">${esc(label)} · ${esc(flowBoardLabel(boardId))} · post ${sequence}</button>`;
+}
+
+function renderFlowDetail(snapshot) {
+  const run = snapshot.run || {};
+  const events = snapshot.events || [];
+  const template = state.flowTemplates.find(item => item.id === run.template_id && item.version === run.template_version);
+  const tasks = flowTaskEntries(run.tasks);
+  const references = [{ kind: 'board', id: run.board_id, relation: 'flow board' }, ...(run.references || [])]
+    .filter(ref => ref && ref.id)
+    .filter((ref, index, all) => all.findIndex(other => other.id === ref.id) === index);
+  const referenceHtml = references.length ? `<div class="flow-references">${references.map(ref => {
+    const kind = String(ref.kind || '').toLowerCase();
+    const postReference = kind === 'post' || String(ref.id).includes(':post:');
+    const boardId = postReference ? String(ref.id).split(':post:')[0] : ref.id;
+    const postSequence = postReference ? Number(String(ref.id).split(':post:').at(-1)) : null;
+    const label = `${flowBoardLabel(boardId)}${Number.isFinite(postSequence) ? ` · post ${postSequence}` : ''}`;
+    return `<span class="flow-reference"><small>${esc(ref.relation || ref.kind || 'reference')}</small>${postReference || kind === 'board'
+      ? `<button type="button" class="board-link" data-flow-board-id="${esc(boardId)}"${Number.isFinite(postSequence) ? ` data-flow-post-sequence="${postSequence}"` : ''}>${esc(label)}</button>`
+      : `<span class="mono">${esc(label)}</span>`}</span>`;
+  }).join('')}</div>` : '<span class="muted">No board references</span>';
+  const eventByTask = new Map();
+  for (const event of events) if (event.task_id) eventByTask.set(event.task_id, [...(eventByTask.get(event.task_id) || []), event]);
+  const taskHtml = tasks.length ? tasks.map(task => {
+    const taskEvents = eventByTask.get(task.task_id) || [];
+    const review = taskEvents.slice().reverse().find(event => ['review_approved', 'review_changes_requested'].includes(event.kind));
+    const assignee = task.assignee?.agent_id ? `${task.assignee.agent_id} · ${task.assignee.provider || 'agent'}` : 'Unassigned';
+    const evidence = task.evidence || [];
+    const postIds = [...new Set(task.post_ids || [])];
+    return `<article class="flow-task">
+      <div class="flow-task__head"><div><p class="eyebrow">Task · ${esc(task.task_id || 'unknown id')}</p><h3>${esc(task.title || task.task_id || 'Untitled task')}</h3></div><span class="flow-state flow-state--${esc(task.state || 'unknown')}">${esc(task.state || 'unknown')}</span></div>
+      <div class="flow-task__meta"><span><small>Assigned</small>${esc(assignee)}</span><span><small>Attempts</small>${fmt(task.attempts || 0)}</span><span><small>Current attempt</small>${esc(task.attempt_id || '—')}</span><span><small>Revision</small>${fmt(task.revision || 0)}</span></div>
+      ${task.summary ? `<p class="flow-task__summary">${esc(task.summary)}</p>` : ''}
+      ${task.blocker ? `<p class="flow-task__blocker"><strong>Blocker</strong> ${esc(task.blocker)}</p>` : ''}
+      ${review ? `<p class="flow-task__review"><strong>Latest review</strong> ${esc(review.kind.replaceAll('_', ' '))} · ${esc(review.actor || 'unknown reviewer')}</p>` : ''}
+      ${postIds.length ? `<div class="flow-task__posts"><small>Linked task and report posts</small>${postIds.map(postId => flowPostLink(postId)).join('')}</div>` : ''}
+      ${evidence.length ? `<div class="flow-evidence"><small>Evidence</small>${evidence.map(item => `<span>${esc(item)}</span>`).join('')}</div>` : ''}
+    </article>`;
+  }).join('') : '<div class="empty-state">No task events recorded for this Flow yet.</div>';
+  const timelineHtml = events.length ? events.slice().reverse().map(event => `
+    <article class="flow-event">
+      <div class="flow-event__head"><div><span class="flow-event__kind">${esc(String(event.kind || 'event').replaceAll('_', ' '))}</span>${event.task_id ? `<span class="flow-event__task">Task ${esc(event.task_id)}</span>` : ''}</div><time>${esc(event.timestamp ? new Date(event.timestamp).toLocaleString() : 'Time unavailable')}</time></div>
+      <p class="flow-event__actor">Recorded by ${esc(event.actor || 'unknown actor')} · ${esc(event.provider || 'unknown provider')}${event.attempt_id ? ` · attempt ${esc(event.attempt_id)}` : ''} · revision ${fmt(event.revision || 0)}</p>
+      ${event.post_id ? `<div class="flow-event__post"><small>Associated board post</small>${flowPostLink(event.post_id, 'Open associated post')}</div>` : ''}
+      <div class="flow-event__data">${flowDataRows(event.data)}</div>
+    </article>`).join('') : '<div class="empty-state">No Flow events recorded yet.</div>';
+  document.querySelector('#flow-detail').innerHTML = `
+    <div class="flow-detail__head"><div><p class="eyebrow">Flow · ${esc(run.flow_id || '')}</p><h2>${esc(run.goal || 'Untitled Flow')}</h2><p class="muted">Created by ${esc(run.created_by || 'unknown agent')} · ${esc(run.created_at ? new Date(run.created_at).toLocaleString() : 'date unavailable')}</p></div><span class="flow-source-label">Flow projection · Membrick recorded</span></div>
+    <div class="flow-summary">
+      <div><small>Template</small><strong>${esc(template?.name || run.template_id || 'Unknown')} · v${esc(run.template_version || '—')}</strong></div>
+      <div><small>Current stage</small><strong>${esc(run.stage || '—')}</strong></div>
+      <div><small>Run state</small><strong><span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span></strong></div>
+      <div><small>Revision</small><strong>${fmt(run.revision || 0)}</strong></div>
+      <div><small>Coordinator</small><strong>${esc(run.coordinator?.agent_id || 'Unclaimed')}</strong><small>${esc(run.coordinator?.provider || '')} · fence ${fmt(run.coordinator_fence || 0)}</small></div>
+      <div><small>Updated</small><strong>${esc(run.updated_at ? new Date(run.updated_at).toLocaleString() : '—')}</strong></div>
+    </div>
+    <section class="flow-detail__section"><div class="panel__head"><div><p class="eyebrow">Context</p><h3>Linked boards and posts</h3></div></div>${referenceHtml}</section>
+    <section class="flow-detail__section"><div class="panel__head"><div><p class="eyebrow">Current projection</p><h3>Tasks · ${fmt(tasks.length)}</h3></div></div><div class="flow-tasks">${taskHtml}</div></section>
+    <section class="flow-detail__section"><div class="panel__head"><div><p class="eyebrow">Audit history</p><h3>Flow event timeline</h3></div><span class="panel__note">${fmt(events.length)} Membrick-recorded events · provider telemetry is shown separately</span></div><div class="flow-timeline">${timelineHtml}</div></section>`;
+  document.querySelectorAll('[data-flow-board-id]').forEach(button => button.addEventListener('click', async () => {
+    const boardId = button.dataset.flowBoardId;
+    const postSequence = button.dataset.flowPostSequence ? Number(button.dataset.flowPostSequence) : null;
+    showView('boards', false);
+    if (!state.boards.length) await loadBoards(boardId);
+    await selectBoard(boardId, postSequence);
+  }));
+}
+
+function boardForTarget(target) {
+  const id = target.includes(':post:') ? target.split(':post:')[0] : target;
+  return state.boards.find(board => board.board_id === id);
+}
+
+function renderBoardLinks(links = []) {
+  if (!links.length) return '<span class="muted">No linked items</span>';
+  return `<div class="board-links">${links.map(link => {
+    const target = String(link.target || '');
+    const board = boardForTarget(target);
+    const postSequence = board && target.includes(':post:')
+      ? Number(target.split(':post:').at(-1)) : null;
+    const label = board ? `${board.type || 'general'} · ${board.title || board.key}`
+      : target.startsWith('https://') ? target
+        : target.startsWith('repo:') ? target.slice(5) : target;
+    const item = board
+      ? `<button type="button" class="board-link" data-board-link="${esc(board.board_id)}"${Number.isFinite(postSequence) ? ` data-post-sequence="${postSequence}"` : ''}>${esc(label)}${Number.isFinite(postSequence) ? ` · post ${postSequence}` : ''}</button>`
+      : target.startsWith('https://')
+        ? `<a class="board-link" href="${esc(target)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`
+        : `<span class="board-link board-link--plain">${esc(label)}</span>`;
+    return `<span class="board-link-item"><small>${esc(link.relation || 'related')}</small>${item}</span>`;
+  }).join('')}</div>`;
+}
+
+function renderBoardDetail(snapshot) {
+  const board = snapshot.board;
+  const template = state.boardTemplates.find(item => item.id === board.template_id && item.version === board.template_version);
+  const posts = snapshot.posts || [];
+  const links = renderBoardLinks(board.links || []);
+  const telemetryEvents = (state.status?.integrations || [])
+    .flatMap(provider => (provider.events || []).map(event => ({ ...event, provider: provider.provider })));
+  const postHtml = posts.map(post => {
+    const postTemplate = template?.post_templates?.find(item => item.id === post.post_template_id && item.version === post.post_template_version);
+    const structured = post.fields && typeof post.fields === 'object'
+      ? `<section class="board-post__fields"><span class="eyebrow">Post template · ${esc(postTemplate?.name || post.post_template_id || 'structured post')} v${esc(post.post_template_version || '')}</span><dl>${Object.entries(post.fields).map(([name, value]) => `<div><dt>${esc(name.replaceAll('_', ' '))}</dt><dd>${esc(Array.isArray(value) ? value.join(', ') : typeof value === 'string' ? value : JSON.stringify(value))}</dd></div>`).join('')}</dl></section>` : '';
+    const correlatedEvents = post.session_key
+      ? telemetryEvents.filter(event => event.session_key === post.session_key)
+      : [];
+    const telemetry = correlatedEvents.length ? `
+      <section class="board-post__telemetry" aria-label="Observed session telemetry">
+        <span class="eyebrow">Observed telemetry · ${fmt(correlatedEvents.length)} events · ${esc(post.session_key)}</span>
+        <div>${correlatedEvents.map(event => `<span class="board-event">${esc(event.event || event.category || 'Event')} · ${esc(event.provider || 'provider')} · ${esc(event.timestamp_ms ? new Date(event.timestamp_ms).toLocaleString() : 'time unavailable')}</span>`).join('')}</div>
+      </section>` : '';
+    return `
+    <article class="board-post" id="post-${esc(post.sequence)}">
+      <div class="board-post__head"><div><p class="eyebrow">${esc(post.author_agent_id || post.provider || 'Agent')} · ${esc(post.provider || 'unknown provider')}</p><h3>${esc(post.title || `Post ${post.sequence}`)}</h3></div><time>${esc(post.created_at ? new Date(post.created_at).toLocaleString() : 'Time unavailable')}</time></div>
+      <div class="board-post__content">${esc(post.content || '')}</div>
+      ${structured}
+      ${(post.links || []).length ? `<div class="board-post__links"><span class="eyebrow">Linked items</span>${renderBoardLinks(post.links)}</div>` : ''}
+      ${telemetry}
+    </article>`;
+  }).join('');
+  const more = snapshot.hasMore
+    ? `<div class="board-more"><button class="btn btn--quiet" type="button" id="board-more">Load next posts</button></div>` : '';
+  document.querySelector('#board-detail').innerHTML = `
+    <div class="board-detail__head"><div><p class="eyebrow">${esc(board.type || 'general')} board · ${esc(board.key)}</p><h2>${esc(board.title || board.key)}</h2><p class="muted">Created ${esc(board.created_at ? new Date(board.created_at).toLocaleString() : 'date unavailable')}</p>${board.template_id ? `<p class="board-template-label">Template · ${esc(template?.name || board.template_id)} v${esc(board.template_version || 'unknown')}${template ? ` · ${esc(template.description)}` : ''}</p>` : ''}</div><span class="board-source-label">Board content · agent-authored</span></div>
+    <section class="board-detail__links"><h3>Linked context</h3>${links}</section>
+    <section class="board-detail__posts"><div class="panel__head"><div><p class="eyebrow">Ordered history</p><h3>${fmt(posts.length)} posts shown</h3></div></div>${postHtml || '<div class="empty-state">No posts on this board yet.</div>'}${more}</section>`;
+  document.querySelectorAll('[data-board-link]').forEach(button => button.addEventListener('click', () => selectBoard(
+    button.dataset.boardLink,
+    button.dataset.postSequence ? Number(button.dataset.postSequence) : null,
+  )));
+  document.querySelector('#board-more')?.addEventListener('click', () => loadBoardPosts(board.board_id, snapshot.nextAfter, true));
 }
 
 /* ── query activity: small multiples, one scale per measure ────── */

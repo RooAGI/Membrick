@@ -768,7 +768,7 @@ pub fn provider_lifecycle_status(
     Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
 }
 
-fn opaque_session_key(session_id: &str) -> String {
+pub(crate) fn opaque_session_key(session_id: &str) -> String {
     if session_id.trim().is_empty() {
         return "unknown".to_string();
     }
