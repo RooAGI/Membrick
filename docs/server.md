@@ -368,7 +368,7 @@ Every Membrick process logs one line per event to stderr, with the UTC time,
 level, process role and id, and the module that logged:
 
 ```text
-2026-10-18T23:35:29.445Z  INFO resident[45368] membrick::executables::server: resident starting version="0.6.3" managed=true root=/path/to/project
+2026-10-18T23:35:29.445Z  INFO resident[45368] membrick::executables::server: resident starting version="0.7.0" managed=true root=/path/to/project
 ```
 
 The role is `resident`, `mcp`, `hook`, `server` or `cli`. Set the level in the
