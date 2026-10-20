@@ -118,13 +118,21 @@ pub(super) fn with_shared_memory_service<T>(
     root: &Path,
     operation: impl FnOnce(&mut MemoryService) -> Result<T>,
 ) -> Result<T> {
+    with_shared_memory_service_timeout(root, SHARED_STORE_WRITE_LOCK_WAIT, operation)
+}
+
+fn with_shared_memory_service_timeout<T>(
+    root: &Path,
+    lock_wait: Duration,
+    operation: impl FnOnce(&mut MemoryService) -> Result<T>,
+) -> Result<T> {
     crate::state_paths::migrate_legacy_state_dir(root)?;
     let memory_root = shared_memory_root(root);
     fs::create_dir_all(&memory_root)?;
     let lock_path = memory_root.join(".board-operation.lock");
     let _lock = acquire_file_lock(
         &lock_path,
-        SHARED_STORE_WRITE_LOCK_WAIT,
+        lock_wait,
         SHARED_STORE_WRITE_LOCK_RETRY,
         "shared store write lock",
     )?;
@@ -743,9 +751,10 @@ mod tests {
     #[test]
     fn shared_board_lock_serializes_writers_across_service_instances() {
         const WRITERS: usize = 6;
+        const TEST_LOCK_WAIT: Duration = Duration::from_secs(60);
         let root = board_test_root("concurrent");
         let workspace = root.to_string_lossy().into_owned();
-        let board = with_shared_memory_service(&root, |service| {
+        let board = with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
             service.board_open("mcp", &workspace, "parallel", "Parallel")
         })
         .unwrap();
@@ -756,7 +765,7 @@ mod tests {
             let workspace = workspace.clone();
             let board_id = board.board_id.clone();
             writers.push(std::thread::spawn(move || {
-                with_shared_memory_service(&root, |service| {
+                with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
                     service.board_post(
                         Some(&board_id),
                         "mcp",
@@ -780,7 +789,7 @@ mod tests {
         sequences.sort_unstable();
         assert_eq!(sequences, (1..=WRITERS as u64).collect::<Vec<_>>());
 
-        let posts = with_shared_memory_service(&root, |service| {
+        let posts = with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
             service.board_read(Some(&board.board_id), "mcp", &workspace, None, None, 100)
         })
         .unwrap();

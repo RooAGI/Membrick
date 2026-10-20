@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Update Membrick's active package and release metadata to one version.
 
-Usage: python3 scripts/bump_version.py 0.6.0
+Usage: python3 scripts/bump_version.py 0.7.0
 
 Historical release notes, benchmark artifacts, and archived outputs are
 intentionally left unchanged.
@@ -77,7 +77,7 @@ def replace_json(path: str, version: str, *, node_lock: bool = False) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", help="new semantic version, for example 0.6.0")
+    parser.add_argument("version", help="new semantic version, for example 0.7.0")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
         parser.error("version must use MAJOR.MINOR.PATCH format")

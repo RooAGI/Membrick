@@ -250,7 +250,15 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
     }
 
     if let Some(session_id) = args.recapture_session.as_deref() {
-        return run_recapture_session(&args, session_id);
+        #[cfg(any(feature = "claude-code", feature = "codex"))]
+        {
+            return run_recapture_session(&args, session_id);
+        }
+        #[cfg(not(any(feature = "claude-code", feature = "codex")))]
+        {
+            let _ = session_id;
+            anyhow::bail!("session recapture requires the Claude Code or Codex feature");
+        }
     }
 
     if args.replay_session.is_some() {
@@ -1245,6 +1253,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
 /// CLI index diagnostics use the same MemoryService boundary as serving paths.
 /// `--recapture-session`: rebuild one session's documents from its transcript
 /// and, with `--recapture-apply`, swap them in for the stored ones.
+#[cfg(any(feature = "claude-code", feature = "codex"))]
 fn run_recapture_session(args: &crate::cli::Args, session_id: &str) -> Result<()> {
     use crate::memory_api::transcript_capture::{
         rebuild_session_documents, replace_session_documents, CaptureRequest,
