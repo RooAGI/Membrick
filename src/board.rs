@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Filter key marking a document's kind in the board subsystem.
 pub const BOARD_DOC_KIND_FILTER: &str = "doc_kind";
@@ -86,6 +87,10 @@ pub fn default_board(owner: &str, workspace: &str, session_id: &str) -> Board {
         workspace: workspace.to_string(),
         key: DEFAULT_BOARD_KEY.to_string(),
         title: format!("{DEFAULT_BOARD_TITLE} (session {session_id})"),
+        board_type: DEFAULT_BOARD_TYPE.to_string(),
+        links: Vec::new(),
+        template_id: None,
+        template_version: None,
         // Synthetic boards predate any persistent record; the real
         // timestamp is set when the record is created.
         created_at: String::new(),
@@ -107,6 +112,297 @@ pub const BOARD_AUTHOR_FILTER: &str = "author_agent_id";
 pub const BOARD_PROVIDER_FILTER: &str = "provider";
 pub const BOARD_SEQUENCE_FILTER: &str = "sequence";
 pub const BOARD_REQUEST_ID_FILTER: &str = "request_id";
+pub const BOARD_TYPE_FILTER: &str = "board_type";
+pub const BOARD_POST_TITLE_FILTER: &str = "board_post_title";
+pub const BOARD_POST_LINKS_FILTER: &str = "board_post_links";
+pub const BOARD_POST_SESSION_KEY_FILTER: &str = "board_post_session_key";
+pub const BOARD_TEMPLATE_ID_FILTER: &str = "board_template_id";
+pub const BOARD_POST_TEMPLATE_ID_FILTER: &str = "board_post_template_id";
+pub const BOARD_POST_TEMPLATE_VERSION_FILTER: &str = "board_post_template_version";
+pub const BOARD_POST_FIELDS_FILTER: &str = "board_post_fields";
+
+pub const DEFAULT_BOARD_TYPE: &str = "general";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardTemplateFieldType {
+    String,
+    StringList,
+    Boolean,
+    Integer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardTemplateField {
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "type")]
+    pub field_type: BoardTemplateFieldType,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardPostTemplate {
+    pub id: String,
+    pub version: u32,
+    pub name: String,
+    pub description: String,
+    pub fields: Vec<BoardTemplateField>,
+}
+
+/// A versioned, declarative contract for structured board posts.
+/// Templates describe shape and agent guidance, not workflow transitions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardTemplate {
+    pub id: String,
+    pub version: u32,
+    pub name: String,
+    pub description: String,
+    #[serde(rename = "type")]
+    pub board_type: String,
+    pub instructions: String,
+    pub post_templates: Vec<BoardPostTemplate>,
+}
+
+fn field(
+    name: &str,
+    description: &str,
+    field_type: BoardTemplateFieldType,
+    required: bool,
+) -> BoardTemplateField {
+    BoardTemplateField {
+        name: name.into(),
+        description: description.into(),
+        field_type,
+        required,
+    }
+}
+
+fn post_template(
+    id: &str,
+    name: &str,
+    description: &str,
+    fields: Vec<BoardTemplateField>,
+) -> BoardPostTemplate {
+    BoardPostTemplate {
+        id: id.into(),
+        version: 1,
+        name: name.into(),
+        description: description.into(),
+        fields,
+    }
+}
+
+/// Built-in templates are versioned with the server and available to every
+/// connected MCP agent.
+fn board_template_versions() -> Vec<BoardTemplate> {
+    use BoardTemplateFieldType::{String as Text, StringList};
+
+    vec![
+        BoardTemplate {
+            id: "project".into(),
+            version: 1,
+            name: "Project plan".into(),
+            description: "Capture a project goal, boundaries, success criteria, and staged outcomes.".into(),
+            board_type: "project".into(),
+            instructions: "Start with a project_brief. Add one stage post per meaningful outcome and link planning, task, and milestone boards. Ask the user about material missing constraints before treating the plan as ready.".into(),
+            post_templates: vec![
+                post_template("project_brief", "Project brief", "The agreed project goal and boundaries.", vec![
+                    field("goal", "What outcome should the project achieve?", Text, true),
+                    field("success_criteria", "Observable conditions that show the goal was met.", StringList, true),
+                    field("scope", "Work included in this project.", Text, false),
+                    field("constraints", "Known limits, dependencies, or requirements.", StringList, false),
+                    field("non_goals", "Related work explicitly outside scope.", StringList, false),
+                ]),
+                post_template("stage", "Stage", "A project stage and its intended outcome.", vec![
+                    field("name", "Short stage name.", Text, true),
+                    field("outcome", "What this stage will deliver.", Text, true),
+                    field("exit_criteria", "Checks that establish the stage outcome.", StringList, true),
+                    field("dependencies", "Earlier stages or external prerequisites.", StringList, false),
+                ]),
+            ],
+        },
+        BoardTemplate {
+            id: "planning".into(),
+            version: 1,
+            name: "Plan and decisions".into(),
+            description: "Record a reviewable plan, assumptions, risks, and decisions.".into(),
+            board_type: "planning".into(),
+            instructions: "Post the plan before decomposing it into delegated work. Separate confirmed facts from assumptions, and link evidence or decisions that affect the plan.".into(),
+            post_templates: vec![
+                post_template("plan", "Plan", "A proposed approach that can be reviewed before execution.", vec![
+                    field("summary", "The proposed approach and why it meets the goal.", Text, true),
+                    field("assumptions", "Unverified premises that could change the plan.", StringList, false),
+                    field("risks", "Likely failure modes and their impact.", StringList, false),
+                    field("dependencies", "Required decisions, systems, or earlier work.", StringList, false),
+                ]),
+                post_template("decision", "Decision", "A decision that changes or constrains the plan.", vec![
+                    field("decision", "What was decided.", Text, true),
+                    field("reason", "Why this option was selected.", Text, true),
+                    field("alternatives", "Other options considered.", StringList, false),
+                ]),
+            ],
+        },
+        BoardTemplate {
+            id: "task".into(),
+            version: 1,
+            name: "Task handoff".into(),
+            description: "Create executable task handoffs and record progress or results.".into(),
+            board_type: "tasks".into(),
+            instructions: "Before handing work to another agent, include bounded scope, testable acceptance criteria, dependencies, and an intended owner. Link the parent plan and milestone. Workers should post progress, blockers, and evidence here.".into(),
+            post_templates: vec![
+                post_template("task", "Task", "A bounded piece of work ready for an agent handoff.", vec![
+                    field("scope", "What the assignee should change or investigate.", Text, true),
+                    field("acceptance_criteria", "Checks that determine whether the task is complete.", StringList, true),
+                    field("owner", "Intended agent or person responsible for the work.", Text, true),
+                    field("dependencies", "Work or decisions required before starting.", StringList, false),
+                ]),
+                post_template("progress", "Progress update", "A concise update from the assigned worker.", vec![
+                    field("summary", "What changed or was learned.", Text, true),
+                    field("next_step", "The next concrete action, if any.", Text, false),
+                ]),
+                post_template("blocker", "Blocker", "A blocker requiring attention.", vec![
+                    field("description", "What is blocking progress.", Text, true),
+                    field("needed", "Decision or action needed to continue.", Text, true),
+                ]),
+                post_template("result", "Result", "A result with verification evidence.", vec![
+                    field("summary", "What was completed and the outcome.", Text, true),
+                    field("evidence", "Commands, reports, commits, or other verification references.", StringList, true),
+                ]),
+            ],
+        },
+        BoardTemplate {
+            id: "milestone".into(),
+            version: 1,
+            name: "Milestone and exit review".into(),
+            description: "Define milestone outcomes and record evidence against exit criteria.".into(),
+            board_type: "milestone".into(),
+            instructions: "State measurable exit criteria when creating the milestone. Record the observed result and link evidence when reviewing it. The board validates post shape but does not decide whether the milestone passed.".into(),
+            post_templates: vec![
+                post_template("milestone", "Milestone", "The planned milestone outcome and its exit criteria.", vec![
+                    field("outcome", "The result this milestone represents.", Text, true),
+                    field("exit_criteria", "Observable checks required for the outcome.", StringList, true),
+                    field("dependencies", "Required tasks, decisions, or earlier milestones.", StringList, false),
+                ]),
+                post_template("review", "Review", "An evidence-backed review of milestone criteria.", vec![
+                    field("summary", "What the evidence shows.", Text, true),
+                    field("evidence", "Links or references supporting the review.", StringList, true),
+                    field("open_items", "Remaining gaps or follow-up work.", StringList, false),
+                ]),
+            ],
+        },
+    ]
+}
+
+/// Return the latest version of each built-in template for discovery.
+pub fn board_templates() -> Vec<BoardTemplate> {
+    let mut latest = BTreeMap::<String, BoardTemplate>::new();
+    for template in board_template_versions() {
+        let replace = latest
+            .get(&template.id)
+            .map_or(true, |existing| template.version > existing.version);
+        if replace {
+            latest.insert(template.id.clone(), template);
+        }
+    }
+    latest.into_values().collect()
+}
+
+pub fn board_template(template_id: &str) -> Option<BoardTemplate> {
+    board_templates()
+        .into_iter()
+        .find(|template| template.id == template_id)
+}
+
+/// Look up an exact template version so existing templated boards retain
+/// their original contract after a newer version is introduced.
+pub fn board_template_version(template_id: &str, version: u32) -> Option<BoardTemplate> {
+    board_template_versions()
+        .into_iter()
+        .find(|template| template.id == template_id && template.version == version)
+}
+
+/// Validate a structured post against a board's versioned built-in template.
+/// Unknown fields are rejected to catch misspellings and stale agents.
+pub fn validate_template_post(
+    template: &BoardTemplate,
+    post_template_id: &str,
+    post_template_version: u32,
+    fields: &Value,
+) -> Result<(), Vec<String>> {
+    let Some(post_template) = template
+        .post_templates
+        .iter()
+        .find(|item| item.id == post_template_id && item.version == post_template_version)
+    else {
+        return Err(vec![format!(
+            "unknown post template {post_template_id:?} version {post_template_version} for board template {:?}",
+            template.id,
+        )]);
+    };
+    let Some(values) = fields.as_object() else {
+        return Err(vec!["fields must be a JSON object".into()]);
+    };
+    let mut errors = Vec::new();
+    for field in &post_template.fields {
+        let Some(value) = values.get(&field.name) else {
+            if field.required {
+                errors.push(format!("missing required field {:?}", field.name));
+            }
+            continue;
+        };
+        let valid = match field.field_type {
+            BoardTemplateFieldType::String => {
+                value.as_str().is_some_and(|text| !text.trim().is_empty())
+            }
+            BoardTemplateFieldType::StringList => value.as_array().is_some_and(|items| {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| item.as_str().is_some_and(|text| !text.trim().is_empty()))
+            }),
+            BoardTemplateFieldType::Boolean => value.is_boolean(),
+            BoardTemplateFieldType::Integer => value.as_i64().is_some(),
+        };
+        if !valid {
+            let expected = match field.field_type {
+                BoardTemplateFieldType::String => "non-empty string",
+                BoardTemplateFieldType::StringList => "non-empty list of non-empty strings",
+                BoardTemplateFieldType::Boolean => "boolean",
+                BoardTemplateFieldType::Integer => "integer",
+            };
+            errors.push(format!("field {:?} must be a {expected}", field.name));
+        }
+    }
+    for key in values.keys() {
+        if !post_template.fields.iter().any(|field| field.name == *key) {
+            errors.push(format!(
+                "unknown field {key:?} for post template {post_template_id:?}"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// A generic relation from a board or post to another board, post, or
+/// reference. The relation label is supplied by the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoardLink {
+    pub target: String,
+    pub relation: String,
+}
+
+/// One board and its ordered posts for read-only dashboard rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardSnapshot {
+    pub board: Board,
+    pub posts: Vec<BoardPost>,
+    pub has_more: bool,
+}
 
 /// A bulletin board: shared by a parent agent and its subagents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +416,20 @@ pub struct Board {
     /// Caller-supplied key, unique within (owner, workspace).
     pub key: String,
     pub title: String,
+    /// Descriptive metadata only; it does not change board behavior.
+    #[serde(default = "default_board_type", rename = "type")]
+    pub board_type: String,
+    #[serde(default)]
+    pub links: Vec<BoardLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<u32>,
     pub created_at: String,
+}
+
+fn default_board_type() -> String {
+    DEFAULT_BOARD_TYPE.to_string()
 }
 
 /// One post on a board.
@@ -131,7 +440,20 @@ pub struct BoardPost {
     pub board_id: String,
     pub author_agent_id: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Opaque telemetry session key, when the writer session is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_key: Option<String>,
     pub content: String,
+    #[serde(default)]
+    pub links: Vec<BoardLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_template_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Value>,
     /// Increasing within the board, assigned by the service.
     pub sequence: u64,
     pub created_at: String,
@@ -171,6 +493,10 @@ pub fn board_doc_filters(board: &Board) -> BTreeMap<String, String> {
     f.insert(BOARD_OWNER_FILTER.to_string(), board.owner.clone());
     f.insert(BOARD_WORKSPACE_FILTER.to_string(), board.workspace.clone());
     f.insert(BOARD_KEY_FILTER.to_string(), board.key.clone());
+    f.insert(BOARD_TYPE_FILTER.to_string(), board.board_type.clone());
+    if let Some(template_id) = &board.template_id {
+        f.insert(BOARD_TEMPLATE_ID_FILTER.to_string(), template_id.clone());
+    }
     f
 }
 
@@ -188,6 +514,37 @@ pub fn board_post_doc_filters(post: &BoardPost, request_id: &str) -> BTreeMap<St
     );
     f.insert(BOARD_PROVIDER_FILTER.to_string(), post.provider.clone());
     f.insert(BOARD_SEQUENCE_FILTER.to_string(), post.sequence.to_string());
+    if let Some(title) = &post.title {
+        f.insert(BOARD_POST_TITLE_FILTER.to_string(), title.clone());
+    }
+    if let Some(session_key) = &post.session_key {
+        f.insert(
+            BOARD_POST_SESSION_KEY_FILTER.to_string(),
+            session_key.clone(),
+        );
+    }
+    if !post.links.is_empty() {
+        if let Ok(links) = serde_json::to_string(&post.links) {
+            f.insert(BOARD_POST_LINKS_FILTER.to_string(), links);
+        }
+    }
+    if let Some(template_id) = &post.post_template_id {
+        f.insert(
+            BOARD_POST_TEMPLATE_ID_FILTER.to_string(),
+            template_id.clone(),
+        );
+    }
+    if let Some(version) = post.post_template_version {
+        f.insert(
+            BOARD_POST_TEMPLATE_VERSION_FILTER.to_string(),
+            version.to_string(),
+        );
+    }
+    if let Some(fields) = &post.fields {
+        if let Ok(value) = serde_json::to_string(fields) {
+            f.insert(BOARD_POST_FIELDS_FILTER.to_string(), value);
+        }
+    }
     if !request_id.is_empty() {
         f.insert(BOARD_REQUEST_ID_FILTER.to_string(), request_id.to_string());
     }

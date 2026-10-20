@@ -666,30 +666,38 @@ impl CodexMcp {
         }
 
         if mcp_tools::resident_backend_enabled()
-            && matches!(
-                tool_name,
-                "search"
-                    | "info"
-                    | "list_memories"
-                    | "board_open"
-                    | "board_list"
-                    | "board_info"
-                    | "board_post"
-                    | "board_read"
-                    | "board_get"
-                    | "board_search"
-                    | "add_memory"
-                    | "get_memory"
-                    | "delete_memory"
-                    | "review_search"
-                    | "search_feedback"
-                    | "enrich_doc"
-            )
+            && (mcp_tools::is_flow_tool_name(tool_name)
+                || matches!(
+                    tool_name,
+                    "search"
+                        | "info"
+                        | "list_memories"
+                        | "board_open"
+                        | "board_list"
+                        | "board_info"
+                        | "board_post"
+                        | "board_read"
+                        | "board_get"
+                        | "board_search"
+                        | "add_memory"
+                        | "get_memory"
+                        | "delete_memory"
+                        | "review_search"
+                        | "search_feedback"
+                        | "enrich_doc"
+                ))
         {
             return mcp_tools::call_resident_tool(id, &self.root, "codex", tool_name, &arguments);
         }
 
         match tool_name {
+            name if mcp_tools::is_flow_tool_name(name) => {
+                let mut service = self.store()?;
+                let service = service.as_mut().expect("initialized");
+                mcp_tools::call_board_or_memory_tool(
+                    name, id, &arguments, service, &self.root, "codex",
+                )
+            }
             "search" => {
                 if let Some(name) =
                     unknown_argument(&arguments, &["query", "top_k", "provider", "session_id"])
@@ -1079,6 +1087,7 @@ impl CodexMcp {
         ]
         .into_iter()
         .chain(mcp_tools::board_tool_definitions())
+        .chain(mcp_tools::flow_tool_definitions())
         .chain(mcp_tools::memory_tool_definitions())
         .chain(std::iter::once(mcp_tools::update_tool_definition()))
         .collect()

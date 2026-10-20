@@ -38,6 +38,7 @@ pub(crate) mod transcript_capture;
 
 mod board;
 mod enrich;
+mod flow;
 mod key_phrases;
 mod receipts;
 mod review;

@@ -2,6 +2,34 @@
 
 use super::*;
 
+fn normalize_board_links(
+    links: &[crate::board::BoardLink],
+) -> anyhow::Result<Vec<crate::board::BoardLink>> {
+    if links.len() > 100 {
+        anyhow::bail!("a board item may have at most 100 links");
+    }
+    links
+        .iter()
+        .map(|link| {
+            let target = link.target.trim();
+            let relation = link.relation.trim();
+            if target.is_empty()
+                || target.chars().count() > 2048
+                || relation.is_empty()
+                || relation.chars().count() > 64
+            {
+                anyhow::bail!(
+                    "link targets must be 1-2048 characters and relations 1-64 characters"
+                );
+            }
+            Ok(crate::board::BoardLink {
+                target: target.to_string(),
+                relation: relation.to_string(),
+            })
+        })
+        .collect()
+}
+
 impl MemoryService {
     // -----------------------------------------------------------------------
     // Agent bulletin board (see crate::board).
@@ -83,10 +111,40 @@ impl MemoryService {
         key: &str,
         title: &str,
     ) -> anyhow::Result<crate::board::Board> {
+        self.board_open_typed(
+            owner,
+            workspace,
+            key,
+            title,
+            crate::board::DEFAULT_BOARD_TYPE,
+            &[],
+        )
+    }
+
+    pub fn board_open_typed(
+        &mut self,
+        owner: &str,
+        workspace: &str,
+        key: &str,
+        title: &str,
+        board_type: &str,
+        links: &[crate::board::BoardLink],
+    ) -> anyhow::Result<crate::board::Board> {
         use crate::board::*;
         if key.trim().is_empty() {
             anyhow::bail!("board key must not be empty");
         }
+        let board_type = board_type.trim();
+        if board_type.is_empty()
+            || board_type.len() > 64
+            || !board_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            anyhow::bail!("board type must be 1-64 letters, numbers, '-' or '_' characters");
+        }
+        let links = normalize_board_links(links)?;
+        self.validate_board_links(&links, owner, workspace)?;
         if key.starts_with(SESSION_BOARD_KEY_PREFIX) {
             anyhow::bail!(
                 "board key namespace {SESSION_BOARD_KEY_PREFIX:?} is reserved for session boards"
@@ -97,7 +155,96 @@ impl MemoryService {
                 "board key \"default\" is reserved: it aliases the current session's board; use board_open_session"
             );
         }
-        self.board_open_inner(owner, workspace, key, title)
+        self.board_open_inner(owner, workspace, key, title, board_type, &links, None, None)
+    }
+
+    pub fn board_open_from_template(
+        &mut self,
+        owner: &str,
+        workspace: &str,
+        key: &str,
+        title: &str,
+        template_id: &str,
+        links: &[crate::board::BoardLink],
+    ) -> anyhow::Result<crate::board::Board> {
+        use crate::board::*;
+        let template = board_template(template_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown board template: {template_id}"))?;
+        if key.trim().is_empty() {
+            anyhow::bail!("board key must not be empty");
+        }
+        if key.starts_with(SESSION_BOARD_KEY_PREFIX) || is_default_alias(key) {
+            anyhow::bail!("template boards require a named, non-reserved key");
+        }
+        let links = normalize_board_links(links)?;
+        self.validate_board_links(&links, owner, workspace)?;
+        self.board_open_inner(
+            owner,
+            workspace,
+            key,
+            title,
+            &template.board_type,
+            &links,
+            Some(&template.id),
+            Some(template.version),
+        )
+    }
+
+    fn validate_board_links(
+        &mut self,
+        links: &[crate::board::BoardLink],
+        owner: &str,
+        workspace: &str,
+    ) -> anyhow::Result<()> {
+        if links.len() > 100 {
+            anyhow::bail!("a board item may have at most 100 links");
+        }
+        for link in links {
+            let target = link.target.trim();
+            let relation = link.relation.trim();
+            if target.is_empty()
+                || target.len() > 2048
+                || relation.is_empty()
+                || relation.len() > 64
+            {
+                anyhow::bail!(
+                    "link targets must be 1-2048 characters and relations 1-64 characters"
+                );
+            }
+            if let Some((target_board, _)) = target.split_once(":post:") {
+                let board = self
+                    .board_info(target_board, owner, workspace, None)?
+                    .ok_or_else(|| anyhow::anyhow!("linked post belongs to an unknown board"))?;
+                if self
+                    .board_get(Some(&board.board_id), owner, workspace, None, target)?
+                    .is_none()
+                {
+                    anyhow::bail!("linked post does not exist in this workspace: {target}");
+                }
+            } else if target.starts_with("board:") {
+                if self.board_info(target, owner, workspace, None)?.is_none() {
+                    anyhow::bail!("linked board does not exist in this workspace: {target}");
+                }
+            } else if target.starts_with("https://") {
+                let parsed = reqwest::Url::parse(target)
+                    .map_err(|_| anyhow::anyhow!("link target is not a valid https URL"))?;
+                if parsed.scheme() != "https" || parsed.host_str().is_none() {
+                    anyhow::bail!("link target must be an https URL with a host");
+                }
+            } else if target
+                .strip_prefix("repo:")
+                .is_some_and(|reference| !reference.trim().is_empty())
+            {
+                // Repository references remain generic identifiers. The
+                // dashboard displays them as references without interpreting
+                // them as local filesystem paths.
+            } else {
+                anyhow::bail!(
+                    "link target must be a workspace board/post ID, https URL, or repo: reference"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Inner open without the reserved-namespace guard; session boards
@@ -108,6 +255,10 @@ impl MemoryService {
         workspace: &str,
         key: &str,
         title: &str,
+        board_type: &str,
+        links: &[crate::board::BoardLink],
+        template_id: Option<&str>,
+        template_version: Option<u32>,
     ) -> anyhow::Result<crate::board::Board> {
         use crate::board::*;
         let board_id = board_id_for(owner, workspace, key);
@@ -124,6 +275,15 @@ impl MemoryService {
             });
         if let Some(doc) = persisted {
             if let Some(board) = board_from_doc_content(&doc.content) {
+                if let Some(template_id) = template_id {
+                    if board.template_id.as_deref() != Some(template_id)
+                        || board.template_version != template_version
+                    {
+                        anyhow::bail!(
+                            "board key already exists with a different template; choose a new key"
+                        );
+                    }
+                }
                 return Ok(board);
             }
         }
@@ -133,6 +293,10 @@ impl MemoryService {
             workspace: workspace.to_string(),
             key: key.to_string(),
             title: title.to_string(),
+            board_type: board_type.to_string(),
+            links: links.to_vec(),
+            template_id: template_id.map(str::to_string),
+            template_version,
             created_at: Utc::now().to_rfc3339(),
         };
         let doc = crate::SourceDocument {
@@ -175,7 +339,16 @@ impl MemoryService {
         }
         // The session key namespace is reserved, so this cannot collide
         // with a user-keyed board.
-        self.board_open_inner(owner, workspace, &session_board_key(sid), title)
+        self.board_open_inner(
+            owner,
+            workspace,
+            &session_board_key(sid),
+            title,
+            crate::board::DEFAULT_BOARD_TYPE,
+            &[],
+            None,
+            None,
+        )
     }
 
     /// List boards owned by `owner` in `workspace`. When `session_id`
@@ -215,6 +388,84 @@ impl MemoryService {
         }
         boards.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(boards)
+    }
+
+    /// List persisted boards for a dashboard without synthesizing the
+    /// session-specific default alias.
+    pub fn board_dashboard_list(
+        &self,
+        owner: &str,
+        workspace: &str,
+    ) -> anyhow::Result<Vec<crate::board::Board>> {
+        self.board_list(owner, workspace, None)
+    }
+
+    /// Read one board and a stable page of its posts for the dashboard.
+    pub fn board_dashboard_detail(
+        &self,
+        board_id: &str,
+        owner: &str,
+        workspace: &str,
+        after_sequence: Option<u64>,
+        limit: usize,
+    ) -> anyhow::Result<Option<crate::board::BoardSnapshot>> {
+        use crate::board::*;
+        let Some(board) = self.board_info(board_id, owner, workspace, None)? else {
+            return Ok(None);
+        };
+        let after = after_sequence.unwrap_or(0);
+        let limit = limit.clamp(1, 100);
+        let mut posts = Vec::new();
+        for doc in self.store.source_documents() {
+            let filters = &doc.filters;
+            if filters.get(BOARD_DOC_KIND_FILTER).map(String::as_str) != Some(BOARD_POST_KIND)
+                || filters.get(BOARD_ID_FILTER).map(String::as_str) != Some(board_id)
+            {
+                continue;
+            }
+            let sequence = filters
+                .get(BOARD_SEQUENCE_FILTER)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            if sequence > after {
+                posts.push(BoardPost {
+                    post_id: doc.doc_id.clone(),
+                    board_id: board_id.to_string(),
+                    author_agent_id: filters
+                        .get(BOARD_AUTHOR_FILTER)
+                        .cloned()
+                        .unwrap_or_default(),
+                    provider: filters
+                        .get(BOARD_PROVIDER_FILTER)
+                        .cloned()
+                        .unwrap_or_default(),
+                    title: filters.get(BOARD_POST_TITLE_FILTER).cloned(),
+                    session_key: filters.get(BOARD_POST_SESSION_KEY_FILTER).cloned(),
+                    content: doc.content.to_string(),
+                    links: filters
+                        .get(BOARD_POST_LINKS_FILTER)
+                        .and_then(|value| serde_json::from_str(value).ok())
+                        .unwrap_or_default(),
+                    post_template_id: filters.get(BOARD_POST_TEMPLATE_ID_FILTER).cloned(),
+                    post_template_version: filters
+                        .get(BOARD_POST_TEMPLATE_VERSION_FILTER)
+                        .and_then(|v| v.parse().ok()),
+                    fields: filters
+                        .get(BOARD_POST_FIELDS_FILTER)
+                        .and_then(|value| serde_json::from_str(value).ok()),
+                    sequence,
+                    created_at: doc.timestamp.clone().unwrap_or_default(),
+                });
+            }
+        }
+        posts.sort_by_key(|post| post.sequence);
+        let has_more = posts.len() > limit;
+        posts.truncate(limit);
+        Ok(Some(BoardSnapshot {
+            board,
+            posts,
+            has_more,
+        }))
     }
 
     /// Fetch a board by ID. Returns `None` for unknown IDs. The
@@ -304,7 +555,75 @@ impl MemoryService {
         content: &str,
         request_id: &str,
     ) -> anyhow::Result<crate::board::BoardPost> {
+        self.board_post_with_metadata(
+            board_id,
+            owner,
+            workspace,
+            session_id,
+            author_agent_id,
+            provider,
+            None,
+            content,
+            &[],
+            request_id,
+        )
+    }
+
+    pub fn board_post_with_metadata(
+        &mut self,
+        board_id: Option<&str>,
+        owner: &str,
+        workspace: &str,
+        session_id: Option<&str>,
+        author_agent_id: &str,
+        provider: &str,
+        title: Option<&str>,
+        content: &str,
+        links: &[crate::board::BoardLink],
+        request_id: &str,
+    ) -> anyhow::Result<crate::board::BoardPost> {
+        self.board_post_structured(
+            board_id,
+            owner,
+            workspace,
+            session_id,
+            author_agent_id,
+            provider,
+            title,
+            content,
+            links,
+            None,
+            None,
+            None,
+            request_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn board_post_structured(
+        &mut self,
+        board_id: Option<&str>,
+        owner: &str,
+        workspace: &str,
+        session_id: Option<&str>,
+        author_agent_id: &str,
+        provider: &str,
+        title: Option<&str>,
+        content: &str,
+        links: &[crate::board::BoardLink],
+        post_template_id: Option<&str>,
+        post_template_version: Option<u32>,
+        fields: Option<&serde_json::Value>,
+        request_id: &str,
+    ) -> anyhow::Result<crate::board::BoardPost> {
         use crate::board::*;
+        if let Some(title) = title {
+            if title.trim().is_empty() || title.len() > 256 {
+                anyhow::bail!("post title must be 1-256 characters when provided");
+            }
+        }
+        let links = normalize_board_links(links)?;
+        self.validate_board_links(&links, owner, workspace)?;
         let board_id = self.resolve_board_id(board_id, owner, workspace, session_id, true)?;
         // The board must exist; posting never creates one implicitly
         // (the session board is ensured by resolve_board_id above).
@@ -313,6 +632,44 @@ impl MemoryService {
             .is_none()
         {
             anyhow::bail!("unknown board_id: {board_id}");
+        }
+        let board = self
+            .board_info(&board_id, owner, workspace, session_id)?
+            .ok_or_else(|| anyhow::anyhow!("unknown board_id: {board_id}"))?;
+        match (
+            &board.template_id,
+            post_template_id,
+            post_template_version,
+            fields,
+        ) {
+            (
+                Some(template_id),
+                Some(post_template_id),
+                Some(post_template_version),
+                Some(fields),
+            ) => {
+                let version = board.template_version.ok_or_else(|| {
+                    anyhow::anyhow!("board template version is missing: {template_id}")
+                })?;
+                let template = board_template_version(template_id, version).ok_or_else(|| {
+                    anyhow::anyhow!("board template is no longer available: {template_id}")
+                })?;
+                let encoded = serde_json::to_vec(fields)?;
+                if encoded.len() > 32 * 1024 {
+                    anyhow::bail!("structured post fields must be at most 32768 bytes");
+                }
+                validate_template_post(&template, post_template_id, post_template_version, fields)
+                    .map_err(|errors| {
+                        anyhow::anyhow!("template validation failed: {}", errors.join("; "))
+                    })?;
+            }
+            (Some(_), _, _, _) => {
+                anyhow::bail!("templated boards require post_template_id, post_template_version, and fields on every post");
+            }
+            (None, None, None, None) => {}
+            (None, _, _, _) => {
+                anyhow::bail!("post template metadata and fields are only accepted on a board opened from a template");
+            }
         }
         // Idempotency: a retried request_id returns the original post.
         // Check the in-memory map first, then the store (restart recovery).
@@ -362,7 +719,16 @@ impl MemoryService {
             board_id: board_id.clone(),
             author_agent_id: author_agent_id.to_string(),
             provider: provider.to_string(),
+            title: title.map(|value| value.trim().to_string()),
+            session_key: session_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(crate::telemetry::opaque_session_key),
             content: content.to_string(),
+            links,
+            post_template_id: post_template_id.map(str::to_string),
+            post_template_version,
+            fields: fields.cloned(),
             sequence,
             created_at: Utc::now().to_rfc3339(),
         };
@@ -476,7 +842,20 @@ impl MemoryService {
                 board_id: board_id.clone(),
                 author_agent_id: f.get(BOARD_AUTHOR_FILTER).cloned().unwrap_or_default(),
                 provider: f.get(BOARD_PROVIDER_FILTER).cloned().unwrap_or_default(),
+                title: f.get(BOARD_POST_TITLE_FILTER).cloned(),
+                session_key: f.get(BOARD_POST_SESSION_KEY_FILTER).cloned(),
                 content: doc.content.to_string(),
+                links: f
+                    .get(BOARD_POST_LINKS_FILTER)
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or_default(),
+                post_template_id: f.get(BOARD_POST_TEMPLATE_ID_FILTER).cloned(),
+                post_template_version: f
+                    .get(BOARD_POST_TEMPLATE_VERSION_FILTER)
+                    .and_then(|v| v.parse().ok()),
+                fields: f
+                    .get(BOARD_POST_FIELDS_FILTER)
+                    .and_then(|value| serde_json::from_str(value).ok()),
                 sequence,
                 created_at: doc.timestamp.clone().unwrap_or_default(),
             });
@@ -524,7 +903,20 @@ impl MemoryService {
                     board_id: board_id.clone(),
                     author_agent_id: f.get(BOARD_AUTHOR_FILTER).cloned().unwrap_or_default(),
                     provider: f.get(BOARD_PROVIDER_FILTER).cloned().unwrap_or_default(),
+                    title: f.get(BOARD_POST_TITLE_FILTER).cloned(),
+                    session_key: f.get(BOARD_POST_SESSION_KEY_FILTER).cloned(),
                     content: d.content.to_string(),
+                    links: f
+                        .get(BOARD_POST_LINKS_FILTER)
+                        .and_then(|value| serde_json::from_str(value).ok())
+                        .unwrap_or_default(),
+                    post_template_id: f.get(BOARD_POST_TEMPLATE_ID_FILTER).cloned(),
+                    post_template_version: f
+                        .get(BOARD_POST_TEMPLATE_VERSION_FILTER)
+                        .and_then(|v| v.parse().ok()),
+                    fields: f
+                        .get(BOARD_POST_FIELDS_FILTER)
+                        .and_then(|value| serde_json::from_str(value).ok()),
                     sequence,
                     created_at: d.timestamp.clone().unwrap_or_default(),
                 }))
@@ -582,7 +974,20 @@ impl MemoryService {
                 board_id: board_id.clone(),
                 author_agent_id: f.get(BOARD_AUTHOR_FILTER).cloned().unwrap_or_default(),
                 provider: f.get(BOARD_PROVIDER_FILTER).cloned().unwrap_or_default(),
+                title: f.get(BOARD_POST_TITLE_FILTER).cloned(),
+                session_key: f.get(BOARD_POST_SESSION_KEY_FILTER).cloned(),
                 content: d.content.to_string(),
+                links: f
+                    .get(BOARD_POST_LINKS_FILTER)
+                    .and_then(|value| serde_json::from_str(value).ok())
+                    .unwrap_or_default(),
+                post_template_id: f.get(BOARD_POST_TEMPLATE_ID_FILTER).cloned(),
+                post_template_version: f
+                    .get(BOARD_POST_TEMPLATE_VERSION_FILTER)
+                    .and_then(|v| v.parse().ok()),
+                fields: f
+                    .get(BOARD_POST_FIELDS_FILTER)
+                    .and_then(|value| serde_json::from_str(value).ok()),
                 sequence,
                 created_at: d.timestamp.clone().unwrap_or_default(),
             });

@@ -1079,6 +1079,12 @@ fn app_router(state: AppState) -> Router {
         .route("/dashboard/rooagi-logo.png", get(dashboard_logo))
         .route("/api/status", get(api_status))
         .route("/api/timeseries", get(api_timeseries))
+        .route("/api/boards", get(api_boards))
+        .route("/api/board-templates", get(api_board_templates))
+        .route("/api/boards/:board_id", get(api_board_detail))
+        .route("/api/flow-templates", get(api_flow_templates))
+        .route("/api/flows", get(api_flows))
+        .route("/api/flows/:flow_id", get(api_flow_detail))
         .route("/api/search-reviews", get(api_search_reviews))
         .route("/api/integrations", get(api_integrations))
         .route("/api/sessions", get(api_sessions))
@@ -1457,9 +1463,15 @@ fn is_workspace_telemetry_path(path: &str) -> bool {
             | "/api/status"
             | "/api/timeseries"
             | "/api/search-reviews"
+            | "/api/boards"
+            | "/api/board-templates"
+            | "/api/flows"
+            | "/api/flow-templates"
             | "/api/metrics"
             | "/metrics"
     ) || path.starts_with("/api/sessions/")
+        || path.starts_with("/api/boards/")
+        || path.starts_with("/api/flows/")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1617,6 +1629,138 @@ async fn api_timeseries(State(state): State<AppState>) -> impl IntoResponse {
             .flatten()
             .unwrap_or_else(|| state.telemetry.snapshot()),
     )
+}
+
+async fn api_boards(State(state): State<AppState>) -> impl IntoResponse {
+    let workspace = state.project_root.to_string_lossy();
+    match state.service.read() {
+        Ok(service) => match service.board_dashboard_list("mcp", &workspace) {
+            Ok(boards) => Json(json!({"boards": boards})).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": format!("boards unavailable: {error}")})),
+            )
+                .into_response(),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail":"boards unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_board_templates() -> impl IntoResponse {
+    Json(json!({"templates": crate::board::board_templates()}))
+}
+
+async fn api_flow_templates(State(state): State<AppState>) -> impl IntoResponse {
+    match state.service.read() {
+        Ok(service) => Json(json!({"templates": service.flow_template_list()})).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail":"flow templates unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_flows(State(state): State<AppState>) -> impl IntoResponse {
+    let workspace = state.project_root.to_string_lossy();
+    match state.service.read() {
+        Ok(service) => match service.flow_list("mcp", &workspace) {
+            Ok(flows) => Json(json!({"flows": flows})).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": format!("flows unavailable: {error}")})),
+            )
+                .into_response(),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail":"flows unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_flow_detail(
+    State(state): State<AppState>,
+    Path(flow_id): Path<String>,
+) -> impl IntoResponse {
+    let workspace = state.project_root.to_string_lossy();
+    match state.service.read() {
+        Ok(service) => match service.flow_get("mcp", &workspace, &flow_id) {
+            Ok(Some(snapshot)) => {
+                Json(json!({"flow": snapshot.run, "events": snapshot.events})).into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"detail":"flow not found"})),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": format!("flow unavailable: {error}")})),
+            )
+                .into_response(),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail":"flows unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardBoardPostsQuery {
+    after_sequence: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn api_board_detail(
+    State(state): State<AppState>,
+    Path(board_id): Path<String>,
+    Query(query): Query<DashboardBoardPostsQuery>,
+) -> impl IntoResponse {
+    let workspace = state.project_root.to_string_lossy();
+    let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    match state.service.read() {
+        Ok(service) => match service.board_dashboard_detail(
+            &board_id,
+            "mcp",
+            &workspace,
+            query.after_sequence,
+            limit,
+        ) {
+            Ok(Some(snapshot)) => {
+                let next_after = snapshot.posts.last().map(|post| post.sequence);
+                Json(json!({
+                    "board": snapshot.board,
+                    "posts": snapshot.posts,
+                    "has_more": snapshot.has_more,
+                    "next_after_sequence": if snapshot.has_more { next_after } else { None },
+                }))
+                .into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"detail":"board not found"})),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": format!("board unavailable: {error}")})),
+            )
+                .into_response(),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail":"board unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
