@@ -1243,10 +1243,25 @@ mod tests {
     fn request_id_retry_returns_original() {
         let mut service = svc();
         let a = post(&mut service, None, Some(S1), "first", "retry-1");
-        let b = post(&mut service, None, Some(S1), "second", "retry-1");
+        let b = post(&mut service, None, Some(S1), "first", "retry-1");
         assert_eq!(a.post_id, b.post_id);
         assert_eq!(b.content, "first");
         assert_eq!(b.sequence, 1);
+        let changed = service
+            .board_post(
+                None,
+                OWNER,
+                WS,
+                Some(S1),
+                "agent-1",
+                "claude",
+                "second",
+                "retry-1",
+            )
+            .unwrap_err();
+        assert!(changed
+            .to_string()
+            .contains("reused with different board post content"));
         let posts = service
             .board_read(None, OWNER, WS, Some(S1), None, 20)
             .unwrap();
@@ -1370,9 +1385,24 @@ mod tests {
         drop(service);
         // Reopen: the store scan recovers request IDs and sequences.
         let mut reopened = MemoryService::at_path(&dir, options).unwrap();
-        let retry = post(&mut reopened, None, Some(S1), "changed", "keep-me");
+        let retry = post(&mut reopened, None, Some(S1), "first", "keep-me");
         assert_eq!(retry.post_id, p1.post_id);
         assert_eq!(retry.content, "first");
+        let changed = reopened
+            .board_post(
+                None,
+                OWNER,
+                WS,
+                Some(S1),
+                "agent-1",
+                "claude",
+                "changed",
+                "keep-me",
+            )
+            .unwrap_err();
+        assert!(changed
+            .to_string()
+            .contains("reused with different board post content"));
         let p3 = post(&mut reopened, None, Some(S1), "third", "r3");
         assert_eq!(p3.sequence, 3);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1737,18 +1767,29 @@ mod tests {
             "same",
         )
         .unwrap();
+        let retry = post_task(
+            &mut service,
+            &board.board_id,
+            Some(("task", 1)),
+            Some(&task_fields()),
+            "same",
+        )
+        .unwrap();
+        assert_eq!(retry.post_id, first.post_id);
+        assert_eq!(retry.fields, first.fields);
         let mut changed = task_fields();
         changed["status"] = json!("done");
-        let retry = post_task(
+        let error = post_task(
             &mut service,
             &board.board_id,
             Some(("task", 1)),
             Some(&changed),
             "same",
         )
-        .unwrap();
-        assert_eq!(retry.post_id, first.post_id);
-        assert_eq!(retry.fields, first.fields);
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reused with different board post content"));
     }
 
     #[test]
