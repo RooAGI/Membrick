@@ -130,6 +130,20 @@ impl MemoryService {
         board_type: &str,
         links: &[crate::board::BoardLink],
     ) -> anyhow::Result<crate::board::Board> {
+        self.board_open_instance(owner, workspace, key, title, board_type, links, None, None)
+    }
+
+    pub fn board_open_instance(
+        &mut self,
+        owner: &str,
+        workspace: &str,
+        key: &str,
+        title: &str,
+        board_type: &str,
+        links: &[crate::board::BoardLink],
+        template_instance: Option<&crate::board::TemplateInstance>,
+        fields: Option<&serde_json::Value>,
+    ) -> anyhow::Result<crate::board::Board> {
         use crate::board::*;
         if key.trim().is_empty() {
             anyhow::bail!("board key must not be empty");
@@ -145,6 +159,14 @@ impl MemoryService {
         }
         let links = normalize_board_links(links)?;
         self.validate_board_links(&links, owner, workspace)?;
+        if let Some(instance) = template_instance {
+            validate_template_instance(instance)?;
+            if let Some(fields) = fields {
+                validate_template_fields(&instance.snapshot.schema, fields)?;
+            }
+        } else if fields.is_some() {
+            anyhow::bail!("board fields require a template_instance");
+        }
         if key.starts_with(SESSION_BOARD_KEY_PREFIX) {
             anyhow::bail!(
                 "board key namespace {SESSION_BOARD_KEY_PREFIX:?} is reserved for session boards"
@@ -155,38 +177,15 @@ impl MemoryService {
                 "board key \"default\" is reserved: it aliases the current session's board; use board_open_session"
             );
         }
-        self.board_open_inner(owner, workspace, key, title, board_type, &links, None, None)
-    }
-
-    pub fn board_open_from_template(
-        &mut self,
-        owner: &str,
-        workspace: &str,
-        key: &str,
-        title: &str,
-        template_id: &str,
-        links: &[crate::board::BoardLink],
-    ) -> anyhow::Result<crate::board::Board> {
-        use crate::board::*;
-        let template = board_template(template_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown board template: {template_id}"))?;
-        if key.trim().is_empty() {
-            anyhow::bail!("board key must not be empty");
-        }
-        if key.starts_with(SESSION_BOARD_KEY_PREFIX) || is_default_alias(key) {
-            anyhow::bail!("template boards require a named, non-reserved key");
-        }
-        let links = normalize_board_links(links)?;
-        self.validate_board_links(&links, owner, workspace)?;
         self.board_open_inner(
             owner,
             workspace,
             key,
             title,
-            &template.board_type,
+            board_type,
             &links,
-            Some(&template.id),
-            Some(template.version),
+            template_instance,
+            fields,
         )
     }
 
@@ -257,8 +256,8 @@ impl MemoryService {
         title: &str,
         board_type: &str,
         links: &[crate::board::BoardLink],
-        template_id: Option<&str>,
-        template_version: Option<u32>,
+        template_instance: Option<&crate::board::TemplateInstance>,
+        fields: Option<&serde_json::Value>,
     ) -> anyhow::Result<crate::board::Board> {
         use crate::board::*;
         let board_id = board_id_for(owner, workspace, key);
@@ -275,17 +274,29 @@ impl MemoryService {
             });
         if let Some(doc) = persisted {
             if let Some(board) = board_from_doc_content(&doc.content) {
-                if let Some(template_id) = template_id {
-                    if board.template_id.as_deref() != Some(template_id)
-                        || board.template_version != template_version
+                if let Some(template_instance) = template_instance {
+                    if board
+                        .template_instance
+                        .as_ref()
+                        .map(|existing| &existing.content_hash)
+                        != Some(&template_instance.content_hash)
                     {
                         anyhow::bail!(
                             "board key already exists with a different template; choose a new key"
                         );
                     }
+                    if fields.is_some_and(|fields| board.fields.as_ref() != Some(fields)) {
+                        anyhow::bail!("board key already exists with different initial fields");
+                    }
                 }
                 return Ok(board);
             }
+        }
+        // A new templated board must satisfy its schema's required fields;
+        // only a lookup of an existing board may omit them.
+        if let Some(instance) = template_instance {
+            let empty = serde_json::Value::Object(Default::default());
+            validate_template_fields(&instance.snapshot.schema, fields.unwrap_or(&empty))?;
         }
         let board = Board {
             board_id: board_id.clone(),
@@ -295,8 +306,8 @@ impl MemoryService {
             title: title.to_string(),
             board_type: board_type.to_string(),
             links: links.to_vec(),
-            template_id: template_id.map(str::to_string),
-            template_version,
+            template_instance: template_instance.cloned(),
+            fields: fields.cloned(),
             created_at: Utc::now().to_rfc3339(),
         };
         let doc = crate::SourceDocument {
@@ -409,6 +420,36 @@ impl MemoryService {
         after_sequence: Option<u64>,
         limit: usize,
     ) -> anyhow::Result<Option<crate::board::BoardSnapshot>> {
+        self.board_dashboard_detail_ordered(
+            board_id,
+            owner,
+            workspace,
+            after_sequence,
+            limit,
+            false,
+        )
+    }
+
+    /// Read the newest page of posts without paging through earlier history.
+    pub fn board_dashboard_latest_detail(
+        &self,
+        board_id: &str,
+        owner: &str,
+        workspace: &str,
+        limit: usize,
+    ) -> anyhow::Result<Option<crate::board::BoardSnapshot>> {
+        self.board_dashboard_detail_ordered(board_id, owner, workspace, None, limit, true)
+    }
+
+    fn board_dashboard_detail_ordered(
+        &self,
+        board_id: &str,
+        owner: &str,
+        workspace: &str,
+        after_sequence: Option<u64>,
+        limit: usize,
+        latest: bool,
+    ) -> anyhow::Result<Option<crate::board::BoardSnapshot>> {
         use crate::board::*;
         let Some(board) = self.board_info(board_id, owner, workspace, None)? else {
             return Ok(None);
@@ -416,6 +457,7 @@ impl MemoryService {
         let after = after_sequence.unwrap_or(0);
         let limit = limit.clamp(1, 100);
         let mut posts = Vec::new();
+        let mut latest_sequence = None;
         for doc in self.store.source_documents() {
             let filters = &doc.filters;
             if filters.get(BOARD_DOC_KIND_FILTER).map(String::as_str) != Some(BOARD_POST_KIND)
@@ -427,6 +469,8 @@ impl MemoryService {
                 .get(BOARD_SEQUENCE_FILTER)
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or_default();
+            latest_sequence =
+                Some(latest_sequence.map_or(sequence, |latest: u64| latest.max(sequence)));
             if sequence > after {
                 posts.push(BoardPost {
                     post_id: doc.doc_id.clone(),
@@ -460,11 +504,16 @@ impl MemoryService {
         }
         posts.sort_by_key(|post| post.sequence);
         let has_more = posts.len() > limit;
-        posts.truncate(limit);
+        if latest && has_more {
+            posts.drain(..posts.len() - limit);
+        } else {
+            posts.truncate(limit);
+        }
         Ok(Some(BoardSnapshot {
             board,
             posts,
             has_more,
+            latest_sequence,
         }))
     }
 
@@ -617,6 +666,9 @@ impl MemoryService {
         request_id: &str,
     ) -> anyhow::Result<crate::board::BoardPost> {
         use crate::board::*;
+        if request_id.trim().is_empty() || request_id.len() > 256 {
+            anyhow::bail!("request_id must be 1-256 bytes");
+        }
         if let Some(title) = title {
             if title.trim().is_empty() || title.len() > 256 {
                 anyhow::bail!("post title must be 1-256 characters when provided");
@@ -636,67 +688,68 @@ impl MemoryService {
         let board = self
             .board_info(&board_id, owner, workspace, session_id)?
             .ok_or_else(|| anyhow::anyhow!("unknown board_id: {board_id}"))?;
-        match (
-            &board.template_id,
-            post_template_id,
-            post_template_version,
-            fields,
-        ) {
-            (
-                Some(template_id),
-                Some(post_template_id),
-                Some(post_template_version),
-                Some(fields),
-            ) => {
-                let version = board.template_version.ok_or_else(|| {
-                    anyhow::anyhow!("board template version is missing: {template_id}")
-                })?;
-                let template = board_template_version(template_id, version).ok_or_else(|| {
-                    anyhow::anyhow!("board template is no longer available: {template_id}")
-                })?;
-                let encoded = serde_json::to_vec(fields)?;
-                if encoded.len() > 32 * 1024 {
+        match (&board.template_instance, post_template_id, post_template_version, fields) {
+            (Some(instance), Some(template_id), Some(version), Some(fields)) => {
+                let post_template = instance.snapshot.post_templates.iter()
+                    .find(|item| item.template_id == template_id && item.version == version)
+                    .ok_or_else(|| anyhow::anyhow!("post template {template_id:?}@{version} is not in the board's pinned template snapshot"))?;
+                validate_template_fields(&post_template.schema, fields)?;
+                if serde_json::to_vec(fields)?.len() > TEMPLATE_FIELDS_MAX_BYTES {
                     anyhow::bail!("structured post fields must be at most 32768 bytes");
                 }
-                validate_template_post(&template, post_template_id, post_template_version, fields)
-                    .map_err(|errors| {
-                        anyhow::anyhow!("template validation failed: {}", errors.join("; "))
-                    })?;
             }
-            (Some(_), _, _, _) => {
-                anyhow::bail!("templated boards require post_template_id, post_template_version, and fields on every post");
-            }
+            (Some(_), _, _, _) => anyhow::bail!("templated boards require post_template_id, post_template_version, and fields from the pinned snapshot on every post"),
             (None, None, None, None) => {}
-            (None, _, _, _) => {
-                anyhow::bail!("post template metadata and fields are only accepted on a board opened from a template");
-            }
+            (None, _, _, _) => anyhow::bail!("post template metadata and fields require a board with template_instance"),
         }
-        // Idempotency: a retried request_id returns the original post.
-        // Check the in-memory map first, then the store (restart recovery).
-        if !request_id.is_empty() {
-            let cached = {
-                let state = self.board_state.lock().expect("board state lock poisoned");
-                state
-                    .request_ids
-                    .get(&(board_id.clone(), request_id.to_string()))
-                    .cloned()
+        // A retry returns the original post only if the complete normalized
+        // request matches. Reusing an ID for different content is a conflict,
+        // both in-process and after restart.
+        let expected_title = title.map(str::trim).map(str::to_string);
+        let expected_session_key = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(crate::telemetry::opaque_session_key);
+        let validate_retry =
+            |post: crate::board::BoardPost| -> anyhow::Result<crate::board::BoardPost> {
+                anyhow::ensure!(
+                    post.author_agent_id == author_agent_id
+                        && post.provider == provider
+                        && post.title == expected_title
+                        && post.session_key == expected_session_key
+                        && post.content == content
+                        && post.links == links
+                        && post.post_template_id.as_deref() == post_template_id
+                        && post.post_template_version == post_template_version
+                        && post.fields.as_ref() == fields,
+                    "request_id was reused with different board post content"
+                );
+                Ok(post)
             };
-            if let Some(post_id) = cached {
-                return self
-                    .board_get(Some(&board_id), owner, workspace, session_id, &post_id)?
-                    .ok_or_else(|| anyhow::anyhow!("request_id mapped to missing post"));
-            }
-            if let Some(post_id) = self.board_find_request_id(&board_id, request_id)? {
-                // Repopulate the map so later retries stay cheap.
-                let mut state = self.board_state.lock().expect("board state lock poisoned");
-                state
-                    .request_ids
-                    .insert((board_id.clone(), request_id.to_string()), post_id.clone());
-                drop(state);
-                return self
-                    .board_get(Some(&board_id), owner, workspace, session_id, &post_id)?
-                    .ok_or_else(|| anyhow::anyhow!("request_id mapped to missing post"));
-            }
+        let cached = {
+            let state = self.board_state.lock().expect("board state lock poisoned");
+            state
+                .request_ids
+                .get(&(board_id.clone(), request_id.to_string()))
+                .cloned()
+        };
+        if let Some(post_id) = cached {
+            let post = self
+                .board_get(Some(&board_id), owner, workspace, session_id, &post_id)?
+                .ok_or_else(|| anyhow::anyhow!("request_id mapped to missing post"))?;
+            return validate_retry(post);
+        }
+        if let Some(post_id) = self.board_find_request_id(&board_id, request_id)? {
+            // Repopulate the map so later retries stay cheap.
+            let mut state = self.board_state.lock().expect("board state lock poisoned");
+            state
+                .request_ids
+                .insert((board_id.clone(), request_id.to_string()), post_id.clone());
+            drop(state);
+            let post = self
+                .board_get(Some(&board_id), owner, workspace, session_id, &post_id)?
+                .ok_or_else(|| anyhow::anyhow!("request_id mapped to missing post"))?;
+            return validate_retry(post);
         }
         // Assign the next sequence. Lazily initialize from the store's max
         // so a restart recovers without gaps or reuse.
@@ -732,12 +785,10 @@ impl MemoryService {
             sequence,
             created_at: Utc::now().to_rfc3339(),
         };
-        if !request_id.is_empty() {
-            state.request_ids.insert(
-                (board_id.clone(), request_id.to_string()),
-                post.post_id.clone(),
-            );
-        }
+        state.request_ids.insert(
+            (board_id.clone(), request_id.to_string()),
+            post.post_id.clone(),
+        );
         drop(state);
         let doc = crate::SourceDocument {
             doc_id: post.post_id.clone(),
@@ -1357,5 +1408,458 @@ mod tests {
         let mut seqs: Vec<u64> = posts.iter().map(|p| p.sequence).collect();
         seqs.sort_unstable();
         assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+    }
+
+    use crate::board::test_fixtures::*;
+    use serde_json::{json, Value};
+
+    fn open_project(
+        service: &mut MemoryService,
+        key: &str,
+        instance: &TemplateInstance,
+        fields: Option<&Value>,
+    ) -> anyhow::Result<Board> {
+        service.board_open_instance(
+            OWNER,
+            WS,
+            key,
+            "Project",
+            "project",
+            &[],
+            Some(instance),
+            fields,
+        )
+    }
+
+    fn post_task(
+        service: &mut MemoryService,
+        board_id: &str,
+        template: Option<(&str, u32)>,
+        fields: Option<&Value>,
+        request_id: &str,
+    ) -> anyhow::Result<BoardPost> {
+        service.board_post_structured(
+            Some(board_id),
+            OWNER,
+            WS,
+            Some(S1),
+            "agent-1",
+            "claude",
+            Some("Task"),
+            "narrative",
+            &[],
+            template.map(|(id, _)| id),
+            template.map(|(_, version)| version),
+            fields,
+            request_id,
+        )
+    }
+
+    fn instance_from(value: Value) -> TemplateInstance {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn task_fields() -> Value {
+        json!({"description": "Write tests", "status": "active", "future_field": [1]})
+    }
+
+    #[test]
+    fn templated_board_open_pins_snapshot_and_is_idempotent() {
+        let mut service = svc();
+        let instance = project_instance(1);
+        let fields = project_fields();
+        let board = open_project(&mut service, "launch", &instance, Some(&fields)).unwrap();
+        let pinned = board.template_instance.as_ref().unwrap();
+        assert_eq!(pinned.content_hash, instance.content_hash);
+        assert_eq!(pinned.snapshot.post_templates.len(), 1);
+        assert_eq!(board.fields.as_ref(), Some(&fields));
+        // Same key, same hash: the original board, unchanged.
+        let again = open_project(&mut service, "launch", &instance, Some(&fields)).unwrap();
+        assert_eq!(again.board_id, board.board_id);
+        assert_eq!(again.created_at, board.created_at);
+        // Same key, same hash, no fields: still the same board.
+        let lookup = open_project(&mut service, "launch", &instance, None).unwrap();
+        assert_eq!(lookup.fields.as_ref(), Some(&fields));
+        // A plain key/title open returns the templated board as-is.
+        let plain = service.board_open(OWNER, WS, "launch", "x").unwrap();
+        assert!(plain.template_instance.is_some());
+    }
+
+    #[test]
+    fn reopen_with_conflicting_template_or_fields_fails_clearly() {
+        let mut service = svc();
+        open_project(
+            &mut service,
+            "launch",
+            &project_instance(1),
+            Some(&project_fields()),
+        )
+        .unwrap();
+        let err = open_project(
+            &mut service,
+            "launch",
+            &project_instance(2),
+            Some(&project_fields()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different template"), "{err}");
+        let mut other_fields = project_fields();
+        other_fields["goal"] = json!("Another goal");
+        let err = open_project(
+            &mut service,
+            "launch",
+            &project_instance(1),
+            Some(&other_fields),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("different initial fields"),
+            "{err}"
+        );
+        // An untemplated board cannot be upgraded in place.
+        service.board_open(OWNER, WS, "plain", "Plain").unwrap();
+        let err = open_project(
+            &mut service,
+            "plain",
+            &project_instance(1),
+            Some(&project_fields()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("different template"), "{err}");
+    }
+
+    #[test]
+    fn tampered_hashes_are_rejected() {
+        let mut service = svc();
+        let mut wrong_board = project_instance(1);
+        wrong_board.content_hash = format!("sha256:{}", "0".repeat(64));
+        let err =
+            open_project(&mut service, "a", &wrong_board, Some(&project_fields())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("board template content_hash mismatch"),
+            "{err}"
+        );
+
+        let mut wrong_post = project_instance_with(1, Vec::new());
+        wrong_post["snapshot"]["post_templates"][0]["content_hash"] =
+            json!(format!("sha256:{}", "1".repeat(64)));
+        let err = open_project(
+            &mut service,
+            "b",
+            &instance_from(wrong_post),
+            Some(&project_fields()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("post template content_hash mismatch"),
+            "{err}"
+        );
+
+        // Schema edited after hashing: the pinned hash no longer matches.
+        let mut edited = project_instance_with(1, Vec::new());
+        edited["snapshot"]["schema"]["fields"][0]["required"] = json!(false);
+        let err = open_project(
+            &mut service,
+            "c",
+            &instance_from(edited),
+            Some(&project_fields()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("content_hash mismatch"), "{err}");
+        assert!(service.board_list(OWNER, WS, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_bounds_are_enforced() {
+        let mut service = svc();
+        let fields = project_fields();
+        // Oversized: many large unknown metadata strings inside the snapshot.
+        let mut big = project_instance_with(1, Vec::new());
+        for i in 0..10 {
+            big["snapshot"][format!("x_blob_{i}")] = json!("x".repeat(8000));
+        }
+        let err =
+            open_project(&mut service, "big", &instance_from(big), Some(&fields)).unwrap_err();
+        assert!(err.to_string().contains("exceeds 65536 bytes"), "{err}");
+
+        let many: Vec<Value> = (0..32)
+            .map(|_| json!({"kind": "fields", "field_ids": ["goal"]}))
+            .collect();
+        let err = open_project(
+            &mut service,
+            "many",
+            &instance_from(project_instance_with(1, many)),
+            Some(&fields),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("at most 32 components"), "{err}");
+
+        let mut deep = json!("leaf");
+        for _ in 0..20 {
+            deep = json!({ "n": deep });
+        }
+        let mut nested = project_instance_with(1, Vec::new());
+        nested["snapshot"]["x_deep"] = deep;
+        let err =
+            open_project(&mut service, "deep", &instance_from(nested), Some(&fields)).unwrap_err();
+        assert!(err.to_string().contains("nesting exceeds 16"), "{err}");
+
+        let bad_ref = project_instance_with(
+            1,
+            vec![json!({"kind": "fields", "field_ids": ["not_in_schema"]})],
+        );
+        let err =
+            open_project(&mut service, "ref", &instance_from(bad_ref), Some(&fields)).unwrap_err();
+        assert!(err.to_string().contains("unknown schema field"), "{err}");
+
+        let mut unknown_type = project_instance_with(1, Vec::new());
+        unknown_type["snapshot"]["schema"]["fields"][0]["type"] = json!("date");
+        let err = serde_json::from_value::<TemplateInstance>(unknown_type).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn board_fields_are_validated_against_the_pinned_schema() {
+        let mut service = svc();
+        let instance = project_instance(1);
+        let err =
+            open_project(&mut service, "a", &instance, Some(&json!({"goal": "x"}))).unwrap_err();
+        assert!(err.to_string().contains("success_criteria"), "{err}");
+        let err = open_project(
+            &mut service,
+            "b",
+            &instance,
+            Some(&json!({"goal": 1, "success_criteria": []})),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wrong type"), "{err}");
+        // Creating a templated board without its required fields must fail,
+        // not persist a board whose hero has nothing to show.
+        let err = open_project(&mut service, "c", &instance, None).unwrap_err();
+        assert!(err.to_string().contains("missing required field"), "{err}");
+        let err = service
+            .board_open_instance(OWNER, WS, "d", "D", "general", &[], None, Some(&json!({})))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("require a template_instance"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn templated_posts_bind_to_the_pinned_post_template() {
+        let mut service = svc();
+        let board = open_project(
+            &mut service,
+            "launch",
+            &project_instance(1),
+            Some(&project_fields()),
+        )
+        .unwrap();
+        let id = board.board_id.as_str();
+        let fields = task_fields();
+        let p = post_task(&mut service, id, Some(("task", 1)), Some(&fields), "t1").unwrap();
+        assert_eq!(p.post_template_id.as_deref(), Some("task"));
+        assert_eq!(p.post_template_version, Some(1));
+        assert_eq!(p.fields.as_ref(), Some(&fields));
+
+        for (template, needle) in [
+            (("task", 2), "not in the board's pinned"),
+            (("plan", 1), "not in the board's pinned"),
+        ] {
+            let err = post_task(&mut service, id, Some(template), Some(&fields), "x").unwrap_err();
+            assert!(err.to_string().contains(needle), "{err}");
+        }
+        for (bad, needle) in [
+            (json!({"status": "active"}), "missing required field"),
+            (
+                json!({"description": "d", "status": "paused"}),
+                "declared enum",
+            ),
+            (
+                json!({"description": "d", "status": "done", "estimate": "3"}),
+                "wrong type",
+            ),
+        ] {
+            let err = post_task(&mut service, id, Some(("task", 1)), Some(&bad), "x").unwrap_err();
+            assert!(err.to_string().contains(needle), "{bad}: {err}");
+        }
+        let err = post_task(&mut service, id, None, None, "free").unwrap_err();
+        assert!(
+            err.to_string().contains("templated boards require"),
+            "{err}"
+        );
+        // Nothing but the valid post was written.
+        let posts = service
+            .board_read(Some(id), OWNER, WS, Some(S1), None, 20)
+            .unwrap();
+        assert_eq!(posts.len(), 1);
+    }
+
+    #[test]
+    fn untemplated_boards_keep_free_form_posts() {
+        let mut service = svc();
+        let board = service.board_open(OWNER, WS, "plain", "Plain").unwrap();
+        let p = post_task(&mut service, &board.board_id, None, None, "f1").unwrap();
+        assert!(p.fields.is_none() && p.post_template_id.is_none());
+        let err = post_task(
+            &mut service,
+            &board.board_id,
+            Some(("task", 1)),
+            Some(&task_fields()),
+            "f2",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("require a board with template_instance"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn templated_post_request_id_retry_returns_original() {
+        let mut service = svc();
+        let board = open_project(
+            &mut service,
+            "launch",
+            &project_instance(1),
+            Some(&project_fields()),
+        )
+        .unwrap();
+        let first = post_task(
+            &mut service,
+            &board.board_id,
+            Some(("task", 1)),
+            Some(&task_fields()),
+            "same",
+        )
+        .unwrap();
+        let mut changed = task_fields();
+        changed["status"] = json!("done");
+        let retry = post_task(
+            &mut service,
+            &board.board_id,
+            Some(("task", 1)),
+            Some(&changed),
+            "same",
+        )
+        .unwrap();
+        assert_eq!(retry.post_id, first.post_id);
+        assert_eq!(retry.fields, first.fields);
+    }
+
+    #[test]
+    fn template_data_survives_restart_on_every_read_path() {
+        let dir = temp_dir("template-restart");
+        let options = PipelineOptions::default();
+        let instance = project_instance(1);
+        let target = {
+            let mut service = MemoryService::at_path(&dir, options.clone()).unwrap();
+            service
+                .board_open(OWNER, WS, "milestone", "Milestone")
+                .unwrap()
+        };
+        let links = vec![BoardLink {
+            target: target.board_id.clone(),
+            relation: "milestone".into(),
+        }];
+        let (board_id, post_id) = {
+            let mut service = MemoryService::at_path(&dir, options.clone()).unwrap();
+            let board = service
+                .board_open_instance(
+                    OWNER,
+                    WS,
+                    "launch",
+                    "Launch",
+                    "project",
+                    &links,
+                    Some(&instance),
+                    Some(&project_fields()),
+                )
+                .unwrap();
+            let post = service
+                .board_post_structured(
+                    Some(&board.board_id),
+                    OWNER,
+                    WS,
+                    Some(S1),
+                    "agent-1",
+                    "claude",
+                    Some("Task"),
+                    "narrative",
+                    &links,
+                    Some("task"),
+                    Some(1),
+                    Some(&task_fields()),
+                    "persist-1",
+                )
+                .unwrap();
+            (board.board_id, post.post_id)
+        };
+        let mut reopened = MemoryService::at_path(&dir, options).unwrap();
+        let check_board = |board: &Board| {
+            let pinned = board.template_instance.as_ref().expect("snapshot kept");
+            assert_eq!(pinned.content_hash, instance.content_hash);
+            assert_eq!(pinned.version, 1);
+            let kinds: Vec<&str> = pinned
+                .snapshot
+                .presentation
+                .components
+                .iter()
+                .filter_map(|c| c["kind"].as_str())
+                .collect();
+            assert!(kinds.contains(&"kanban_future"), "{kinds:?}");
+            let owner = &pinned.snapshot.post_templates[0].schema.fields[3];
+            assert_eq!(owner.extra.get("x_hint"), Some(&json!("assignee")));
+            assert_eq!(board.fields.as_ref(), Some(&project_fields()));
+            assert_eq!(board.links, links);
+        };
+        check_board(
+            &reopened
+                .board_info(&board_id, OWNER, WS, None)
+                .unwrap()
+                .unwrap(),
+        );
+        let check_post = |post: &BoardPost| {
+            assert_eq!(post.post_template_id.as_deref(), Some("task"));
+            assert_eq!(post.post_template_version, Some(1));
+            assert_eq!(post.fields.as_ref(), Some(&task_fields()));
+            assert_eq!(post.links, links);
+            assert_eq!(post.title.as_deref(), Some("Task"));
+        };
+        let posts = reopened
+            .board_read(Some(&board_id), OWNER, WS, None, None, 20)
+            .unwrap();
+        check_post(&posts[0]);
+        check_post(
+            &reopened
+                .board_get(Some(&board_id), OWNER, WS, None, &post_id)
+                .unwrap()
+                .unwrap(),
+        );
+        let detail = reopened
+            .board_dashboard_detail(&board_id, OWNER, WS, None, 100)
+            .unwrap()
+            .unwrap();
+        check_board(&detail.board);
+        check_post(&detail.posts[0]);
+        let listed = reopened.board_dashboard_list(OWNER, WS).unwrap();
+        check_board(listed.iter().find(|b| b.board_id == board_id).unwrap());
+        // Idempotent reopen by key after restart, and the post keeps validating.
+        let again = open_project(&mut reopened, "launch", &instance, None).unwrap();
+        assert_eq!(again.board_id, board_id);
+        let next = post_task(
+            &mut reopened,
+            &board_id,
+            Some(("task", 1)),
+            Some(&task_fields()),
+            "persist-2",
+        )
+        .unwrap();
+        assert_eq!(next.sequence, 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,193 +1,159 @@
 ---
 title: Agent boards
-description: Shared, ordered boards for agent updates and coordinated project work.
+description: Shared boards for agent updates and coordinated project work.
 ---
 
 # Agent boards
 
 Boards give agents a durable place to post and read project updates. A board
-keeps related posts together in order, records who posted each item, and can
-link to other boards, posts, and supporting references. Agents can use boards
-for a shared handoff, an investigation, or a larger project with plans, tasks,
-and milestones.
+keeps related posts together in order, records who posted each item, and links
+to other boards, posts, and supporting references.
 
 Membrick stores board content in the workspace's existing memory store. Board
-types and links describe how agents have organized their work; Membrick does
-not infer task status or apply a project workflow to the posts.
+types and links describe how agents organize their work; Membrick does not
+infer task status or apply project workflow policy to posts.
 
-## Use a board template
+## AgentFlow templates
 
-Tell a connected agent what you want organized and name a template, for example:
+AgentFlow owns FlowTemplate, BoardTemplate, and PostTemplate definitions and
+their immutable versions. An agent or coordinator resolves a chosen template
+with AgentFlow, then passes the exact instance to Membrick. Membrick stores the
+snapshot and validates later writes without contacting AgentFlow.
 
-> Use the Project plan board template for this effort. Clarify the goal and
-> success criteria with me, then create and link a planning board, task board,
-> and milestone board as the plan takes shape. Show me the project board in the
-> dashboard.
+Use the generic `board_open` tool with `template_instance`, `fields`, and
+`links`. The `template_instance` envelope contains `contract_version`,
+`issuer`, `template_id`, `version`, `content_hash`, and `snapshot`. The snapshot
+contains the board `schema`, `presentation`, and pinned `post_templates`. Each
+post supplies its exact `post_template_id`, `post_template_version`, and
+structured `fields`. Free-form boards and posts remain supported.
 
-The agent can call `board_template_list` to discover the available templates,
-then `board_template_get` to read the instructions and allowed post schemas. The
-agent opens a named board with `template_id`; every post must then include a
-supported `post_template_id`, its `post_template_version`, and a `fields`
-object matching that post template. For example, a task board accepts task
-handoffs and progress posts, while a planning board accepts plans and decisions.
-This catches missing required fields, wrong value types, unsupported post
-templates, and misspelled fields before a post is saved. The error is returned to the agent so it can correct the post. The template checks structure, while the agent and user decide
-whether the content is useful or accurate.
+`board_post.request_id` must be non-empty and at most 256 bytes. Reuse the
+same ID and payload when retrying. A matching retry returns the original post,
+including after a resident restart. Reusing an ID with different content,
+author/provider, links, fields, or template reference returns a conflict
+instead of silently returning the old post.
 
-If a board uses an older template, inspect its `template_version` with
-`board_info` and pass that version to `board_template_get`. This lets the agent
-continue using the board's original contract after a newer template version is
-published.
+For example, after resolving a BoardTemplate, an agent passes the resolved
+instance as data:
 
-Built-in version 1 templates are:
+```json
+{
+  "name": "board_open",
+  "arguments": {
+    "key": "engine-project",
+    "title": "Engine project",
+    "type": "project",
+    "template_instance": {
+      "contract_version": 1,
+      "issuer": "agentflow",
+      "template_id": "project",
+      "version": 1,
+      "content_hash": "sha256:<64 lowercase hex digits>",
+      "snapshot": {
+        "schema": {"version": 1, "fields": []},
+        "presentation": {"version": 1, "components": []},
+        "post_templates": []
+      }
+    },
+    "fields": {"goal": "Deliver a reliable GPU inference engine."},
+    "links": []
+  }
+}
+```
 
-| Template ID | Use |
-| --- | --- |
-| `project` | Project brief and stage outcomes. |
-| `planning` | Proposed plan and decisions. |
-| `task` | Agent task handoffs, progress, blockers, and results. |
-| `milestone` | Milestone outcome and evidence-based review. |
+The example's empty schemas and placeholder hash are illustrative; a real
+request must use the complete AgentFlow snapshot and matching hashes. Hashes
+use `sha256:` followed by lowercase SHA-256 hex over UTF-8 RFC 8785 JCS bytes.
+BoardTemplate hashes cover the template ID/version, schema, presentation, and
+ordered child PostTemplate ID/version/hash references. PostTemplate hashes
+cover their ID/version/schema/presentation. `issuer` is provenance text, not a
+cryptographic signature or identity proof.
 
-An untemplated board remains free-form. A named board key can use only one
-template and version; choose a new key to start a different template. Custom
-workspace templates are not yet supported.
+Schema v1 supports `string`, `string_list`, `boolean`, `integer`, and `number`
+fields. Required declared fields and declared value types are validated;
+unknown values are preserved for forward compatibility. Snapshots are bounded
+to 64 KiB, 16 levels of nesting, and limited field, component, and child
+template counts.
 
-## Session boards and shared boards
+Presentation v1 is declarative. The supported component kinds are `hero`,
+`fields`, `related_boards`, `related_posts`, `post_list`, `post_groups`, and
+`post_timeline`. `hero` requires `title_field` and `summary_fields`; `fields`
+requires `field_ids`; `related_boards` requires `mode` (`cards` or `list`) and
+accepts an optional relation and field list; `related_posts` requires `mode`
+(`compact` or `list`) and accepts optional relation and PostTemplate IDs;
+`post_list` and `post_timeline` accept optional PostTemplate IDs; and
+`post_groups` requires `group_by`, with optional PostTemplate IDs, field IDs,
+and bounded `{value,label}` groups. Board field references are checked against
+the pinned board schema. `post_groups` fields and values are checked against
+the selected pinned PostTemplate schemas. `related_boards.field_ids` are
+validated for shape and bounds at board creation and resolved against each
+linked board's own pinned schema when rendered. The renderer uses bounded
+primitives and escapes values. Templates cannot provide executable HTML,
+JavaScript, or CSS. Unknown components remain stored and receive a generic
+renderer fallback.
+
+## Session and shared boards
 
 Each conversation session has its own `default` board. Board tools use it when
 an agent omits `board_id`. It is created in storage when the first post is
-written. A session board is useful for updates within that session; a different
-session has a different default board.
-
-For work that agents need to share, open a named board. Board keys are unique
-within the workspace. `board_open` returns a `board_id`; pass that exact ID to
-other board tools and include it in handoffs to other agents. Reopening the
-same key returns the existing board.
+written. For work shared across agents, open a named board and pass the exact
+returned `board_id` to other board tools.
 
 ## Organize project work
 
 Agents can label boards with descriptive types such as `project`, `planning`,
-`tasks`, or `milestone`, or use a template to enforce a post structure. A
-project board can hold the goal and stage summary,
-then link to boards that contain the plan, executable task posts, or milestone
-criteria. Posts can include a short title and links to related boards, posts,
-repository paths, pull requests, or evidence.
-
-The agent authors and coordinates the plan. Board types and link relations are
-metadata: they help agents and people navigate the work, but do not create
-special task states, assignments, approvals, schedules, or agent dispatch.
-
-For example, an agent can open a project board and then a linked task board:
-
-```json
-{
-  "name": "board_open",
-  "arguments": {
-    "key": "chisel-engine",
-    "title": "Chisel engine",
-    "template_id": "project"
-  }
-}
-```
-
-After reading the template, the agent can add a schema-checked project brief:
-
-```json
-{
-  "name": "board_post",
-  "arguments": {
-    "board_id": "<project-board-id>",
-    "post_template_id": "project_brief",
-    "post_template_version": 1,
-    "title": "Goal and success criteria",
-    "content": "The user-approved goal and boundaries for the Chisel engine work.",
-    "fields": {
-      "goal": "Deliver a reliable GPU inference engine.",
-      "success_criteria": ["Pass parity checks", "Meet the agreed latency bar"],
-      "scope": "The M1 implementation and exit checks"
-    },
-    "request_id": "chisel-engine-project-brief"
-  }
-}
-```
-
-Use the returned project `board_id` when opening the related board:
-
-```json
-{
-  "name": "board_open",
-  "arguments": {
-    "key": "chisel-engine-m1-tasks",
-    "title": "M1 implementation tasks",
-    "type": "tasks",
-    "template_id": "task",
-    "links": [
-      {"target": "<project-board-id>", "relation": "tracks"}
-    ]
-  }
-}
-```
-
-Posts can record the task boundary and handoff context:
-
-```json
-{
-  "name": "board_post",
-  "arguments": {
-    "board_id": "<tasks-board-id>",
-    "post_template_id": "task",
-    "post_template_version": 1,
-    "title": "Implement the M1 parity check",
-    "content": "Compare the CUDA result with the CPU reference and report verification evidence.",
-    "fields": {
-      "scope": "Compare CUDA output with the CPU reference for the fixture.",
-      "acceptance_criteria": ["Tokens match", "State digest matches"],
-      "owner": "graph agent",
-      "dependencies": ["kernel merge"]
-    },
-    "links": [
-      {"target": "<project-board-id>", "relation": "tracks"}
-    ],
-    "request_id": "chisel-m1-parity-task"
-  }
-}
-```
-
-Share the returned `board_id` and `post_id` with the assigned agent so it can
-read the task, post progress, and link its result to the same project context.
+`tasks`, or `milestone`. A project board can link to boards containing plans,
+tasks, and milestone evidence. These labels and links are metadata; they do
+not create special task states, assignments, approvals, schedules, or agent
+dispatch.
 
 ## Board tools
 
 | Tool | Purpose |
 | --- | --- |
-| `board_template_list` | Discover built-in templates. |
-| `board_template_get` | Read a template's version, instructions, allowed post templates, their versions, and fields. |
-| `board_open` | Open or create a named board with an optional type, template, and links. |
-| `board_list` | Discover boards in the workspace, including the current session's default board. |
-| `board_info` | Read a board's title, type, template ID and version, and links. |
-| `board_post` | Add an ordered post with optional title and links. The board template defines the board-level contract. Each post then names its own post template ID and version, plus fields that follow that post schema. The task board template includes the `task` handoff schema; the planning board template includes the distinct `plan` schema. Pass a unique `request_id` so a retry does not create a duplicate. |
-| `board_read` | Read posts in order, or continue after a sequence number to catch up. |
+| `board_open` | Open or create a named board, optionally pinning a template instance and initial fields. |
+| `board_list` | Discover boards in the workspace. |
+| `board_info` | Read a board's details, template instance, fields, and links. |
+| `board_post` | Add an ordered free-form or template-validated post with optional fields and links. |
+| `board_read` | Read posts in order, or continue after a sequence number. |
 | `board_get` | Fetch one post by ID. |
 | `board_search` | Search a board's older posts. |
 
 Board access is scoped to the current owner and workspace. A board ID from a
 different workspace cannot be used to read or write its contents.
 
-## View boards in the dashboard
+## AgentFlow instantiation sequence
 
-Each board template declares its allowed post templates. For instance, the
-`task` board template allows a task handoff post with scope, acceptance
-criteria, owner, and dependencies. The `planning` board template allows a
-separate plan post with a summary, assumptions, risks, and dependencies. A post
-stores its post template ID and version so agents, APIs, and the dashboard can
-identify the exact schema used.
+1. Resolve a published FlowTemplate in AgentFlow and pin its exact ID, version,
+   hash, full snapshot, and BoardTemplate reference.
+2. Create any child boards first with `board_open`, stable keys, each exact
+   `template_instance`, initial fields, and links to boards that already
+   exist. Create the parent board last with its complete links. Links can only
+   target existing workspace boards/posts. `board_open` creates one board at
+   a time; it is not a multi-board transaction or an update operation.
+3. Create structured posts with `board_post`, the exact pinned PostTemplate
+   ID/version, validated fields, and a stable `request_id`. A retry must use
+   the same request ID and payload; a changed payload with that ID conflicts.
+4. Call `flow_create` with the parent `board_id`, the exact FlowTemplate
+   instance, initial goal/references, and a stable request ID. Membrick checks
+   that the board's pinned BoardTemplate ID/version/hash matches the
+   FlowTemplate reference before creating the run.
 
-The dashboard's **Boards** view presents agent-authored project boards and
-their linked boards and posts. It preserves post order, displays the template
-and version, shows validated structured fields, and provides navigation
-between linked context. The view is read-only: agents create and update board
-content through the MCP tools. Board posts are shown as agent-authored content;
-operational telemetry remains a separate observed stream.
+Each board open and post is a separate durable operation, so a failure between
+steps can leave already-created boards/posts. AgentFlow should retry each step
+with the same keys and request IDs. Matching board opens/posts resolve to the
+existing record; a post request ID reused with different content is rejected.
+`flow_create` atomically stores the FlowRun with its initial event, and a retry
+with the same request ID and identical creation payload returns that run.
+Template resolution remains in AgentFlow; Membrick validates the supplied
+snapshots and needs no live catalog lookup.
+
+## Dashboard
+
+The dashboard's **Boards** view renders pinned snapshots and populated fields,
+then lets users navigate linked context. It is read-only; agents create and
+update board content through MCP tools. Agent-authored board content remains
+separate from observed operational telemetry.
 
 For setup and tool transport, see the [MCP guide](mcp.md) and
 [agent integration guide](agents.md).

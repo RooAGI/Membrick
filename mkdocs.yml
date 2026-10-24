@@ -64,6 +64,8 @@ nav:
       - Overview: connect-agent.md
       - How Membrick remembers: agent-memory.md
       - Boards: boards.md
+      - Board dashboard design: board-ui-design.md
+      - ChatGPT AgentFlow contract: chatgpt-agentflow-template-contract.md
       - Agent Integration: agents.md
       - Project planning and coordination: agent-project-planning-plan.md
       - Flow orchestration: flow-orchestration.md

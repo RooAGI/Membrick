@@ -1080,9 +1080,8 @@ fn app_router(state: AppState) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/timeseries", get(api_timeseries))
         .route("/api/boards", get(api_boards))
-        .route("/api/board-templates", get(api_board_templates))
+        .route("/api/boards/events", get(api_board_events))
         .route("/api/boards/:board_id", get(api_board_detail))
-        .route("/api/flow-templates", get(api_flow_templates))
         .route("/api/flows", get(api_flows))
         .route("/api/flows/:flow_id", get(api_flow_detail))
         .route("/api/search-reviews", get(api_search_reviews))
@@ -1464,9 +1463,7 @@ fn is_workspace_telemetry_path(path: &str) -> bool {
             | "/api/timeseries"
             | "/api/search-reviews"
             | "/api/boards"
-            | "/api/board-templates"
             | "/api/flows"
-            | "/api/flow-templates"
             | "/api/metrics"
             | "/metrics"
     ) || path.starts_with("/api/sessions/")
@@ -1650,19 +1647,60 @@ async fn api_boards(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn api_board_templates() -> impl IntoResponse {
-    Json(json!({"templates": crate::board::board_templates()}))
+/// The dashboard change notice for a successful board or Flow write, or
+/// `None` when the result does not identify what changed. Notices carry IDs
+/// only; clients refetch content through the authenticated read APIs.
+fn change_event(tool: &str, payload: &Value) -> Option<Value> {
+    if crate::integrations::mcp_tools::is_flow_tool_name(tool) {
+        let run = payload.get("run")?;
+        return Some(json!({
+            "kind": "flow",
+            "tool": tool,
+            "flow_id": run.get("flow_id")?,
+            "board_id": run.get("board_id"),
+            "revision": run.get("revision"),
+        }));
+    }
+    Some(json!({
+        "kind": "board",
+        "tool": tool,
+        "board_id": payload.get("board_id")?,
+        "sequence": payload.get("sequence"),
+    }))
 }
 
-async fn api_flow_templates(State(state): State<AppState>) -> impl IntoResponse {
-    match state.service.read() {
-        Ok(service) => Json(json!({"templates": service.flow_template_list()})).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"flow templates unavailable"})),
+/// Server-sent board and Flow change notices for this workspace. The stream
+/// opens with `ready`, then sends one `change` per applied write. A client
+/// that falls behind receives `resync` and should refetch what it shows.
+async fn api_board_events(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let Some(writer) = state.staged_writer.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"detail":"board events unavailable"})),
         )
-            .into_response(),
-    }
+            .into_response();
+    };
+    let receiver = writer.changes().subscribe();
+    let ready = futures_util::stream::once(async {
+        Ok::<_, std::convert::Infallible>(Event::default().event("ready").data("{}"))
+    });
+    let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
+        let event = match receiver.recv().await {
+            Ok(change) => Event::default().event("change").data(change.to_string()),
+            Err(RecvError::Lagged(skipped)) => Event::default()
+                .event("resync")
+                .data(json!({"skipped": skipped}).to_string()),
+            Err(RecvError::Closed) => return None,
+        };
+        Some((Ok(event), receiver))
+    });
+    Sse::new(ready.chain(changes))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 async fn api_flows(State(state): State<AppState>) -> impl IntoResponse {
@@ -1717,6 +1755,7 @@ async fn api_flow_detail(
 struct DashboardBoardPostsQuery {
     after_sequence: Option<u64>,
     limit: Option<usize>,
+    latest: Option<bool>,
 }
 
 async fn api_board_detail(
@@ -1726,35 +1765,54 @@ async fn api_board_detail(
 ) -> impl IntoResponse {
     let workspace = state.project_root.to_string_lossy();
     let limit = query.limit.unwrap_or(100).clamp(1, 100);
+    if query.latest.unwrap_or(false) && query.after_sequence.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail":"latest cannot be combined with after_sequence"})),
+        )
+            .into_response();
+    }
     match state.service.read() {
-        Ok(service) => match service.board_dashboard_detail(
-            &board_id,
-            "mcp",
-            &workspace,
-            query.after_sequence,
-            limit,
-        ) {
-            Ok(Some(snapshot)) => {
-                let next_after = snapshot.posts.last().map(|post| post.sequence);
-                Json(json!({
-                    "board": snapshot.board,
-                    "posts": snapshot.posts,
-                    "has_more": snapshot.has_more,
-                    "next_after_sequence": if snapshot.has_more { next_after } else { None },
-                }))
-                .into_response()
+        Ok(service) => {
+            let snapshot = if query.latest.unwrap_or(false) {
+                service.board_dashboard_latest_detail(&board_id, "mcp", &workspace, limit)
+            } else {
+                service.board_dashboard_detail(
+                    &board_id,
+                    "mcp",
+                    &workspace,
+                    query.after_sequence,
+                    limit,
+                )
+            };
+            match snapshot {
+                Ok(Some(snapshot)) => {
+                    let next_after = snapshot.posts.last().map(|post| post.sequence);
+                    Json(json!({
+                        "board": snapshot.board,
+                        "posts": snapshot.posts,
+                        "has_more": snapshot.has_more,
+                        "next_after_sequence": if snapshot.has_more {
+                            next_after
+                        } else {
+                            None
+                        },
+                        "latest_sequence": snapshot.latest_sequence,
+                    }))
+                    .into_response()
+                }
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"detail":"board not found"})),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"detail": format!("board unavailable: {error}")})),
+                )
+                    .into_response(),
             }
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"detail":"board not found"})),
-            )
-                .into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": format!("board unavailable: {error}")})),
-            )
-                .into_response(),
-        },
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"detail":"board unavailable"})),
@@ -2868,14 +2926,58 @@ async fn provider_mcp_tool_call(
             "board_open" | "board_post" => {
                 let writer = &runtime.staged_writer;
                 let provider = provider.to_string();
-                writer
+                let write_tool = tool.clone();
+                let payload = writer
                     .mutate(move |owner| {
                         crate::integrations::mcp_tools::dispatch_board_tool(
-                            &tool, &arguments, owner, "mcp", &workspace, &provider,
+                            &write_tool,
+                            &arguments,
+                            owner,
+                            "mcp",
+                            &workspace,
+                            &provider,
                         )
                         .map_err(anyhow::Error::msg)
                     })
-                    .await
+                    .await?;
+                // The mutation is applied to the owner before `mutate`
+                // returns, so dashboard reads already see this change.
+                if let Some(event) = change_event(&tool, &payload) {
+                    writer.changes().publish(event);
+                }
+                Ok(payload)
+            }
+            "flow_create" | "flow_event_append" | "flow_action_consume" => {
+                let writer = &runtime.staged_writer;
+                let provider = provider.to_string();
+                let write_tool = tool.clone();
+                let payload = writer
+                    .mutate(move |owner| {
+                        crate::integrations::mcp_tools::dispatch_flow_tool(
+                            &write_tool,
+                            &arguments,
+                            owner,
+                            "mcp",
+                            &workspace,
+                            &provider,
+                        )
+                        .map_err(anyhow::Error::msg)
+                    })
+                    .await?;
+                if let Some(event) = change_event(&tool, &payload) {
+                    writer.changes().publish(event);
+                }
+                Ok(payload)
+            }
+            "flow_list" | "flow_get" | "flow_pending_actions" => {
+                let mut owner = runtime
+                    .service
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("provider memory service poisoned"))?;
+                crate::integrations::mcp_tools::dispatch_flow_tool(
+                    &tool, &arguments, &mut owner, "mcp", &workspace, provider,
+                )
+                .map_err(anyhow::Error::msg)
             }
             "board_list" | "board_info" | "board_read" | "board_get" | "board_search" => {
                 let mut owner = runtime
@@ -3775,6 +3877,275 @@ mod tests {
         drop(app);
         drop(state);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn call_provider_tool(
+        app: &Router,
+        root: &std::path::Path,
+        tool: &str,
+        arguments: Value,
+    ) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/provider-memory/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "workspace":root,"provider":"codex","user_id":"mcp",
+                            "tool":tool,"arguments":arguments,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn encode_path_segment(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    }
+
+    /// Reads `event:`/`data:` records from a server-sent event body.
+    struct SseReader {
+        body: axum::body::Body,
+        buffer: String,
+    }
+
+    impl SseReader {
+        async fn open(app: &Router, authorization: Option<&str>) -> axum::response::Response {
+            use tower::ServiceExt;
+            let mut request = axum::http::Request::builder().uri("/api/boards/events");
+            if let Some(value) = authorization {
+                request = request.header("authorization", value);
+            }
+            app.clone()
+                .oneshot(request.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        /// The next event, or `None` if nothing arrives within `wait`.
+        async fn next(&mut self, wait: Duration) -> Option<(String, Value)> {
+            use http_body_util::BodyExt;
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                if let Some(end) = self.buffer.find("\n\n") {
+                    let record = self.buffer[..end].to_string();
+                    self.buffer.drain(..end + 2);
+                    let mut name = String::from("message");
+                    let mut data = String::new();
+                    for line in record.lines() {
+                        if let Some(value) = line.strip_prefix("event:") {
+                            name = value.trim().to_string();
+                        } else if let Some(value) = line.strip_prefix("data:") {
+                            data.push_str(value.trim());
+                        }
+                    }
+                    if data.is_empty() {
+                        continue; // keep-alive comment
+                    }
+                    return Some((name, serde_json::from_str(&data).unwrap()));
+                }
+                let frame = tokio::time::timeout_at(deadline, self.body.frame())
+                    .await
+                    .ok()??
+                    .unwrap();
+                if let Ok(bytes) = frame.into_data() {
+                    self.buffer.push_str(std::str::from_utf8(&bytes).unwrap());
+                }
+            }
+        }
+    }
+
+    // A dashboard subscriber gets exactly one notice per board write, and
+    // only after the dashboard read API already returns the written post.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn board_change_is_published_once_after_the_write_is_readable() {
+        use tower::ServiceExt;
+        let root = security_test_root();
+        let state = provider_memory_test_state(&root);
+        let app = app_router(state.clone());
+        let response = SseReader::open(&app, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"].to_str().unwrap(),
+            "text/event-stream"
+        );
+        let mut events = SseReader {
+            body: response.into_body(),
+            buffer: String::new(),
+        };
+        let wait = Duration::from_secs(5);
+        assert_eq!(events.next(wait).await.unwrap().0, "ready");
+
+        let (status, board) = call_provider_tool(
+            &app,
+            &root,
+            "board_open",
+            json!({"key":"live-updates","title":"Live updates"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{board}");
+        let board_id = board["board_id"].as_str().unwrap().to_string();
+        let (name, opened) = events.next(wait).await.unwrap();
+        assert_eq!(name, "change");
+        assert_eq!(opened["kind"], "board");
+        assert_eq!(opened["tool"], "board_open");
+        assert_eq!(opened["board_id"], board_id.as_str());
+
+        let (status, post) = call_provider_tool(
+            &app,
+            &root,
+            "board_post",
+            json!({"board_id":board_id,"content":"first live post","request_id":"live-1"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{post}");
+        let (name, posted) = events.next(wait).await.unwrap();
+        assert_eq!(name, "change");
+        assert_eq!(posted["tool"], "board_post");
+        assert_eq!(posted["board_id"], board_id.as_str());
+        assert_eq!(posted["sequence"], post["sequence"]);
+
+        let detail = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/boards/{}", encode_path_segment(&board_id)))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: Value = serde_json::from_slice(
+            &axum::body::to_bytes(detail.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            detail["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["sequence"] == post["sequence"]),
+            "notified post is not visible to the dashboard: {detail}"
+        );
+        assert!(
+            events.next(Duration::from_millis(300)).await.is_none(),
+            "one board write produced more than one notice"
+        );
+        drop(events);
+        drop(app);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn board_events_require_the_server_token() {
+        let root = security_test_root();
+        let mut state = provider_memory_test_state(&root);
+        state.token = Some("events-secret".into());
+        let app = app_router(state.clone());
+        assert_eq!(
+            SseReader::open(&app, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            SseReader::open(&app, Some("Bearer wrong")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            SseReader::open(&app, Some("Bearer events-secret"))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        drop(app);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lagged_board_event_subscriber_is_told_to_resync() {
+        let root = security_test_root();
+        let state = provider_memory_test_state(&root);
+        let app = app_router(state.clone());
+        let mut events = SseReader {
+            body: SseReader::open(&app, None).await.into_body(),
+            buffer: String::new(),
+        };
+        let wait = Duration::from_secs(5);
+        assert_eq!(events.next(wait).await.unwrap().0, "ready");
+        let changes = state.staged_writer.as_ref().unwrap().changes();
+        for n in 0..300 {
+            changes.publish(json!({"kind":"board","board_id":"board:test","sequence":n}));
+        }
+        let (name, data) = events.next(wait).await.unwrap();
+        assert_eq!(name, "resync");
+        assert!(data["skipped"].as_u64().unwrap() > 0, "{data}");
+        drop(events);
+        drop(app);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Provider MCP processes forward Flow tools to the resident; it must
+    // dispatch them instead of rejecting them as unknown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_dispatches_forwarded_flow_tools() {
+        let root = security_test_root();
+        let state = provider_memory_test_state(&root);
+        let app = app_router(state.clone());
+        let (status, result) = call_provider_tool(&app, &root, "flow_list", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result, json!({"flows": []}));
+        drop(app);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn change_events_identify_what_changed() {
+        assert_eq!(
+            change_event("board_post", &json!({"board_id":"board:a","sequence":3})),
+            Some(json!({"kind":"board","tool":"board_post","board_id":"board:a","sequence":3}))
+        );
+        assert_eq!(
+            change_event("board_open", &json!({"board_id":"board:a","key":"a"})),
+            Some(json!({"kind":"board","tool":"board_open","board_id":"board:a","sequence":null}))
+        );
+        assert_eq!(
+            change_event(
+                "flow_event_append",
+                &json!({"run":{"flow_id":"flow:1","board_id":"board:a","revision":4},"events":[]})
+            ),
+            Some(json!({
+                "kind":"flow","tool":"flow_event_append","flow_id":"flow:1",
+                "board_id":"board:a","revision":4,
+            }))
+        );
+        assert_eq!(change_event("board_post", &json!({})), None);
+        assert_eq!(change_event("flow_create", &json!({"flows":[]})), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

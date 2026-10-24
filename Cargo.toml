@@ -52,6 +52,7 @@ axum = "0.7"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
@@ -73,6 +74,7 @@ temps = { version = "3", features = ["chrono"] }
 fuzzydate = "0.4.1"
 console = { version = "0.16.3", features = ["std"] }
 sha2 = "0.10"
+serde_jcs = "0.2.0"
 fs4 = "0.13.1"
 rayon = "1.11"
 libflate = "1.4"

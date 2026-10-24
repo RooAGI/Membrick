@@ -18,7 +18,7 @@ pub const FLOW_EVENT_REVISION_FILTER: &str = "flow_revision";
 pub const FLOW_EVENT_ID_FILTER: &str = "flow_event_id";
 pub const FLOW_REQUEST_ID_FILTER: &str = "flow_request_id";
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowTaskState {
     Ready,
@@ -79,16 +79,37 @@ pub struct FlowRetryPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlowTemplate {
+    #[serde(rename = "template_id", alias = "id")]
     pub id: String,
     pub version: u32,
     pub name: String,
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub content_hash: String,
+    pub board_template: FlowBoardTemplateRef,
     pub stages: Vec<FlowStage>,
     pub task_states: Vec<FlowTaskState>,
     pub transitions: Vec<FlowTransition>,
     pub requires_review: bool,
     pub coordinator_policy: String,
     pub retry_policy: FlowRetryPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowBoardTemplateRef {
+    pub template_id: String,
+    pub version: u32,
+    pub content_hash: String,
+}
+
+/// Uniform reference envelope used when an AgentFlow definition is pinned to a run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FlowTemplateInstance {
+    pub issuer: String,
+    pub template_id: String,
+    pub version: u32,
+    pub content_hash: String,
+    pub snapshot: FlowTemplate,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +188,9 @@ pub struct FlowRun {
     pub board_id: String,
     pub template_id: String,
     pub template_version: u32,
+    /// Exact AgentFlow-owned definition pinned at creation. Missing only on legacy stored runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_template_instance: Option<FlowTemplateInstance>,
     pub goal: String,
     pub references: Vec<FlowReference>,
     pub stage: String,
@@ -232,8 +256,7 @@ pub struct FlowCreateRequest {
     pub owner: String,
     pub workspace: String,
     pub board_id: String,
-    pub template_id: String,
-    pub template_version: u32,
+    pub flow_template_instance: FlowTemplateInstance,
     pub goal: String,
     #[serde(default)]
     pub references: Vec<FlowReference>,
@@ -430,7 +453,9 @@ fn builtin_templates() -> Vec<FlowTemplate> {
         id: "agent_work".into(),
         version: 1,
         name: "Agent work with independent review".into(),
-        description: "A provider-neutral plan, task execution, progress, review, and handoff lifecycle.".into(),
+        description: Some("A provider-neutral plan, task execution, progress, review, and handoff lifecycle.".into()),
+        content_hash: "".into(),
+        board_template: FlowBoardTemplateRef { template_id: "project".into(), version: 1, content_hash: "".into() },
         stages,
         task_states: states,
         transitions,
@@ -443,14 +468,112 @@ fn builtin_templates() -> Vec<FlowTemplate> {
     }]
 }
 
-pub fn flow_templates() -> Vec<FlowTemplate> {
-    builtin_templates()
-}
-
-pub fn flow_template(template_id: &str, version: Option<u32>) -> Option<FlowTemplate> {
+pub(crate) fn legacy_flow_template(
+    template_id: &str,
+    version: Option<u32>,
+) -> Option<FlowTemplate> {
     builtin_templates().into_iter().find(|template| {
         template.id == template_id && version.map_or(true, |value| value == template.version)
     })
+}
+
+pub fn validate_flow_template_instance(instance: &FlowTemplateInstance) -> anyhow::Result<()> {
+    if instance.issuer.trim().is_empty() || instance.issuer.len() > 128 {
+        anyhow::bail!("FlowTemplate issuer must be 1-128 bytes");
+    }
+    validate_flow_template(&instance.snapshot)?;
+    anyhow::ensure!(
+        instance.template_id == instance.snapshot.id
+            && instance.version == instance.snapshot.version
+            && instance.content_hash == instance.snapshot.content_hash,
+        "FlowTemplate instance envelope does not match its snapshot identity/hash"
+    );
+    Ok(())
+}
+
+/// Validate an AgentFlow supplied FlowTemplate snapshot and its JCS content hash.
+pub fn validate_flow_template(template: &FlowTemplate) -> anyhow::Result<()> {
+    use sha2::Digest;
+    if template.id.trim().is_empty() || template.id.len() > 128 || template.version == 0 {
+        anyhow::bail!("FlowTemplate identity must be valid");
+    }
+    if template.name.trim().is_empty()
+        || template.name.len() > 256
+        || template
+            .description
+            .as_ref()
+            .is_some_and(|value| value.len() > 2048)
+        || template.board_template.template_id.trim().is_empty()
+        || template.board_template.template_id.len() > 128
+        || template.board_template.version == 0
+    {
+        anyhow::bail!("FlowTemplate metadata or board template reference is invalid");
+    }
+    if template.stages.is_empty()
+        || template.stages.len() > 64
+        || template.task_states.is_empty()
+        || template.task_states.len() > 32
+        || template.transitions.is_empty()
+        || template.transitions.len() > 256
+        || template.retry_policy.max_attempts > 100
+        || template.retry_policy.retry_states.len() > 32
+    {
+        anyhow::bail!("FlowTemplate lifecycle definition exceeds supported bounds");
+    }
+    let template_bytes = serde_jcs::to_vec(&serde_json::to_value(template)?)?;
+    if template_bytes.len() > 64 * 1024 {
+        anyhow::bail!("FlowTemplate snapshot exceeds 65536 bytes");
+    }
+    let mut stage_ids = std::collections::HashSet::new();
+    for stage in &template.stages {
+        if stage.id.trim().is_empty() || stage.id.len() > 128 || !stage_ids.insert(&stage.id) {
+            anyhow::bail!("FlowTemplate stage IDs must be unique and 1-128 bytes");
+        }
+        if stage.name.trim().is_empty() || stage.name.len() > 256 {
+            anyhow::bail!("FlowTemplate stage names must be 1-256 bytes");
+        }
+    }
+    let mut task_states = std::collections::HashSet::new();
+    for state in &template.task_states {
+        if !task_states.insert(*state) {
+            anyhow::bail!("FlowTemplate task states must be unique");
+        }
+    }
+    for transition in &template.transitions {
+        if transition
+            .from_stage
+            .as_ref()
+            .is_some_and(|value| !stage_ids.contains(value))
+            || transition
+                .to_stage
+                .as_ref()
+                .is_some_and(|value| !stage_ids.contains(value))
+        {
+            anyhow::bail!("FlowTemplate transition references an unknown stage");
+        }
+        if transition
+            .from_task_state
+            .as_ref()
+            .is_some_and(|value| !task_states.contains(value))
+            || transition
+                .to_task_state
+                .as_ref()
+                .is_some_and(|value| !task_states.contains(value))
+        {
+            anyhow::bail!("FlowTemplate transition references an undeclared task state");
+        }
+    }
+    let mut definition = serde_json::to_value(template)?;
+    definition
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("FlowTemplate must serialize as an object"))?
+        .remove("content_hash");
+    let canonical = serde_jcs::to_vec(&definition)?;
+    let expected = format!("sha256:{:x}", sha2::Sha256::digest(canonical));
+    if template.content_hash != expected {
+        anyhow::bail!("FlowTemplate content_hash mismatch; expected {expected}");
+    }
+    Ok(())
 }
 
 pub fn flow_run_doc_id(flow_id: &str) -> String {
@@ -500,7 +623,7 @@ impl FlowRun {
         owner: String,
         workspace: String,
         board_id: String,
-        template: &FlowTemplate,
+        template_instance: &FlowTemplateInstance,
         goal: String,
         references: Vec<FlowReference>,
         created_by: String,
@@ -511,8 +634,9 @@ impl FlowRun {
             owner,
             workspace,
             board_id,
-            template_id: template.id.clone(),
-            template_version: template.version,
+            template_id: template_instance.template_id.clone(),
+            template_version: template_instance.version,
+            flow_template_instance: Some(template_instance.clone()),
             goal,
             references,
             stage: "planning".into(),

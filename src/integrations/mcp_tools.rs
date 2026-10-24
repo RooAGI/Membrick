@@ -10,6 +10,9 @@ pub(crate) fn provider_filter_values() -> Vec<&'static str> {
     crate::provider_sources::PROVIDERS
         .iter()
         .map(|provider| provider.name)
+        // ChatGPT connects through the generic resident MCP bridge rather
+        // than a Membrick-owned capture hook/runtime integration.
+        .chain(std::iter::once("chatgpt"))
         .collect()
 }
 
@@ -877,30 +880,21 @@ pub(crate) fn board_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "board_open".to_string(),
-            description: "Open a shared board by key, creating it if needed. For structured project work, discover a template with board_template_list and board_template_get, then pass template_id; posts will be checked against that versioned contract. Without a template, use descriptive types and links to organize project, planning, task, and milestone boards while keeping their content free-form. The key is unique within your workspace; calling board_open twice with the same key returns the same board. Share the returned board_id with subagents. The key \"default\" is reserved for the current session's board.".to_string(),
+            description: "Open a shared board by key, creating it if needed. Optionally pass an immutable template_instance snapshot from the template owner and structured fields. Membrick stores that exact version and validates structured posts against it without looking up a catalog. Without a template_instance, the board remains free-form. Calling board_open twice with the same key and same template returns the same board; a conflicting template is rejected. Share the returned board_id with subagents.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "key": {"type": "string", "description": "Caller-supplied board key, e.g. \"pr-81-review\". Unique within the workspace. \"default\" is reserved for the current session's board; keys starting with \"session:\" are rejected."},
                     "title": {"type": "string", "description": "Human-readable board title."},
                     "type": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$", "description": "Descriptive board type, e.g. project, planning, tasks, milestone, or general. It does not change board behavior."},
-                    "template_id": {"type": "string", "description": "Optional built-in board template ID returned by board_template_list. It defines which versioned post templates the board accepts."},
+                    "template_instance": {"type":"object", "description":"Immutable versioned template and full schema/presentation snapshot from the template owner. The snapshot includes child post_templates.", "required":["contract_version","issuer","template_id","version","content_hash","snapshot"], "properties":{"contract_version":{"type":"integer","const":1},"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object","required":["schema","presentation","post_templates"],"properties":{"schema":{"type":"object"},"presentation":{"type":"object"},"post_templates":{"type":"array","maxItems":100,"items":{"type":"object"}}}}}},
+                    "fields": {"type":"object", "description":"Structured board values matching the pinned template schema. Unknown fields are preserved for forward compatibility."},
                     "links": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"target": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Board ID, post ID, https URL, or repo: reference."}, "relation": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Agent-supplied relation label, e.g. contains, plans, tracks, depends_on, evidence_for."}}, "required": ["target", "relation"], "additionalProperties": false}},
                     "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
                 },
                 "required": ["key", "title"],
                 "additionalProperties": false
             }),
-        },
-        ToolDefinition {
-            name: "board_template_list".to_string(),
-            description: "List the built-in board templates available for structured agent workflows. Inspect a template with board_template_get before opening a board from it.".to_string(),
-            input_schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
-        },
-        ToolDefinition {
-            name: "board_template_get".to_string(),
-            description: "Get a board template and its allowed, versioned post templates with field requirements. Omit version for the latest version, or request a board's exact template_version to continue posting to an older board.".to_string(),
-            input_schema: json!({"type": "object", "properties": {"template_id": {"type": "string", "description": "Template ID returned by board_template_list."}, "version": {"type": "integer", "minimum": 1, "description": "Optional exact version, for example template_version returned by board_info."}}, "required": ["template_id"], "additionalProperties": false}),
         },
         ToolDefinition {
             name: "board_list".to_string(),
@@ -928,18 +922,18 @@ pub(crate) fn board_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "board_post".to_string(),
-            description: "Post an update or project item to a board. On a templated board, inspect its template and provide a supported post_template_id, its post_template_version, and a fields object matching that post template; validation errors identify missing, mistyped, or unknown fields. Use content for readable context and links for related items. Pass a unique request_id so retries are safe. Omitting board_id selects the current session's default board.".to_string(),
+            description: "Post an update or structured item to a board. On a templated board, supply a post_template_id and exact post_template_version from the board's pinned snapshot plus fields matching its schema. Narrative content, title, and links remain optional. Unknown field values are preserved. Pass a unique request_id so retries are safe.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "board_id": {"type": "string", "description": "For a shared board, pass the exact board_id returned by board_open or board_post. Omit (or pass \"default\") only for this session's private default board."},
                     "content": {"type": "string", "description": "Post content, e.g. \"The parser failure comes from the empty input path.\""},
                     "title": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional short label for this post."},
-                    "post_template_id": {"type": "string", "description": "Required on templated boards; ID of an allowed post template listed by board_template_get, such as task or plan."},
+                    "post_template_id": {"type": "string", "description": "ID of a post template in the board's pinned template_instance snapshot."},
                     "post_template_version": {"type": "integer", "minimum": 1, "description": "Required on templated boards; exact version of post_template_id."},
                     "fields": {"type": "object", "description": "Required on templated boards; structured data validated against the selected post template."},
                     "links": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"target": {"type": "string", "minLength": 1, "maxLength": 2048}, "relation": {"type": "string", "minLength": 1, "maxLength": 64}}, "required": ["target", "relation"], "additionalProperties": false}},
-                    "request_id": {"type": "string", "description": "Unique ID for this post attempt; reuse it when retrying."},
+                    "request_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Unique ID for this post attempt; reuse the same ID and payload when retrying."},
                     "author_agent_id": {"type": "string", "description": "Your agent ID (e.g. subagent ID). Defaults to the provider name."},
                     "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
                 },
@@ -1000,35 +994,24 @@ pub(crate) fn board_tool_definitions() -> Vec<ToolDefinition> {
 pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
-            name: "flow_template_list".into(),
-            description: "List built-in versioned FlowTemplate contracts. Inspect a selected version with flow_template_get before creating a Flow.".into(),
-            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: "flow_template_get".into(),
-            description: "Read one versioned FlowTemplate, including its stages, task states, allowed transitions, review gates, coordinator policy, and retry policy.".into(),
-            input_schema: json!({"type":"object","properties":{"template_id":{"type":"string"},"version":{"type":"integer","minimum":1}},"required":["template_id"],"additionalProperties":false}),
-        },
-        ToolDefinition {
             name: "flow_list".into(),
             description: "List Flow runs visible in this workspace in stable ID order. Use flow_get for the event history and full projection.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
         ToolDefinition {
             name: "flow_create".into(),
-            description: "Create a durable Flow run from an existing board and a versioned template. Supply request_id and reuse it for retries. Flow creation records coordination state; it does not launch an agent.".into(),
+            description: "Create a durable Flow run from an existing board and an exact AgentFlow-owned FlowTemplate instance. Provide the full pinned definition and reuse request_id for retries. Flow creation records coordination state; it does not launch an agent.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
                     "board_id":{"type":"string","description":"Existing workspace board that anchors this Flow."},
-                    "template_id":{"type":"string","description":"Template ID from flow_template_list."},
-                    "template_version":{"type":"integer","minimum":1,"description":"Exact template version from flow_template_get."},
+                    "flow_template_instance":{"type":"object","description":"Exact FlowTemplate envelope resolved by AgentFlow. snapshot contains the complete definition, including template_id, version, content_hash, board_template, stages, task_states, transitions, review and retry policy.","required":["issuer","template_id","version","content_hash","snapshot"],"properties":{"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object"}}},
                     "goal":{"type":"string","minLength":1},
                     "references":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["board","post"]},"id":{"type":"string"},"relation":{"type":"string"}},"required":["kind","id","relation"],"additionalProperties":false}},
                     "created_by":{"type":"string","description":"Agent identity creating the Flow; defaults to the provider identity."},
                     "request_id":{"type":"string","description":"Unique idempotency key; reuse on retry."}
                 },
-                "required":["board_id","template_id","template_version","goal","request_id"],
+                "required":["board_id","flow_template_instance","goal","request_id"],
                 "additionalProperties":false
             }),
         },
@@ -1075,9 +1058,7 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
 pub(crate) fn is_flow_tool_name(name: &str) -> bool {
     matches!(
         name,
-        "flow_template_list"
-            | "flow_template_get"
-            | "flow_list"
+        "flow_list"
             | "flow_create"
             | "flow_get"
             | "flow_event_append"
@@ -1086,7 +1067,7 @@ pub(crate) fn is_flow_tool_name(name: &str) -> bool {
     )
 }
 
-fn dispatch_flow_tool(
+pub(crate) fn dispatch_flow_tool(
     tool: &str,
     arguments: &Value,
     service: &mut MemoryService,
@@ -1102,12 +1083,10 @@ fn dispatch_flow_tool(
             .ok_or_else(|| format!("missing required argument: {name}"))
     }
     let allowed: &[&str] = match tool {
-        "flow_template_list" | "flow_list" => &[],
-        "flow_template_get" => &["template_id", "version"],
+        "flow_list" => &[],
         "flow_create" => &[
             "board_id",
-            "template_id",
-            "template_version",
+            "flow_template_instance",
             "goal",
             "references",
             "created_by",
@@ -1145,24 +1124,6 @@ fn dispatch_flow_tool(
     }
 
     match tool {
-        "flow_template_list" => Ok(json!({"templates": service.flow_template_list()})),
-        "flow_template_get" => {
-            let template_id = required_str(arguments, "template_id")?;
-            let version = match arguments.get("version") {
-                Some(value) => Some(
-                    value
-                        .as_u64()
-                        .and_then(|value| u32::try_from(value).ok())
-                        .filter(|value| *value > 0)
-                        .ok_or_else(|| "version must be a positive integer".to_string())?,
-                ),
-                None => None,
-            };
-            let template = service
-                .flow_template_get(template_id, version)
-                .map_err(|error| format!("{error:#}"))?;
-            Ok(json!({"template": template}))
-        }
         "flow_list" => {
             let flows = service
                 .flow_list(owner, workspace)
@@ -1171,13 +1132,14 @@ fn dispatch_flow_tool(
         }
         "flow_create" => {
             let board_id = required_str(arguments, "board_id")?;
-            let template_id = required_str(arguments, "template_id")?;
-            let template_version = arguments
-                .get("template_version")
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .ok_or_else(|| "template_version must be a positive integer".to_string())?;
+            let template_instance = arguments
+                .get("flow_template_instance")
+                .cloned()
+                .ok_or_else(|| "missing required argument: flow_template_instance".to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<crate::flow::FlowTemplateInstance>(value)
+                        .map_err(|error| format!("invalid flow_template_instance: {error}"))
+                })?;
             let goal = required_str(arguments, "goal")?;
             let references = arguments
                 .get("references")
@@ -1198,8 +1160,7 @@ fn dispatch_flow_tool(
                     owner,
                     workspace,
                     board_id,
-                    template_id,
-                    template_version,
+                    template_instance,
                     goal,
                     references,
                     created_by,
@@ -1331,8 +1292,8 @@ pub(crate) fn dispatch_board_tool(
             "key": board.key,
             "title": board.title,
             "type": board.board_type,
-            "template_id": board.template_id,
-            "template_version": board.template_version,
+            "template_instance": board.template_instance,
+            "fields": board.fields,
             "links": board.links,
             "owner": board.owner,
             "workspace": board.workspace,
@@ -1358,9 +1319,15 @@ pub(crate) fn dispatch_board_tool(
     }
     // Reject unknown arguments per tool.
     let allowed: &[&str] = match tool {
-        "board_open" => &["key", "title", "type", "template_id", "links", "session_id"],
-        "board_template_list" => &[],
-        "board_template_get" => &["template_id", "version"],
+        "board_open" => &[
+            "key",
+            "title",
+            "type",
+            "template_instance",
+            "fields",
+            "links",
+            "session_id",
+        ],
         "board_list" => &["session_id"],
         "board_info" => &["board_id", "session_id"],
         "board_post" => &[
@@ -1397,24 +1364,6 @@ pub(crate) fn dispatch_board_tool(
     // (hook-tracked, same as search).
 
     match tool {
-        "board_template_list" => Ok(json!({"templates": crate::board::board_templates()})),
-        "board_template_get" => {
-            let template_id = get_str(arguments, "template_id")?;
-            let template = match arguments.get("version") {
-                Some(value) => {
-                    let version = value
-                        .as_u64()
-                        .and_then(|value| u32::try_from(value).ok())
-                        .filter(|value| *value > 0)
-                        .ok_or_else(|| "version must be a positive integer".to_string())?;
-                    crate::board::board_template_version(template_id, version)
-                }
-                None => crate::board::board_template(template_id),
-            };
-            template
-                .map(|template| json!(template))
-                .ok_or_else(|| format!("unknown board template or version: {template_id}"))
-        }
         "board_open" => {
             let key = get_str(arguments, "key")?;
             let title = get_str(arguments, "title")?;
@@ -1425,37 +1374,20 @@ pub(crate) fn dispatch_board_tool(
                 None => crate::board::DEFAULT_BOARD_TYPE,
             };
             let links = parse_links(arguments)?;
-            let template_id = arguments
-                .get("template_id")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .ok_or_else(|| "template_id must be a string".to_string())
-                })
-                .transpose()?;
-            let template = template_id
-                .map(|template_id| {
-                    crate::board::board_template(template_id)
-                        .ok_or_else(|| format!("unknown board template: {template_id}"))
-                })
-                .transpose()?;
-            if let (Some(explicit_type), Some(template)) = (
-                arguments.get("type").and_then(Value::as_str),
-                template.as_ref(),
-            ) {
-                if explicit_type != template.board_type {
-                    return Err(format!(
-                        "template {:?} requires board type {:?}",
-                        template.id, template.board_type
-                    ));
-                }
-            }
+            let template_instance = arguments
+                .get("template_instance")
+                .cloned()
+                .map(serde_json::from_value::<crate::board::TemplateInstance>)
+                .transpose()
+                .map_err(|error| format!("invalid template_instance: {error}"))?;
+            let fields = arguments.get("fields");
             // The "default" key is an alias for the current session's
             // board, not a separate board.
             let board = if crate::board::is_default_alias(key) {
                 if board_type != crate::board::DEFAULT_BOARD_TYPE
                     || !links.is_empty()
-                    || template_id.is_some()
+                    || template_instance.is_some()
+                    || fields.is_some()
                 {
                     return Err(
                         "the session default board cannot be typed or linked; open a named board"
@@ -1470,15 +1402,18 @@ pub(crate) fn dispatch_board_tool(
                     .board_open_session(owner, workspace, &session_id, title)
                     .map_err(|e| e.to_string())?
             } else {
-                if let Some(template_id) = template_id {
-                    service
-                        .board_open_from_template(owner, workspace, key, title, template_id, &links)
-                        .map_err(|e| e.to_string())?
-                } else {
-                    service
-                        .board_open_typed(owner, workspace, key, title, board_type, &links)
-                        .map_err(|e| e.to_string())?
-                }
+                service
+                    .board_open_instance(
+                        owner,
+                        workspace,
+                        key,
+                        title,
+                        board_type,
+                        &links,
+                        template_instance.as_ref(),
+                        fields,
+                    )
+                    .map_err(|e| e.to_string())?
             };
             Ok(board_json(&board))
         }
@@ -1949,15 +1884,8 @@ pub(crate) fn call_board_or_memory_tool(
         }
     } else {
         match tool_name {
-            "board_template_list"
-            | "board_template_get"
-            | "board_open"
-            | "board_list"
-            | "board_info"
-            | "board_post"
-            | "board_read"
-            | "board_get"
-            | "board_search" => {
+            "board_open" | "board_list" | "board_info" | "board_post" | "board_read"
+            | "board_get" | "board_search" => {
                 dispatch_board_tool(tool_name, arguments, service, "mcp", &workspace, provider)
             }
             "add_memory" | "get_memory" | "delete_memory" => {

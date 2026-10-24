@@ -13,11 +13,12 @@ connected agent to coordinate.
 
 ## FlowTemplate and Flow
 
-A **FlowTemplate** is an immutable, versioned definition of a process. It
-describes generic stages and allowed transitions, task and report contracts,
-review gates, completion criteria, and retry policy. Templates describe what
-events and information a process requires. They do not contain provider-specific
-commands or launch agents.
+A **FlowTemplate** is an immutable, versioned definition of a process owned and
+published by AgentFlow. It describes generic stages and allowed transitions,
+task and report contracts, review gates, completion criteria, and retry policy.
+Templates describe what events and information a process requires. They do not
+contain provider-specific commands or launch agents. Membrick does not publish
+or expose a FlowTemplate catalog.
 
 A **Flow** (also called a flow run) is one execution of a template version. It
 has a stable ID, a goal, a current revision and projected state, and references
@@ -74,11 +75,25 @@ coordinator writes to it.
 
 ## Membrick and host responsibilities
 
-Membrick stores and validates FlowTemplates, Flow records, append-only events,
-current projections, board references, and durable action intents. Templates
-define the allowed contracts and transitions; event writes enforce those
-contracts and idempotency rules. The dashboard reads the resulting projection
-and timeline, and can navigate to the linked boards and posts.
+AgentFlow resolves and supplies the immutable FlowTemplate when creating a run.
+The `flow_template_instance` envelope contains `issuer`, `template_id`,
+`version`, `content_hash`, and the full `snapshot`. The snapshot contains
+`template_id`, `version`, `name`, optional `description`, `content_hash`, a
+`board_template` reference, `stages`, `task_states`, `transitions`,
+`requires_review`, `coordinator_policy`, and `retry_policy`. Its hash is
+`sha256:` plus lowercase SHA-256 hex over UTF-8 RFC 8785 JCS bytes of the full
+snapshot with `content_hash` omitted. Membrick verifies the hash and that the
+envelope identity/hash matches the snapshot, then stores the exact definition
+with the FlowRun. `issuer` is provenance text, not a cryptographic signature.
+
+Membrick stores and validates Flow records, append-only events, current
+projections, board references, and durable action intents. Event writes use the
+run's pinned template snapshot to enforce contracts and idempotency rules, so
+later AgentFlow catalog changes do not alter an existing run. Legacy runs
+without a pinned snapshot continue to use their legacy lifecycle definition.
+The dashboard reads the resulting projection and timeline, and can navigate
+to linked boards and posts. Board instances separately pin their BoardTemplate
+schema and presentation snapshots.
 
 An action intent records that work should be dispatched or reviewed, including
 an idempotency key and enough task context for a host to act. A host or provider

@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Filter key marking a document's kind in the board subsystem.
 pub const BOARD_DOC_KIND_FILTER: &str = "doc_kind";
@@ -89,8 +89,8 @@ pub fn default_board(owner: &str, workspace: &str, session_id: &str) -> Board {
         title: format!("{DEFAULT_BOARD_TITLE} (session {session_id})"),
         board_type: DEFAULT_BOARD_TYPE.to_string(),
         links: Vec::new(),
-        template_id: None,
-        template_version: None,
+        template_instance: None,
+        fields: None,
         // Synthetic boards predate any persistent record; the real
         // timestamp is set when the record is created.
         created_at: String::new(),
@@ -125,267 +125,602 @@ pub const DEFAULT_BOARD_TYPE: &str = "general";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum BoardTemplateFieldType {
+pub enum TemplateFieldType {
     String,
     StringList,
     Boolean,
     Integer,
+    Number,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoardTemplateField {
-    pub name: String,
-    pub description: String,
+pub struct TemplateField {
+    pub id: String,
     #[serde(rename = "type")]
-    pub field_type: BoardTemplateFieldType,
+    pub field_type: TemplateFieldType,
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub enum_values: Option<Vec<Value>>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoardPostTemplate {
-    pub id: String,
+pub struct TemplateSchema {
     pub version: u32,
-    pub name: String,
-    pub description: String,
-    pub fields: Vec<BoardTemplateField>,
+    pub fields: Vec<TemplateField>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
 }
 
-/// A versioned, declarative contract for structured board posts.
-/// Templates describe shape and agent guidance, not workflow transitions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoardTemplate {
-    pub id: String,
+pub struct TemplatePresentation {
     pub version: u32,
-    pub name: String,
-    pub description: String,
-    #[serde(rename = "type")]
-    pub board_type: String,
-    pub instructions: String,
-    pub post_templates: Vec<BoardPostTemplate>,
+    #[serde(default)]
+    pub components: Vec<Value>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
 }
 
-fn field(
-    name: &str,
-    description: &str,
-    field_type: BoardTemplateFieldType,
-    required: bool,
-) -> BoardTemplateField {
-    BoardTemplateField {
-        name: name.into(),
-        description: description.into(),
-        field_type,
-        required,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostTemplateSnapshot {
+    pub template_id: String,
+    pub version: u32,
+    pub content_hash: String,
+    pub schema: TemplateSchema,
+    pub presentation: TemplatePresentation,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateSnapshot {
+    pub schema: TemplateSchema,
+    pub presentation: TemplatePresentation,
+    #[serde(default)]
+    pub post_templates: Vec<PostTemplateSnapshot>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+/// Immutable template identity and snapshot supplied by the template owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateInstance {
+    pub contract_version: u32,
+    pub issuer: String,
+    pub template_id: String,
+    pub version: u32,
+    pub content_hash: String,
+    pub snapshot: TemplateSnapshot,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
+}
+
+pub const TEMPLATE_SNAPSHOT_MAX_BYTES: usize = 64 * 1024;
+pub const TEMPLATE_FIELDS_MAX_BYTES: usize = 32 * 1024;
+
+fn content_hash(value: &Value) -> anyhow::Result<String> {
+    use sha2::Digest;
+    let bytes = serde_jcs::to_vec(value)?;
+    Ok(format!("sha256:{:x}", sha2::Sha256::digest(bytes)))
+}
+
+fn validate_schema(schema: &TemplateSchema) -> anyhow::Result<()> {
+    if schema.version != 1 {
+        anyhow::bail!("unsupported template schema version: {}", schema.version);
     }
-}
-
-fn post_template(
-    id: &str,
-    name: &str,
-    description: &str,
-    fields: Vec<BoardTemplateField>,
-) -> BoardPostTemplate {
-    BoardPostTemplate {
-        id: id.into(),
-        version: 1,
-        name: name.into(),
-        description: description.into(),
-        fields,
+    if schema.fields.len() > 256 {
+        anyhow::bail!("template schema may define at most 256 fields");
     }
-}
-
-/// Built-in templates are versioned with the server and available to every
-/// connected MCP agent.
-fn board_template_versions() -> Vec<BoardTemplate> {
-    use BoardTemplateFieldType::{String as Text, StringList};
-
-    vec![
-        BoardTemplate {
-            id: "project".into(),
-            version: 1,
-            name: "Project plan".into(),
-            description: "Capture a project goal, boundaries, success criteria, and staged outcomes.".into(),
-            board_type: "project".into(),
-            instructions: "Start with a project_brief. Add one stage post per meaningful outcome and link planning, task, and milestone boards. Ask the user about material missing constraints before treating the plan as ready.".into(),
-            post_templates: vec![
-                post_template("project_brief", "Project brief", "The agreed project goal and boundaries.", vec![
-                    field("goal", "What outcome should the project achieve?", Text, true),
-                    field("success_criteria", "Observable conditions that show the goal was met.", StringList, true),
-                    field("scope", "Work included in this project.", Text, false),
-                    field("constraints", "Known limits, dependencies, or requirements.", StringList, false),
-                    field("non_goals", "Related work explicitly outside scope.", StringList, false),
-                ]),
-                post_template("stage", "Stage", "A project stage and its intended outcome.", vec![
-                    field("name", "Short stage name.", Text, true),
-                    field("outcome", "What this stage will deliver.", Text, true),
-                    field("exit_criteria", "Checks that establish the stage outcome.", StringList, true),
-                    field("dependencies", "Earlier stages or external prerequisites.", StringList, false),
-                ]),
-            ],
-        },
-        BoardTemplate {
-            id: "planning".into(),
-            version: 1,
-            name: "Plan and decisions".into(),
-            description: "Record a reviewable plan, assumptions, risks, and decisions.".into(),
-            board_type: "planning".into(),
-            instructions: "Post the plan before decomposing it into delegated work. Separate confirmed facts from assumptions, and link evidence or decisions that affect the plan.".into(),
-            post_templates: vec![
-                post_template("plan", "Plan", "A proposed approach that can be reviewed before execution.", vec![
-                    field("summary", "The proposed approach and why it meets the goal.", Text, true),
-                    field("assumptions", "Unverified premises that could change the plan.", StringList, false),
-                    field("risks", "Likely failure modes and their impact.", StringList, false),
-                    field("dependencies", "Required decisions, systems, or earlier work.", StringList, false),
-                ]),
-                post_template("decision", "Decision", "A decision that changes or constrains the plan.", vec![
-                    field("decision", "What was decided.", Text, true),
-                    field("reason", "Why this option was selected.", Text, true),
-                    field("alternatives", "Other options considered.", StringList, false),
-                ]),
-            ],
-        },
-        BoardTemplate {
-            id: "task".into(),
-            version: 1,
-            name: "Task handoff".into(),
-            description: "Create executable task handoffs and record progress or results.".into(),
-            board_type: "tasks".into(),
-            instructions: "Before handing work to another agent, include bounded scope, testable acceptance criteria, dependencies, and an intended owner. Link the parent plan and milestone. Workers should post progress, blockers, and evidence here.".into(),
-            post_templates: vec![
-                post_template("task", "Task", "A bounded piece of work ready for an agent handoff.", vec![
-                    field("scope", "What the assignee should change or investigate.", Text, true),
-                    field("acceptance_criteria", "Checks that determine whether the task is complete.", StringList, true),
-                    field("owner", "Intended agent or person responsible for the work.", Text, true),
-                    field("dependencies", "Work or decisions required before starting.", StringList, false),
-                ]),
-                post_template("progress", "Progress update", "A concise update from the assigned worker.", vec![
-                    field("summary", "What changed or was learned.", Text, true),
-                    field("next_step", "The next concrete action, if any.", Text, false),
-                ]),
-                post_template("blocker", "Blocker", "A blocker requiring attention.", vec![
-                    field("description", "What is blocking progress.", Text, true),
-                    field("needed", "Decision or action needed to continue.", Text, true),
-                ]),
-                post_template("result", "Result", "A result with verification evidence.", vec![
-                    field("summary", "What was completed and the outcome.", Text, true),
-                    field("evidence", "Commands, reports, commits, or other verification references.", StringList, true),
-                ]),
-            ],
-        },
-        BoardTemplate {
-            id: "milestone".into(),
-            version: 1,
-            name: "Milestone and exit review".into(),
-            description: "Define milestone outcomes and record evidence against exit criteria.".into(),
-            board_type: "milestone".into(),
-            instructions: "State measurable exit criteria when creating the milestone. Record the observed result and link evidence when reviewing it. The board validates post shape but does not decide whether the milestone passed.".into(),
-            post_templates: vec![
-                post_template("milestone", "Milestone", "The planned milestone outcome and its exit criteria.", vec![
-                    field("outcome", "The result this milestone represents.", Text, true),
-                    field("exit_criteria", "Observable checks required for the outcome.", StringList, true),
-                    field("dependencies", "Required tasks, decisions, or earlier milestones.", StringList, false),
-                ]),
-                post_template("review", "Review", "An evidence-backed review of milestone criteria.", vec![
-                    field("summary", "What the evidence shows.", Text, true),
-                    field("evidence", "Links or references supporting the review.", StringList, true),
-                    field("open_items", "Remaining gaps or follow-up work.", StringList, false),
-                ]),
-            ],
-        },
-    ]
-}
-
-/// Return the latest version of each built-in template for discovery.
-pub fn board_templates() -> Vec<BoardTemplate> {
-    let mut latest = BTreeMap::<String, BoardTemplate>::new();
-    for template in board_template_versions() {
-        let replace = latest
-            .get(&template.id)
-            .map_or(true, |existing| template.version > existing.version);
-        if replace {
-            latest.insert(template.id.clone(), template);
+    let mut ids = std::collections::HashSet::new();
+    for field in &schema.fields {
+        if field.id.trim().is_empty() || field.id.len() > 128 || !ids.insert(&field.id) {
+            anyhow::bail!("template field IDs must be unique and 1-128 bytes");
+        }
+        if field.label.as_ref().is_some_and(|s| s.len() > 256)
+            || field.description.as_ref().is_some_and(|s| s.len() > 2048)
+        {
+            anyhow::bail!("template field label/description exceeds its size limit");
+        }
+        if let Some(values) = &field.enum_values {
+            if values.len() > 256 {
+                anyhow::bail!("template field enum may contain at most 256 values");
+            }
         }
     }
-    latest.into_values().collect()
+    Ok(())
 }
 
-pub fn board_template(template_id: &str) -> Option<BoardTemplate> {
-    board_templates()
-        .into_iter()
-        .find(|template| template.id == template_id)
+pub fn validate_template_instance(instance: &TemplateInstance) -> anyhow::Result<()> {
+    if instance.contract_version != 1 || instance.version == 0 {
+        anyhow::bail!("unsupported template instance contract or version");
+    }
+    if instance.issuer.trim().is_empty()
+        || instance.issuer.len() > 128
+        || instance.template_id.trim().is_empty()
+        || instance.template_id.len() > 128
+    {
+        anyhow::bail!("template issuer and ID must be 1-128 bytes");
+    }
+    let snapshot_json = serde_json::to_value(&instance.snapshot)?;
+    if serde_json::to_vec(&snapshot_json)?.len() > TEMPLATE_SNAPSHOT_MAX_BYTES {
+        anyhow::bail!("template snapshot exceeds 65536 bytes");
+    }
+    validate_snapshot_depth(&snapshot_json, 0)?;
+    validate_schema(&instance.snapshot.schema)?;
+    if instance.snapshot.post_templates.len() > 100 {
+        anyhow::bail!("template snapshot may contain at most 100 post templates");
+    }
+    validate_presentation(
+        &instance.snapshot.presentation,
+        &instance.snapshot.schema,
+        Some(&instance.snapshot.post_templates),
+    )?;
+    let mut refs = std::collections::HashSet::new();
+    for post in &instance.snapshot.post_templates {
+        if post.template_id.trim().is_empty()
+            || post.template_id.len() > 128
+            || post.version == 0
+            || !refs.insert((post.template_id.as_str(), post.version))
+        {
+            anyhow::bail!("post template references must be unique and valid");
+        }
+        validate_schema(&post.schema)?;
+        validate_presentation(&post.presentation, &post.schema, None)?;
+        verify_post_template_hash(post)?;
+    }
+    verify_template_hash(instance)?;
+    Ok(())
 }
 
-/// Look up an exact template version so existing templated boards retain
-/// their original contract after a newer version is introduced.
-pub fn board_template_version(template_id: &str, version: u32) -> Option<BoardTemplate> {
-    board_template_versions()
-        .into_iter()
-        .find(|template| template.id == template_id && template.version == version)
+fn validate_snapshot_depth(value: &Value, depth: usize) -> anyhow::Result<()> {
+    if depth > 16 {
+        anyhow::bail!("template snapshot nesting exceeds 16 levels");
+    }
+    match value {
+        Value::Array(items) => {
+            if items.len() > 256 {
+                anyhow::bail!("template arrays may contain at most 256 items");
+            }
+            for item in items {
+                validate_snapshot_depth(item, depth + 1)?;
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                validate_snapshot_depth(item, depth + 1)?;
+            }
+        }
+        Value::String(s) if s.len() > 8192 => {
+            anyhow::bail!("template strings may be at most 8192 bytes")
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
-/// Validate a structured post against a board's versioned built-in template.
-/// Unknown fields are rejected to catch misspellings and stale agents.
-pub fn validate_template_post(
-    template: &BoardTemplate,
-    post_template_id: &str,
-    post_template_version: u32,
-    fields: &Value,
-) -> Result<(), Vec<String>> {
-    let Some(post_template) = template
+fn validate_presentation(
+    presentation: &TemplatePresentation,
+    schema: &TemplateSchema,
+    available_post_templates: Option<&[PostTemplateSnapshot]>,
+) -> anyhow::Result<()> {
+    if presentation.version != 1 {
+        anyhow::bail!(
+            "unsupported template presentation version: {}",
+            presentation.version
+        );
+    }
+    if presentation.components.len() > 32 {
+        anyhow::bail!("presentation may contain at most 32 components");
+    }
+    let field_ids: std::collections::HashSet<&str> = schema
+        .fields
+        .iter()
+        .map(|field| field.id.as_str())
+        .collect();
+    for component in &presentation.components {
+        let Some(component) = component.as_object() else {
+            anyhow::bail!("presentation components must be objects");
+        };
+        let Some(kind) = component.get("kind").and_then(Value::as_str) else {
+            anyhow::bail!("presentation components require a string kind");
+        };
+        if component.get("title").is_some_and(|value| {
+            value
+                .as_str()
+                .is_none_or(|text| text.trim().is_empty() || text.len() > 128)
+        }) {
+            anyhow::bail!("presentation component title must be 1-128 bytes");
+        }
+        let require_field = |key: &str| -> anyhow::Result<()> {
+            let field_id = component
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|field_id| !field_id.trim().is_empty() && field_id.len() <= 128)
+                .ok_or_else(|| anyhow::anyhow!("{kind} component requires a valid {key}"))?;
+            if !field_ids.contains(field_id) {
+                anyhow::bail!("{kind} component references unknown schema field {field_id:?}");
+            }
+            Ok(())
+        };
+        let validate_field_list = |key: &str, required: bool| -> anyhow::Result<Vec<&str>> {
+            let Some(values) = component.get(key) else {
+                if required {
+                    anyhow::bail!("{kind} component requires {key}");
+                }
+                return Ok(Vec::new());
+            };
+            let values = values
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{kind}.{key} must be an array of field IDs"))?;
+            if values.len() > 256 {
+                anyhow::bail!("{kind}.{key} may contain at most 256 field IDs");
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut result = Vec::with_capacity(values.len());
+            for value in values {
+                let field_id = value
+                    .as_str()
+                    .filter(|field_id| !field_id.trim().is_empty() && field_id.len() <= 128)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{kind}.{key} entries must be valid field IDs")
+                    })?;
+                if !field_ids.contains(field_id) {
+                    anyhow::bail!("{kind} component references unknown schema field {field_id:?}");
+                }
+                if !seen.insert(field_id) {
+                    anyhow::bail!("{kind}.{key} field IDs must be unique");
+                }
+                result.push(field_id);
+            }
+            Ok(result)
+        };
+        let validate_template_ids = |required: bool| -> anyhow::Result<Vec<&str>> {
+            let Some(values) = component.get("post_template_ids") else {
+                if required {
+                    anyhow::bail!("{kind} component requires post_template_ids");
+                }
+                return Ok(Vec::new());
+            };
+            let values = values.as_array().ok_or_else(|| {
+                anyhow::anyhow!("{kind}.post_template_ids must be an array of template IDs")
+            })?;
+            if values.len() > 100 {
+                anyhow::bail!("{kind}.post_template_ids may contain at most 100 IDs");
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut result = Vec::with_capacity(values.len());
+            for value in values {
+                let template_id = value
+                    .as_str()
+                    .filter(|template_id| {
+                        !template_id.trim().is_empty() && template_id.len() <= 128
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{kind}.post_template_ids entries must be valid IDs")
+                    })?;
+                if !seen.insert(template_id) {
+                    anyhow::bail!("{kind}.post_template_ids must be unique");
+                }
+                if available_post_templates.is_some_and(|available| {
+                    !available.iter().any(|post| post.template_id == template_id)
+                }) {
+                    anyhow::bail!(
+                        "{kind} component references unknown PostTemplate {template_id:?}"
+                    );
+                }
+                result.push(template_id);
+            }
+            Ok(result)
+        };
+        let validate_relation = || -> anyhow::Result<()> {
+            if component.get("relation").is_some_and(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|text| text.trim().is_empty() || text.len() > 64)
+            }) {
+                anyhow::bail!("{kind}.relation must be a 1-64 byte string when present");
+            }
+            Ok(())
+        };
+        let validate_mode = |allowed: &[&str]| -> anyhow::Result<()> {
+            let mode = component
+                .get("mode")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("{kind} component requires mode"))?;
+            if !allowed.contains(&mode) {
+                anyhow::bail!("unsupported {kind} mode {mode:?}");
+            }
+            Ok(())
+        };
+
+        match kind {
+            "hero" => {
+                require_field("title_field")?;
+                validate_field_list("summary_fields", true)?;
+            }
+            "fields" => {
+                validate_field_list("field_ids", true)?;
+            }
+            "related_boards" => {
+                validate_relation()?;
+                validate_mode(&["cards", "list"])?;
+                // These IDs describe fields on linked boards, which have their own
+                // independently pinned schema and are checked when rendered.
+                validate_field_id_syntax_list(component.get("field_ids"), kind)?;
+            }
+            "related_posts" => {
+                validate_relation()?;
+                validate_mode(&["compact", "list"])?;
+                validate_template_ids(false)?;
+            }
+            "post_list" | "post_timeline" => {
+                validate_template_ids(false)?;
+            }
+            "post_groups" => {
+                let template_ids = validate_template_ids(false)?;
+                let group_by = component
+                    .get("group_by")
+                    .and_then(Value::as_str)
+                    .filter(|field_id| !field_id.trim().is_empty() && field_id.len() <= 128)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("post_groups requires a valid group_by field ID")
+                    })?;
+                let selected_schemas: Vec<&TemplateSchema> = match available_post_templates {
+                    Some(available) => {
+                        let selected: Vec<&PostTemplateSnapshot> = available
+                            .iter()
+                            .filter(|post| {
+                                template_ids.is_empty()
+                                    || template_ids.iter().any(|id| *id == post.template_id)
+                            })
+                            .collect();
+                        if selected.is_empty() {
+                            anyhow::bail!(
+                                "post_groups must select at least one pinned PostTemplate"
+                            );
+                        }
+                        selected.iter().map(|post| &post.schema).collect()
+                    }
+                    // A PostTemplate presentation may group its own records. In that
+                    // context its own schema is the only pinned schema available.
+                    None => vec![schema],
+                };
+                for selected_schema in &selected_schemas {
+                    if !selected_schema
+                        .fields
+                        .iter()
+                        .any(|field| field.id == group_by)
+                    {
+                        anyhow::bail!("post_groups references unknown group_by field {group_by:?}");
+                    }
+                }
+                if let Some(values) = component.get("field_ids") {
+                    let fields = values.as_array().ok_or_else(|| {
+                        anyhow::anyhow!("post_groups.field_ids must be an array of field IDs")
+                    })?;
+                    if fields.len() > 256 {
+                        anyhow::bail!("post_groups.field_ids may contain at most 256 field IDs");
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    for value in fields {
+                        let field_id = value
+                            .as_str()
+                            .filter(|field_id| !field_id.trim().is_empty() && field_id.len() <= 128)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "post_groups.field_ids entries must be valid field IDs"
+                                )
+                            })?;
+                        if !seen.insert(field_id) {
+                            anyhow::bail!("post_groups.field_ids must be unique");
+                        }
+                        if selected_schemas.iter().any(|selected_schema| {
+                            !selected_schema
+                                .fields
+                                .iter()
+                                .any(|field| field.id == field_id)
+                        }) {
+                            anyhow::bail!("post_groups references unknown post field {field_id:?}");
+                        }
+                    }
+                }
+                let groups = component.get("groups");
+                let Some(groups) = groups else { continue };
+                let groups = groups
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("post_groups.groups must be an array"))?;
+                if groups.len() > 100 {
+                    anyhow::bail!("post_groups.groups may contain at most 100 entries");
+                }
+                let definitions: Vec<&TemplateField> = selected_schemas
+                    .iter()
+                    .map(|selected_schema| {
+                        selected_schema
+                            .fields
+                            .iter()
+                            .find(|field| field.id == group_by)
+                            .expect("group_by was validated above")
+                    })
+                    .collect();
+                let mut group_values = std::collections::HashSet::new();
+                for group in groups {
+                    let object = group
+                        .as_object()
+                        .ok_or_else(|| anyhow::anyhow!("post_groups groups must be objects"))?;
+                    let value = object
+                        .get("value")
+                        .ok_or_else(|| anyhow::anyhow!("post_groups group requires value"))?;
+                    if value.is_null()
+                        || definitions
+                            .iter()
+                            .any(|field| !presentation_value_matches(field.field_type, value))
+                    {
+                        anyhow::bail!(
+                            "post_groups group value has the wrong type for field {group_by:?}"
+                        );
+                    }
+                    let value_key = serde_json::to_string(value)?;
+                    if !group_values.insert(value_key) {
+                        anyhow::bail!("post_groups group values must be unique");
+                    }
+                    if definitions.iter().any(|field| {
+                        field
+                            .enum_values
+                            .as_ref()
+                            .is_some_and(|choices| !choices.contains(value))
+                    }) {
+                        anyhow::bail!(
+                            "post_groups group value is not declared by field {group_by:?}"
+                        );
+                    }
+                    if definitions
+                        .iter()
+                        .map(|field| field.field_type)
+                        .any(|field_type| field_type != definitions[0].field_type)
+                    {
+                        anyhow::bail!("post_groups selected templates disagree on group_by type");
+                    }
+                    if definitions
+                        .iter()
+                        .any(|field| field.enum_values != definitions[0].enum_values)
+                    {
+                        anyhow::bail!("post_groups selected templates disagree on group_by values");
+                    }
+                    let label = object
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .filter(|label| !label.trim().is_empty() && label.len() <= 128)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("post_groups group label must be 1-128 bytes")
+                        })?;
+                    let _ = label;
+                }
+            }
+            _ => {} // Unknown component kinds round-trip for safe renderer fallback.
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_id_syntax_list(values: Option<&Value>, component: &str) -> anyhow::Result<()> {
+    let Some(values) = values else { return Ok(()) };
+    let values = values
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{component}.field_ids must be an array of field IDs"))?;
+    if values.len() > 256 {
+        anyhow::bail!("{component}.field_ids may contain at most 256 field IDs");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for value in values {
+        let field_id = value
+            .as_str()
+            .filter(|field_id| !field_id.trim().is_empty() && field_id.len() <= 128)
+            .ok_or_else(|| {
+                anyhow::anyhow!("{component}.field_ids entries must be valid field IDs")
+            })?;
+        if !seen.insert(field_id) {
+            anyhow::bail!("{component}.field_ids must be unique");
+        }
+    }
+    Ok(())
+}
+
+fn presentation_value_matches(field_type: TemplateFieldType, value: &Value) -> bool {
+    match field_type {
+        TemplateFieldType::String => value.as_str().is_some(),
+        TemplateFieldType::StringList => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string)),
+        TemplateFieldType::Boolean => value.is_boolean(),
+        TemplateFieldType::Integer => value.as_i64().is_some(),
+        TemplateFieldType::Number => value.as_f64().is_some(),
+    }
+}
+
+fn verify_template_hash(instance: &TemplateInstance) -> anyhow::Result<()> {
+    let post_refs: Vec<Value> = instance
+        .snapshot
         .post_templates
         .iter()
-        .find(|item| item.id == post_template_id && item.version == post_template_version)
-    else {
-        return Err(vec![format!(
-            "unknown post template {post_template_id:?} version {post_template_version} for board template {:?}",
-            template.id,
-        )]);
-    };
-    let Some(values) = fields.as_object() else {
-        return Err(vec!["fields must be a JSON object".into()]);
-    };
-    let mut errors = Vec::new();
-    for field in &post_template.fields {
-        let Some(value) = values.get(&field.name) else {
-            if field.required {
-                errors.push(format!("missing required field {:?}", field.name));
+        .map(|post| {
+            json!({
+                "template_id": post.template_id,
+                "version": post.version,
+                "content_hash": post.content_hash,
+            })
+        })
+        .collect();
+    let definition = json!({
+        "template_id": instance.template_id,
+        "version": instance.version,
+        "schema": instance.snapshot.schema,
+        "presentation": instance.snapshot.presentation,
+        "post_templates": post_refs,
+    });
+    verify_hash(&instance.content_hash, &definition, "board template")
+}
+
+fn verify_post_template_hash(post: &PostTemplateSnapshot) -> anyhow::Result<()> {
+    let definition = json!({
+        "template_id": post.template_id,
+        "version": post.version,
+        "schema": post.schema,
+        "presentation": post.presentation,
+    });
+    verify_hash(&post.content_hash, &definition, "post template")
+}
+
+fn verify_hash(actual: &str, definition: &Value, label: &str) -> anyhow::Result<()> {
+    let expected = content_hash(definition)?;
+    if actual != expected {
+        anyhow::bail!("{label} content_hash mismatch; expected {expected}");
+    }
+    Ok(())
+}
+
+pub fn validate_template_fields(schema: &TemplateSchema, fields: &Value) -> anyhow::Result<()> {
+    validate_schema(schema)?;
+    let values = fields
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("fields must be a JSON object"))?;
+    if serde_json::to_vec(fields)?.len() > TEMPLATE_FIELDS_MAX_BYTES {
+        anyhow::bail!("structured fields exceed 32768 bytes");
+    }
+    for definition in &schema.fields {
+        let Some(value) = values.get(&definition.id) else {
+            if definition.required {
+                anyhow::bail!("missing required field {:?}", definition.id);
             }
             continue;
         };
-        let valid = match field.field_type {
-            BoardTemplateFieldType::String => {
-                value.as_str().is_some_and(|text| !text.trim().is_empty())
-            }
-            BoardTemplateFieldType::StringList => value.as_array().is_some_and(|items| {
-                !items.is_empty()
+        let valid = match definition.field_type {
+            TemplateFieldType::String => value.as_str().is_some_and(|v| !v.trim().is_empty()),
+            TemplateFieldType::StringList => value.as_array().is_some_and(|items| {
+                items.len() <= 256
                     && items
                         .iter()
-                        .all(|item| item.as_str().is_some_and(|text| !text.trim().is_empty()))
+                        .all(|v| v.as_str().is_some_and(|s| !s.trim().is_empty()))
             }),
-            BoardTemplateFieldType::Boolean => value.is_boolean(),
-            BoardTemplateFieldType::Integer => value.as_i64().is_some(),
+            TemplateFieldType::Boolean => value.is_boolean(),
+            TemplateFieldType::Integer => value.as_i64().is_some(),
+            TemplateFieldType::Number => value.as_f64().is_some(),
         };
         if !valid {
-            let expected = match field.field_type {
-                BoardTemplateFieldType::String => "non-empty string",
-                BoardTemplateFieldType::StringList => "non-empty list of non-empty strings",
-                BoardTemplateFieldType::Boolean => "boolean",
-                BoardTemplateFieldType::Integer => "integer",
-            };
-            errors.push(format!("field {:?} must be a {expected}", field.name));
+            anyhow::bail!("field {:?} has the wrong type", definition.id);
+        }
+        if let Some(choices) = &definition.enum_values {
+            if !choices.contains(value) {
+                anyhow::bail!("field {:?} must match a declared enum value", definition.id);
+            }
         }
     }
-    for key in values.keys() {
-        if !post_template.fields.iter().any(|field| field.name == *key) {
-            errors.push(format!(
-                "unknown field {key:?} for post template {post_template_id:?}"
-            ));
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+    // Unknown fields are retained verbatim to permit forward-compatible round trips.
+    Ok(())
 }
 
 /// A generic relation from a board or post to another board, post, or
@@ -402,6 +737,8 @@ pub struct BoardSnapshot {
     pub board: Board,
     pub posts: Vec<BoardPost>,
     pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_sequence: Option<u64>,
 }
 
 /// A bulletin board: shared by a parent agent and its subagents.
@@ -422,9 +759,9 @@ pub struct Board {
     #[serde(default)]
     pub links: Vec<BoardLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_id: Option<String>,
+    pub template_instance: Option<TemplateInstance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_version: Option<u32>,
+    pub fields: Option<Value>,
     pub created_at: String,
 }
 
@@ -494,8 +831,11 @@ pub fn board_doc_filters(board: &Board) -> BTreeMap<String, String> {
     f.insert(BOARD_WORKSPACE_FILTER.to_string(), board.workspace.clone());
     f.insert(BOARD_KEY_FILTER.to_string(), board.key.clone());
     f.insert(BOARD_TYPE_FILTER.to_string(), board.board_type.clone());
-    if let Some(template_id) = &board.template_id {
-        f.insert(BOARD_TEMPLATE_ID_FILTER.to_string(), template_id.clone());
+    if let Some(template_instance) = &board.template_instance {
+        f.insert(
+            BOARD_TEMPLATE_ID_FILTER.to_string(),
+            template_instance.template_id.clone(),
+        );
     }
     f
 }
@@ -561,6 +901,78 @@ pub fn board_from_doc_content(content: &str) -> Option<Board> {
     serde_json::from_str(content).ok()
 }
 
+/// Realistic AgentFlow-style template instances with correct JCS hashes.
+#[cfg(test)]
+pub(crate) mod test_fixtures {
+    use super::*;
+
+    fn jcs_hash(definition: &Value) -> String {
+        use sha2::Digest;
+        let bytes = serde_jcs::to_vec(definition).unwrap();
+        format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+    }
+
+    /// A task PostTemplate. Schema and presentation are hashed as supplied.
+    pub(crate) fn task_post_template(version: u32) -> Value {
+        let schema = json!({"version": 1, "fields": [
+            {"id": "description", "type": "string", "required": true, "label": "Description"},
+            {"id": "status", "type": "string", "required": true,
+             "enum": ["ready", "active", "blocked", "review", "done"]},
+            {"id": "estimate", "type": "integer", "required": false},
+            {"id": "owner", "type": "string", "required": false, "x_hint": "assignee"}
+        ]});
+        let presentation = json!({"version": 1, "components": [
+            {"kind": "fields", "field_ids": ["description", "status"]}
+        ]});
+        let hash = jcs_hash(&json!({
+            "template_id": "task", "version": version,
+            "schema": schema, "presentation": presentation,
+        }));
+        json!({"template_id": "task", "version": version, "content_hash": hash,
+               "schema": schema, "presentation": presentation})
+    }
+
+    /// A project BoardTemplate instance pinning one task PostTemplate. The
+    /// caller may add presentation components; hashes are recomputed.
+    pub(crate) fn project_instance_with(version: u32, extra_components: Vec<Value>) -> Value {
+        let schema = json!({"version": 1, "fields": [
+            {"id": "goal", "type": "string", "required": true, "label": "Goal"},
+            {"id": "success_criteria", "type": "string_list", "required": true},
+            {"id": "coordinator", "type": "string", "required": false}
+        ]});
+        let mut components = vec![
+            json!({"kind": "hero", "title_field": "goal", "summary_fields": ["success_criteria"]}),
+            json!({"kind": "post_groups", "post_template_ids": ["task"], "group_by": "status",
+                   "groups": [{"value": "active", "label": "Active"},
+                              {"value": "review", "label": "Review"}]}),
+            // Unknown kind: must round-trip for renderer fallback.
+            json!({"kind": "kanban_future", "lanes": 3}),
+        ];
+        components.extend(extra_components);
+        let presentation = json!({"version": 1, "components": components});
+        let task = task_post_template(1);
+        let refs = json!([{"template_id": "task", "version": 1,
+                           "content_hash": task["content_hash"]}]);
+        let hash = jcs_hash(&json!({
+            "template_id": "project", "version": version,
+            "schema": schema, "presentation": presentation, "post_templates": refs,
+        }));
+        json!({"contract_version": 1, "issuer": "agentflow", "template_id": "project",
+               "version": version, "content_hash": hash,
+               "snapshot": {"schema": schema, "presentation": presentation,
+                            "post_templates": [task]}})
+    }
+
+    pub(crate) fn project_instance(version: u32) -> TemplateInstance {
+        serde_json::from_value(project_instance_with(version, Vec::new())).unwrap()
+    }
+
+    pub(crate) fn project_fields() -> Value {
+        json!({"goal": "Ship template boards", "success_criteria": ["Tests pass"],
+               "unknown_note": {"kept": true}})
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +1012,94 @@ mod tests {
         assert!(is_default_alias("default"));
         assert!(is_default_alias("  default  "));
         assert!(!is_default_alias(&a));
+    }
+
+    fn golden_post_template() -> PostTemplateSnapshot {
+        serde_json::from_value(json!({
+            "template_id": "task",
+            "version": 1,
+            // Computed independently with Python's json.dumps(sort_keys=True,
+            // separators=(",", ":")) + SHA-256, which equals RFC 8785 JCS
+            // for this ASCII/integer-only definition.
+            "content_hash": "sha256:b1045979bf45136e840b67871023d61cb2a71757b21bf7d0c8f4a52848b63464",
+            "schema": {"version": 1, "fields": [
+                {"id": "status", "type": "string", "required": true, "enum": ["ready", "done"]}
+            ]},
+            "presentation": {"version": 1, "components": [
+                {"kind": "fields", "field_ids": ["status"]}
+            ]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn post_template_hash_matches_independent_jcs_vector() {
+        verify_post_template_hash(&golden_post_template()).unwrap();
+        let mut tampered = golden_post_template();
+        tampered.schema.fields[0].required = false;
+        let err = verify_post_template_hash(&tampered).unwrap_err();
+        assert!(err.to_string().contains("content_hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn unknown_field_type_is_rejected_at_parse() {
+        let err = serde_json::from_value::<TemplateField>(
+            json!({"id": "due", "type": "date", "required": false}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn unknown_field_metadata_round_trips() {
+        let field: TemplateField = serde_json::from_value(
+            json!({"id": "x", "type": "string", "required": false, "x_hint": {"a": 1}}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&field).unwrap()["x_hint"],
+            json!({"a": 1})
+        );
+    }
+
+    #[test]
+    fn legacy_board_and_post_records_deserialize_without_template_data() {
+        // Pre-typed record: no type, links, template_instance, or fields.
+        let board = board_from_doc_content(
+            r#"{"board_id":"board:u:ws:k","owner":"u","workspace":"ws","key":"k","title":"K","created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("legacy board parses");
+        assert_eq!(board.board_type, DEFAULT_BOARD_TYPE);
+        assert!(board.links.is_empty());
+        assert!(board.template_instance.is_none() && board.fields.is_none());
+        // Typed-board prototype record carrying the retired built-in refs.
+        let prototype = board_from_doc_content(
+            r#"{"board_id":"board:u:ws:p","owner":"u","workspace":"ws","key":"p","title":"P","type":"project","links":[],"template_id":"project","template_version":1,"created_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("prototype board parses");
+        assert_eq!(prototype.board_type, "project");
+        assert!(prototype.template_instance.is_none());
+        let post: BoardPost = serde_json::from_str(
+            r#"{"post_id":"p1","board_id":"board:u:ws:k","author_agent_id":"a","provider":"codex","content":"hi","sequence":1,"created_at":"t"}"#,
+        )
+        .unwrap();
+        assert!(post.fields.is_none() && post.post_template_id.is_none());
+        assert!(post.links.is_empty());
+    }
+
+    #[test]
+    fn template_fields_validate_known_and_keep_unknown() {
+        let schema = golden_post_template().schema;
+        validate_template_fields(&schema, &json!({"status": "done", "future": [1, 2]})).unwrap();
+        for (fields, needle) in [
+            (json!({}), "missing required field"),
+            (json!({"status": 3}), "wrong type"),
+            (json!({"status": "  "}), "wrong type"),
+            (json!({"status": "active"}), "declared enum"),
+            (json!(["status"]), "JSON object"),
+        ] {
+            let err = validate_template_fields(&schema, &fields).unwrap_err();
+            assert!(err.to_string().contains(needle), "{fields}: {err}");
+        }
     }
 }

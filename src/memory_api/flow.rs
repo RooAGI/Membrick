@@ -69,6 +69,22 @@ fn parse_event(document: &crate::SourceDocument) -> anyhow::Result<FlowEvent> {
         .map_err(|error| anyhow::anyhow!("invalid stored FlowEvent {}: {error}", document.doc_id))
 }
 
+fn flow_template_for_run(run: &FlowRun) -> anyhow::Result<FlowTemplate> {
+    if let Some(instance) = &run.flow_template_instance {
+        validate_flow_template_instance(instance)?;
+        return Ok(instance.snapshot.clone());
+    }
+    // Runs written before template snapshots were pinned retain their historic
+    // lifecycle semantics through this compatibility-only resolver.
+    legacy_flow_template(&run.template_id, Some(run.template_version)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "legacy FlowRun references unavailable FlowTemplate {}@{}",
+            run.template_id,
+            run.template_version
+        )
+    })
+}
+
 fn actor_is_coordinator(run: &FlowRun, actor: &str, fence: Option<u64>) -> anyhow::Result<()> {
     let coordinator = run
         .coordinator
@@ -511,27 +527,12 @@ fn apply_event(
 }
 
 impl MemoryService {
-    pub fn flow_template_list(&self) -> Vec<FlowTemplate> {
-        flow_templates()
-    }
-
-    pub fn flow_template_get(
-        &self,
-        template_id: &str,
-        version: Option<u32>,
-    ) -> anyhow::Result<FlowTemplate> {
-        flow_template(template_id, version).ok_or_else(|| {
-            anyhow::anyhow!("unknown FlowTemplate {template_id:?} version {version:?}")
-        })
-    }
-
     pub fn flow_create(
         &mut self,
         owner: &str,
         workspace: &str,
         board_id: &str,
-        template_id: &str,
-        template_version: u32,
+        flow_template_instance: FlowTemplateInstance,
         goal: &str,
         references: Vec<FlowReference>,
         created_by: &str,
@@ -543,13 +544,27 @@ impl MemoryService {
         validate_identifier(goal, "goal", 16 * 1024)?;
         validate_identifier(created_by, "created_by", 256)?;
         validate_identifier(request_id, "request_id", 256)?;
-        let template = self.flow_template_get(template_id, Some(template_version))?;
+        validate_flow_template_instance(&flow_template_instance)?;
+        let template = &flow_template_instance.snapshot;
+        let template_id = &flow_template_instance.template_id;
+        let template_version = flow_template_instance.version;
         let board = self
             .board_info(board_id, owner, workspace, None)?
             .ok_or_else(|| anyhow::anyhow!("unknown board_id: {board_id}"))?;
         anyhow::ensure!(
             board.owner == owner && board.workspace == workspace,
             "board is outside requested owner/workspace"
+        );
+        let board_template = board.template_instance.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "FlowRun board must have the FlowTemplate's pinned BoardTemplate instance"
+            )
+        })?;
+        anyhow::ensure!(
+            board_template.template_id == template.board_template.template_id
+                && board_template.version == template.board_template.version
+                && board_template.content_hash == template.board_template.content_hash,
+            "FlowRun board template instance does not match the FlowTemplate board_template reference"
         );
         self.validate_flow_references(owner, workspace, &references)?;
         anyhow::ensure!(
@@ -563,6 +578,7 @@ impl MemoryService {
             board_id,
             template_id,
             &template_version.to_string(),
+            &flow_template_instance.content_hash,
             goal,
             created_by,
             &references_json,
@@ -593,6 +609,9 @@ impl MemoryService {
                     &run.board_id,
                     &run.template_id,
                     &run.template_version.to_string(),
+                    run.flow_template_instance
+                        .as_ref()
+                        .map_or("legacy", |instance| instance.content_hash.as_str()),
                     &run.goal,
                     &run.created_by,
                     &previous_references,
@@ -615,7 +634,7 @@ impl MemoryService {
             owner.into(),
             workspace.into(),
             board_id.into(),
-            &template,
+            &flow_template_instance,
             goal.into(),
             references,
             created_by.into(),
@@ -632,13 +651,13 @@ impl MemoryService {
             kind: FlowEventKind::FlowStarted,
             task_id: None,
             post_id: None,
-            data: json!({"template_id": template_id, "template_version": template_version}),
+            data: json!({"template_id": template_id, "template_version": template_version, "template_hash": flow_template_instance.content_hash}),
             timestamp: timestamp.clone(),
         };
         let mut run_filters = flow_run_filters(&run);
         run_filters.insert(FLOW_CREATE_REQUEST_FILTER.into(), request_id.into());
         let mut run = run;
-        apply_event(&mut run, &template, &initial)?;
+        apply_event(&mut run, template, &initial)?;
         let run_content = serde_json::to_string(&run)?;
         let event_content = serde_json::to_string(&initial)?;
         let run_doc = json_document(
@@ -697,7 +716,7 @@ impl MemoryService {
             return Ok(None);
         };
         let run = parse_run(document)?;
-        let template = self.flow_template_get(&run.template_id, Some(run.template_version))?;
+        let _template = flow_template_for_run(&run)?;
         let mut events = self.flow_events_for(&run, owner, workspace)?;
         events.sort_by(|left, right| {
             left.revision
@@ -725,7 +744,6 @@ impl MemoryService {
             "FlowRun projection revision does not match event timeline"
         );
         // Resolve the pinned template so a corrupt projection cannot hide a removed version.
-        let _ = template;
         Ok(Some(FlowSnapshot { run, events }))
     }
 
@@ -821,10 +839,7 @@ impl MemoryService {
             data,
             timestamp: now(),
         };
-        let template = self.flow_template_get(
-            &snapshot.run.template_id,
-            Some(snapshot.run.template_version),
-        )?;
+        let template = flow_template_for_run(&snapshot.run)?;
         self.validate_event_references(&input.owner, &input.workspace, &event)?;
         apply_event(&mut snapshot.run, &template, &event)?;
         let event_content = serde_json::to_string(&event)?;
@@ -1056,5 +1071,147 @@ impl MemoryService {
             self.validate_flow_references(owner, workspace, &[reference])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::test_fixtures::{project_fields, project_instance};
+    use crate::PipelineOptions;
+
+    const OWNER: &str = "mcp";
+    const WS: &str = "ws-flow-test";
+
+    fn hashed(mut template: FlowTemplate) -> FlowTemplate {
+        template.content_hash = String::new();
+        let mut definition = serde_json::to_value(&template).unwrap();
+        definition.as_object_mut().unwrap().remove("content_hash");
+        let bytes = serde_jcs::to_vec(&definition).unwrap();
+        template.content_hash = format!("sha256:{:x}", sha2::Sha256::digest(bytes));
+        template
+    }
+
+    /// An AgentFlow FlowTemplate pinned to the fixture project BoardTemplate.
+    fn flow_instance() -> FlowTemplateInstance {
+        let board = project_instance(1);
+        let mut template = legacy_flow_template("agent_work", Some(1)).unwrap();
+        template.board_template = FlowBoardTemplateRef {
+            template_id: board.template_id,
+            version: board.version,
+            content_hash: board.content_hash,
+        };
+        let snapshot = hashed(template);
+        FlowTemplateInstance {
+            issuer: "agentflow".into(),
+            template_id: snapshot.id.clone(),
+            version: snapshot.version,
+            content_hash: snapshot.content_hash.clone(),
+            snapshot,
+        }
+    }
+
+    fn project_board(service: &mut MemoryService) -> String {
+        service
+            .board_open_instance(
+                OWNER,
+                WS,
+                "launch",
+                "Launch",
+                "project",
+                &[],
+                Some(&project_instance(1)),
+                Some(&project_fields()),
+            )
+            .unwrap()
+            .board_id
+    }
+
+    fn create(
+        service: &mut MemoryService,
+        board_id: &str,
+        instance: FlowTemplateInstance,
+        request_id: &str,
+    ) -> anyhow::Result<FlowSnapshot> {
+        service.flow_create(
+            OWNER,
+            WS,
+            board_id,
+            instance,
+            "Ship it",
+            Vec::new(),
+            "coordinator",
+            request_id,
+        )
+    }
+
+    #[test]
+    fn flow_create_pins_snapshot_across_restart() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let dir = base.join(format!("membrick-flow-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let options = PipelineOptions::default();
+        let instance = flow_instance();
+        let flow_id = {
+            let mut service = MemoryService::at_path(&dir, options.clone()).unwrap();
+            let board_id = project_board(&mut service);
+            let created = create(&mut service, &board_id, instance.clone(), "f1").unwrap();
+            // Retrying the same request returns the same run.
+            let retry = create(&mut service, &board_id, instance.clone(), "f1").unwrap();
+            assert_eq!(retry.run.flow_id, created.run.flow_id);
+            created.run.flow_id
+        };
+        let service = MemoryService::at_path(&dir, options).unwrap();
+        let snapshot = service.flow_get(OWNER, WS, &flow_id).unwrap().unwrap();
+        assert_eq!(
+            snapshot.run.flow_template_instance.as_ref(),
+            Some(&instance)
+        );
+        assert_eq!(
+            snapshot.events[0].data["template_hash"],
+            json!(instance.content_hash)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_create_rejects_bad_hash_envelope_and_board_mismatch() {
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        let board_id = project_board(&mut service);
+
+        let mut tampered = flow_instance();
+        tampered.snapshot.requires_review = !tampered.snapshot.requires_review;
+        let err = create(&mut service, &board_id, tampered, "a").unwrap_err();
+        assert!(err.to_string().contains("content_hash mismatch"), "{err}");
+
+        let mut envelope = flow_instance();
+        envelope.version = 2;
+        let err = create(&mut service, &board_id, envelope, "b").unwrap_err();
+        assert!(err.to_string().contains("envelope does not match"), "{err}");
+
+        let mut other_board = flow_instance();
+        other_board.snapshot.board_template.content_hash = format!("sha256:{}", "2".repeat(64));
+        let snapshot = hashed(other_board.snapshot);
+        let other_board = FlowTemplateInstance {
+            content_hash: snapshot.content_hash.clone(),
+            snapshot,
+            ..flow_instance()
+        };
+        let err = create(&mut service, &board_id, other_board, "c").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the FlowTemplate board_template"),
+            "{err}"
+        );
+
+        let plain = service.board_open(OWNER, WS, "plain", "Plain").unwrap();
+        let err = create(&mut service, &plain.board_id, flow_instance(), "d").unwrap_err();
+        assert!(
+            err.to_string().contains("pinned BoardTemplate instance"),
+            "{err}"
+        );
+        assert!(service.flow_list(OWNER, WS).unwrap().is_empty());
     }
 }
