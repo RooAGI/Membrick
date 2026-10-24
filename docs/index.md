@@ -42,6 +42,13 @@ does not need to be retrained; it gets better context to work with.
     persistent service. Use the integrations and APIs to add memory to an agent
     without building a separate memory system from scratch.</p>
   </article>
+  <article>
+    <span class="feature-number">04</span>
+    <h3>Coordinate work on shared boards</h3>
+    <p>Give agents a durable place to post progress, hand off tasks, and link
+    related plans and evidence. Follow the work in order from the dashboard.</p>
+    <p><a href="boards/">Explore agent boards →</a></p>
+  </article>
 </div>
 
 ## What lasting memory makes possible {.landing-heading}

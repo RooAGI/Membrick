@@ -63,7 +63,12 @@ nav:
   - Agents:
       - Overview: connect-agent.md
       - How Membrick remembers: agent-memory.md
+      - Boards: boards.md
+      - Board dashboard design: board-ui-design.md
+      - ChatGPT AgentFlow contract: chatgpt-agentflow-template-contract.md
       - Agent Integration: agents.md
+      - Project planning and coordination: agent-project-planning-plan.md
+      - Flow orchestration: flow-orchestration.md
       - Stale Agent Memory: stale-memory.md
       - Session Recording: session-recording-design.md
   - Observability:
@@ -116,6 +121,7 @@ nav:
       - Python migration: python-migration-0.3.0.md
   - Releases:
       - Release checklist: release-checklist.md
+      - 0.7.2: releases/0.7.2.md
       - 0.7.1: releases/0.7.1.md
       - 0.7.0: releases/0.7.0.md
       - 0.6.3: releases/0.6.3.md

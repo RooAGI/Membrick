@@ -479,12 +479,36 @@ impl MuseMcp {
         }
 
         if crate::integrations::mcp_tools::resident_backend_enabled()
-            && matches!(
+            && (crate::integrations::mcp_tools::is_flow_tool_name(tool_name)
+                || matches!(
+                    tool_name,
+                    "search"
+                        | "info"
+                        | "list_memories"
+                        | "board_open"
+                        | "board_list"
+                        | "board_info"
+                        | "board_post"
+                        | "board_read"
+                        | "board_get"
+                        | "board_search"
+                        | "add_memory"
+                        | "get_memory"
+                        | "delete_memory"
+                        | "review_search"
+                        | "search_feedback"
+                        | "enrich_doc"
+                ))
+        {
+            return crate::integrations::mcp_tools::call_resident_tool(
+                id, &self.root, "muse", tool_name, &arguments,
+            );
+        }
+
+        if mcp_tools::is_flow_tool_name(tool_name)
+            || matches!(
                 tool_name,
-                "search"
-                    | "info"
-                    | "list_memories"
-                    | "board_open"
+                "board_open"
                     | "board_list"
                     | "board_info"
                     | "board_post"
@@ -499,27 +523,6 @@ impl MuseMcp {
                     | "enrich_doc"
             )
         {
-            return crate::integrations::mcp_tools::call_resident_tool(
-                id, &self.root, "muse", tool_name, &arguments,
-            );
-        }
-
-        if matches!(
-            tool_name,
-            "board_open"
-                | "board_list"
-                | "board_info"
-                | "board_post"
-                | "board_read"
-                | "board_get"
-                | "board_search"
-                | "add_memory"
-                | "get_memory"
-                | "delete_memory"
-                | "review_search"
-                | "search_feedback"
-                | "enrich_doc"
-        ) {
             let mut service = self.store()?;
             let service = service.as_mut().expect("MCP store initialized");
             return mcp_tools::call_board_or_memory_tool(
@@ -802,6 +805,7 @@ impl MuseMcp {
             mcp_tools::update_tool_definition(),
         ];
         tools.extend(mcp_tools::board_tool_definitions());
+        tools.extend(mcp_tools::flow_tool_definitions());
         tools.extend(mcp_tools::memory_tool_definitions());
         tools
     }

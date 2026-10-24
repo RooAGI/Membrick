@@ -51,6 +51,7 @@ mod config;
 mod conversation_state;
 mod conversational_rerank;
 mod daemon;
+pub mod flow;
 mod ids;
 mod index;
 #[cfg(any(

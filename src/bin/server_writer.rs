@@ -623,10 +623,42 @@ fn run_writer(
     }
 }
 
+/// Board and Flow change notices for one workspace. Publishers send after a
+/// write has been applied, so a subscriber that refetches sees the change.
+/// Subscribers that fall behind receive `Lagged` and must resynchronize.
+#[derive(Clone)]
+pub(super) struct ChangeEvents {
+    sender: tokio::sync::broadcast::Sender<Value>,
+}
+
+impl ChangeEvents {
+    const CAPACITY: usize = 256;
+
+    pub(super) fn new() -> Self {
+        Self::with_capacity(Self::CAPACITY)
+    }
+
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            sender: tokio::sync::broadcast::channel(capacity).0,
+        }
+    }
+
+    pub(super) fn publish(&self, event: Value) {
+        // No subscribers is the normal case when no dashboard is open.
+        let _ = self.sender.send(event);
+    }
+
+    pub(super) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Value> {
+        self.sender.subscribe()
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct StagedWriter {
     sender: WriterSender,
     published: Arc<RwLock<Arc<MemoryService>>>,
+    changes: ChangeEvents,
 }
 impl StagedWriter {
     #[cfg(test)]
@@ -666,6 +698,7 @@ impl StagedWriter {
                 target: MemoryStore::Captured,
             },
             published: published.clone(),
+            changes: ChangeEvents::new(),
         };
         std::thread::Builder::new()
             .name("memory-writer".into())
@@ -676,6 +709,10 @@ impl StagedWriter {
         let mut writer = self.clone();
         writer.sender.target = MemoryStore::Workspace;
         writer
+    }
+    /// Change notices for this writer's workspace, shared by all clones.
+    pub(super) fn changes(&self) -> &ChangeEvents {
+        &self.changes
     }
     pub(super) fn read_view(&self) -> anyhow::Result<Arc<MemoryService>> {
         Ok(self

@@ -335,22 +335,23 @@ impl GeminiMcp {
         }
 
         if mcp_tools::resident_backend_enabled()
-            && matches!(
-                name,
-                "search"
-                    | "info"
-                    | "list_memories"
-                    | "board_open"
-                    | "board_list"
-                    | "board_info"
-                    | "board_post"
-                    | "board_read"
-                    | "board_get"
-                    | "board_search"
-                    | "add_memory"
-                    | "get_memory"
-                    | "delete_memory"
-            )
+            && (mcp_tools::is_flow_tool_name(name)
+                || matches!(
+                    name,
+                    "search"
+                        | "info"
+                        | "list_memories"
+                        | "board_open"
+                        | "board_list"
+                        | "board_info"
+                        | "board_post"
+                        | "board_read"
+                        | "board_get"
+                        | "board_search"
+                        | "add_memory"
+                        | "get_memory"
+                        | "delete_memory"
+                ))
         {
             return mcp_tools::call_resident_tool(
                 id,
@@ -361,6 +362,18 @@ impl GeminiMcp {
             );
         }
         match name {
+            flow_name if mcp_tools::is_flow_tool_name(flow_name) => {
+                let mut service = self.store()?;
+                let service = service.as_mut().expect("initialized");
+                mcp_tools::call_board_or_memory_tool(
+                    flow_name,
+                    id,
+                    &args,
+                    service,
+                    &self.root,
+                    self.provider.as_str(),
+                )
+            }
             "search" => {
                 let query = args
                     .get("query")
@@ -550,6 +563,7 @@ fn tool_definitions(provider_display_name: &str) -> Vec<ToolDefinition> {
     ];
     let mut tools = tools;
     tools.extend(mcp_tools::board_tool_definitions());
+    tools.extend(mcp_tools::flow_tool_definitions());
     tools.extend(mcp_tools::memory_tool_definitions());
     tools.push(mcp_tools::update_tool_definition());
     tools

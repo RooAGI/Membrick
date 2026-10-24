@@ -678,25 +678,26 @@ impl ClaudeMcp {
         }
 
         if crate::integrations::mcp_tools::resident_backend_enabled()
-            && matches!(
-                tool_name,
-                "search"
-                    | "info"
-                    | "list_memories"
-                    | "board_open"
-                    | "board_list"
-                    | "board_info"
-                    | "board_post"
-                    | "board_read"
-                    | "board_get"
-                    | "board_search"
-                    | "add_memory"
-                    | "get_memory"
-                    | "delete_memory"
-                    | "review_search"
-                    | "search_feedback"
-                    | "enrich_doc"
-            )
+            && (crate::integrations::mcp_tools::is_flow_tool_name(tool_name)
+                || matches!(
+                    tool_name,
+                    "search"
+                        | "info"
+                        | "list_memories"
+                        | "board_open"
+                        | "board_list"
+                        | "board_info"
+                        | "board_post"
+                        | "board_read"
+                        | "board_get"
+                        | "board_search"
+                        | "add_memory"
+                        | "get_memory"
+                        | "delete_memory"
+                        | "review_search"
+                        | "search_feedback"
+                        | "enrich_doc"
+                ))
         {
             return crate::integrations::mcp_tools::call_resident_tool(
                 id, &self.root, "claude", tool_name, &arguments,
@@ -964,6 +965,17 @@ impl ClaudeMcp {
                     Err(message) => Ok(error_response(id, -32602, &message)),
                 }
             }
+            name if mcp_tools::is_flow_tool_name(name) => {
+                let mut service = self.store()?;
+                mcp_tools::call_board_or_memory_tool(
+                    name,
+                    id,
+                    &arguments,
+                    service.as_mut().expect("initialized"),
+                    &self.root,
+                    "claude",
+                )
+            }
             "add_memory" | "get_memory" | "delete_memory" => {
                 let mut service = self.store()?;
                 let service = service.as_mut().expect("MCP store initialized");
@@ -1089,6 +1101,7 @@ impl ClaudeMcp {
         ]
         .into_iter()
         .chain(mcp_tools::board_tool_definitions())
+        .chain(mcp_tools::flow_tool_definitions())
         .chain(mcp_tools::memory_tool_definitions())
         .chain(std::iter::once(mcp_tools::update_tool_definition()))
         .collect()
@@ -1490,6 +1503,12 @@ mod tests {
                 "board_read".to_string(),
                 "board_get".to_string(),
                 "board_search".to_string(),
+                "flow_list".to_string(),
+                "flow_create".to_string(),
+                "flow_get".to_string(),
+                "flow_event_append".to_string(),
+                "flow_pending_actions".to_string(),
+                "flow_action_consume".to_string(),
                 "add_memory".to_string(),
                 "get_memory".to_string(),
                 "delete_memory".to_string(),
