@@ -1,6 +1,7 @@
 import { renderEventDetail, renderToolCall, toolDetail, toolGroup } from './event-detail.js';
 import { renderCaptureProgressHtml } from './capture-progress.mjs';
 import { renderSearchEvaluationHtml } from './search-evaluation.mjs';
+import { escapeHtml as esc, mergeBoardPosts, parseBoardLinkTarget } from './board-ui.mjs';
 
 const VIEWS = {
   overview: { title: 'Overview', sub: 'How the memory index is serving agents right now.' },
@@ -25,7 +26,6 @@ async function api(path) {
   return response.json();
 }
 
-const esc = value => String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'}[c]));
 const fmt = value => Number(value || 0).toLocaleString();
 const clock = value => value ? new Date(value).toLocaleTimeString() : '—';
 const pct = value => `${(Number(value || 0) * 100).toFixed(1)}%`;
@@ -822,15 +822,7 @@ function renderFlowDetail(snapshot) {
 // A link target is a board ID, a post ID (`<board_id>:post:<sequence>`), a web
 // URL, or an opaque reference. Only the target's syntax decides how it renders.
 function parseLinkTarget(target) {
-  const marker = ':post:';
-  const separator = target.lastIndexOf(marker);
-  if (separator > 0) {
-    const sequence = Number(target.slice(separator + marker.length));
-    return { kind: 'post', boardId: target.slice(0, separator), sequence: Number.isInteger(sequence) && sequence > 0 ? sequence : null };
-  }
-  if (target.startsWith('board:') || state.boards.some(board => board.board_id === target)) return { kind: 'board', boardId: target, sequence: null };
-  if (target.startsWith('https://')) return { kind: 'external', boardId: null, sequence: null };
-  return { kind: 'reference', boardId: null, sequence: null };
+  return parseBoardLinkTarget(target, state.boards.map(board => board.board_id));
 }
 
 const LINK_KIND_LABELS = { board: 'Board', post: 'Post', external: 'Web', reference: 'Ref' };
@@ -1321,9 +1313,7 @@ async function renderBoardDetail(snapshot) {
   // Keep chronological history for pagination, while also showing the newest
   // page when older history has not been loaded yet. Merge by sequence so a
   // latest-page fetch never renders duplicates.
-  const postsBySequence = new Map(loadedPosts.map(post => [post.sequence, post]));
-  for (const post of snapshot.latestPosts || []) postsBySequence.set(post.sequence, post);
-  const posts = [...postsBySequence.values()].sort((a, b) => a.sequence - b.sequence);
+  const posts = mergeBoardPosts(loadedPosts, snapshot.latestPosts || []);
   const links = renderBoardLinks(board.links || []);
   const telemetryEvents = (state.status?.integrations || [])
     .flatMap(provider => (provider.events || []).map(event => ({ ...event, provider: provider.provider })));
