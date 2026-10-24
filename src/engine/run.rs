@@ -83,11 +83,18 @@ use std::time::Instant;
 ///
 /// This is the main entry point used by the CLI wrapper in `main.rs`.
 pub fn run(args: crate::cli::Args) -> Result<()> {
-    if args.global_setup {
-        return crate::integrations::project_manager::setup_global();
+    #[cfg(feature = "agent-integrations")]
+    {
+        if args.global_setup {
+            return crate::integrations::project_manager::setup_global();
+        }
+        if args.manager_serve {
+            return crate::integrations::project_manager::run_server();
+        }
     }
-    if args.manager_serve {
-        return crate::integrations::project_manager::run_server();
+    #[cfg(not(feature = "agent-integrations"))]
+    if args.global_setup || args.manager_serve {
+        anyhow::bail!("global project manager requires agent integrations");
     }
     if let Some(command) = args.unknown_command.as_deref() {
         anyhow::bail!("unrecognized command or bare path: {command}; see `membrick --help`");

@@ -45,21 +45,21 @@ these repository files. Verify them as separate release prerequisites.
 6. Record the merged commit, tag, workflow run links, published package
    versions, and any exceptions in the release record.
 
-## v0.7.0 release candidate
+## v0.7.1 release candidate
 
-Use this section for the current 0.7.0 candidate. Version metadata and release
-notes are present in the working tree; publication is a separate step after the
+Use this section for the current 0.7.1 patch candidate. Version metadata and
+release notes are in the working tree; publication is a separate step after the
 release PR is merged and all required checks pass.
 
-- [x] Choose `0.7.0` as the compatible feature release version.
-- [x] Add `docs/releases/0.7.0.md` with user-visible changes, upgrade guidance,
+- [x] Choose `0.7.1` as the compatible patch release version.
+- [x] Add `docs/releases/0.7.1.md` with user-visible changes, upgrade guidance,
   storage compatibility, and provider setup notes.
 - [x] Align active Rust, Python, npm, native Node, platform package, OpenClaw,
   Helm, citation, Docker example, and documentation-navigation versions.
-- [ ] Confirm `v0.7.0` and all package versions are unused in GitHub Releases,
+- [ ] Confirm `v0.7.1` and all package versions are unused in GitHub Releases,
   crates.io, PyPI, npm, and the five npm platform packages immediately before
   publishing.
-- [ ] Confirm the 0.7.0 release scope, migration behavior, compatibility limits,
+- [ ] Confirm the 0.7.1 release scope, migration behavior, compatibility limits,
   and known issues against the final merged candidate.
 - [ ] Verify account-side PyPI and crates.io Trusted Publisher settings,
   repository Actions permissions, and required environments.
@@ -75,7 +75,7 @@ release PR is merged and all required checks pass.
 - [ ] Save benchmark commands and artifacts. Redact secrets and obtain consent
   before retaining external users' transcripts.
 - [ ] Review the final release diff and confirm every included change belongs
-  in 0.7.0.
+  in 0.7.1.
 
 ## In the release PR
 
@@ -85,16 +85,14 @@ release PR is merged and all required checks pass.
   adjustment, the focused test and full library suite passed (1,097 tests). A
   later all-targets run was interrupted, so this gate remains open.
 - [ ] Agent install contract and Unix and Windows installer checks pass.
-- [x] Python binding tests and a local macOS ARM64 wheel build and contents
-  check pass. Build wheels on the release runners for the other supported
-  platforms.
+- [ ] Python binding tests and wheel builds pass on supported platforms.
 - [ ] Node binding tests and native builds pass on every supported target.
 - [ ] Security audit passes, or each finding has a documented disposition.
 - [ ] Strict MkDocs documentation build and link checks pass locally; confirm
   the docs workflow on the updated PR head as well.
-- [x] Version metadata matches across release components and matches the
+- [ ] Version metadata matches across release components and matches the
   proposed `vX.Y.Z` tag.
-- [x] `cargo package --locked --list` and `cargo publish --dry-run --locked`
+- [ ] `cargo package --locked --list` and `cargo publish --dry-run --locked`
   succeed for the Rust crate.
 - [ ] Package contents include the expected CLI, native libraries, licenses,
   and metadata for each published package.

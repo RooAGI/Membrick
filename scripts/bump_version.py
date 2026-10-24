@@ -67,6 +67,10 @@ def replace_json(path: str, version: str, *, node_lock: bool = False) -> None:
             name: version if value == OLD_VERSION else value
             for name, value in root_package.get("optionalDependencies", {}).items()
         }
+        for name, package_version in root_package["optionalDependencies"].items():
+            package = data["packages"].get(f"node_modules/{name}")
+            if package is not None and package.get("version") == OLD_VERSION:
+                package["version"] = package_version
     elif path.endswith("bindings/node/package.json"):
         data["optionalDependencies"] = {
             name: version if value == OLD_VERSION else value
@@ -77,7 +81,7 @@ def replace_json(path: str, version: str, *, node_lock: bool = False) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", help="new semantic version, for example 0.7.0")
+    parser.add_argument("version", help="new semantic version, for example 0.7.1")
     args = parser.parse_args()
     if not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
         parser.error("version must use MAJOR.MINOR.PATCH format")
