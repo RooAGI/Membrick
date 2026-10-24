@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SERVER_NAME: &str = "membrick";
+const MANAGER_SERVER_NAME: &str = "membrick_manager";
 const DEFAULT_QUERY_TOP_K: usize = 5;
 const HOOK_MARKER: &str = "--claude-code-hook";
 const HOOK_EVENTS: &[(&str, &str)] = &[
@@ -72,13 +73,14 @@ struct ClaudeMcp {
     store: Mutex<Option<crate::memory_api::MemoryService>>,
 }
 
-pub fn install_user_config(root: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
+pub fn install_local_config(root: &Path, config_path: Option<&Path>) -> Result<PathBuf> {
     let config_path = match config_path {
         Some(path) => path.to_path_buf(),
         None => default_claude_config_path()?,
     };
-    // Still canonicalized, to reject a path that does not exist before writing.
-    let _root = root
+    // Claude stores local-scope MCP servers in ~/.claude.json under the
+    // canonical project path. Keep each project's launch entry independent.
+    let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", root.display()))?;
     let executable = env::current_exe()
@@ -86,20 +88,67 @@ pub fn install_user_config(root: &Path, config_path: Option<&Path>) -> Result<Pa
         .to_string_lossy()
         .into_owned();
     let mut config = read_claude_config(&config_path)?;
-    config.mcp_servers.remove("lint-ai");
-    let entry = config
-        .mcp_servers
+    let root_key = root.to_string_lossy().into_owned();
+
+    // Remove this project's previous global-style Membrick entry if it was
+    // created by an older installer. Leave entries pinned to other projects
+    // and unrelated user-scoped servers intact.
+    for server_name in [SERVER_NAME, "lint-ai"] {
+        if config
+            .mcp_servers
+            .get(server_name)
+            .is_some_and(|entry| claude_entry_targets_root(entry, &root))
+        {
+            config.mcp_servers.remove(server_name);
+        }
+    }
+
+    let projects = config
+        .extra
+        .entry("projects".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("Claude config 'projects' must be an object")?;
+    let project = projects
+        .entry(root_key)
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("Claude project config must be an object")?;
+    let servers = project
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("Claude project 'mcpServers' must be an object")?;
+    servers.remove("lint-ai");
+    let entry = servers
         .entry(SERVER_NAME.to_string())
         .or_insert_with(|| json!({}));
     let entry = entry
         .as_object_mut()
         .context("Claude MCP server entry must be a JSON object")?;
     entry.insert("command".to_string(), json!(executable));
-    // Pin the project root explicitly so the MCP server does not depend on the
-    // client's working directory (which may be the user's home directory).
+    // Pin the root explicitly so startup does not depend on Claude's cwd.
     entry.insert(
         "args".to_string(),
         json!(["--claude-code-serve", root.to_string_lossy().into_owned()]),
+    );
+    write_claude_config(&config_path, &config)?;
+    Ok(config_path)
+}
+
+/// Add the user-global setup MCP server without registering project memory.
+pub fn install_manager_config(config_path: Option<&Path>) -> Result<PathBuf> {
+    let config_path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or(default_claude_config_path()?);
+    let executable = env::current_exe()
+        .context("failed to locate Membrick executable; refusing PATH-based installation")?
+        .to_string_lossy()
+        .into_owned();
+    let mut config = read_claude_config(&config_path)?;
+    config.mcp_servers.insert(
+        MANAGER_SERVER_NAME.to_string(),
+        json!({"command": executable, "args": ["--manager-serve"]}),
     );
     write_claude_config(&config_path, &config)?;
     Ok(config_path)
@@ -147,9 +196,38 @@ pub fn uninstall(
     };
     if config_path.exists() {
         let mut config = read_claude_config(&config_path)?;
-        let removed = config.mcp_servers.remove(SERVER_NAME).is_some();
-        let removed_legacy = config.mcp_servers.remove("lint-ai").is_some();
-        if removed || removed_legacy {
+        let root_key = root.to_string_lossy().into_owned();
+        let mut removed = false;
+
+        if let Some(projects) = config
+            .extra
+            .get_mut("projects")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(project) = projects.get_mut(&root_key).and_then(Value::as_object_mut) {
+                if let Some(servers) = project.get_mut("mcpServers").and_then(Value::as_object_mut)
+                {
+                    removed |= servers.remove(SERVER_NAME).is_some();
+                    removed |= servers.remove("lint-ai").is_some();
+                    if servers.is_empty() {
+                        project.remove("mcpServers");
+                    }
+                }
+            }
+        }
+
+        // Clean up only the legacy global entries that point at this project.
+        for server_name in [SERVER_NAME, "lint-ai"] {
+            if config
+                .mcp_servers
+                .get(server_name)
+                .is_some_and(|entry| claude_entry_targets_root(entry, &root))
+            {
+                config.mcp_servers.remove(server_name);
+                removed = true;
+            }
+        }
+        if removed {
             write_claude_config(&config_path, &config)?;
         }
     }
@@ -1065,6 +1143,14 @@ fn read_claude_config(path: &Path) -> Result<ClaudeConfig> {
     Ok(serde_json::from_str(&text)?)
 }
 
+fn claude_entry_targets_root(entry: &Value, root: &Path) -> bool {
+    let Some(args) = entry.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    args.first().and_then(Value::as_str) == Some("--claude-code-serve")
+        && args.get(1).and_then(Value::as_str) == Some(root.to_string_lossy().as_ref())
+}
+
 fn write_claude_config(path: &Path, config: &ClaudeConfig) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1138,6 +1224,28 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn global_manager_config_preserves_servers_without_project_pin() {
+        let path = temp_path("claude-global-manager");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"other":{"command":"other"}},"theme":"dark"}"#,
+        )
+        .unwrap();
+        install_manager_config(Some(&path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcpServers"][MANAGER_SERVER_NAME]["args"][0],
+            "--manager-serve"
+        );
+        assert!(value["mcpServers"][MANAGER_SERVER_NAME]
+            .get("cwd")
+            .is_none());
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["mcpServers"]["other"]["command"], "other");
+        let _ = fs::remove_file(path);
+    }
+
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1208,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn install_user_config_merges_existing_servers() {
+    fn install_local_config_writes_project_local_server_and_preserves_user_servers() {
         let config_path = temp_path("claude-config");
         fs::write(
             &config_path,
@@ -1217,7 +1325,7 @@ mod tests {
         .unwrap();
         let root = env::current_dir().unwrap();
 
-        let written = install_user_config(&root, Some(&config_path)).unwrap();
+        let written = install_local_config(&root, Some(&config_path)).unwrap();
         assert_eq!(written, config_path);
 
         let parsed: ClaudeConfig =
@@ -1231,12 +1339,14 @@ mod tests {
             parsed.mcp_servers["membrick"]["env"]["KEEP"].as_str(),
             Some("yes")
         );
+        let project_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        let server = &parsed.extra["projects"][&project_key]["mcpServers"]["membrick"];
         assert_eq!(
-            parsed.mcp_servers["membrick"]["command"].as_str(),
+            server["command"].as_str(),
             Some(env::current_exe().unwrap().to_string_lossy().as_ref())
         );
         assert_eq!(
-            parsed.mcp_servers["membrick"]["args"]
+            server["args"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1248,16 +1358,35 @@ mod tests {
     }
 
     #[test]
-    fn install_user_config_pins_the_project_root() {
+    fn install_local_config_keeps_project_roots_separate() {
         let first = temp_path("claude-config-multi");
         let root_a = env::current_dir().unwrap();
-        install_user_config(&root_a, Some(&first)).unwrap();
+        install_local_config(&root_a, Some(&first)).unwrap();
         let after_a = read_claude_config(&first).unwrap();
-        install_user_config(&root_a.join("src"), Some(&first)).unwrap();
+        install_local_config(&root_a.join("src"), Some(&first)).unwrap();
         let after_b = read_claude_config(&first).unwrap();
-        assert_ne!(
-            after_a.mcp_servers["membrick"]["args"],
-            after_b.mcp_servers["membrick"]["args"]
+        let path_a = root_a
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let path_b = root_a
+            .join("src")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            after_a.extra["projects"][&path_a]["mcpServers"]["membrick"]["args"][1].as_str(),
+            Some(path_a.as_str())
+        );
+        assert_eq!(
+            after_b.extra["projects"][&path_a]["mcpServers"]["membrick"]["args"][1].as_str(),
+            Some(path_a.as_str())
+        );
+        assert_eq!(
+            after_b.extra["projects"][&path_b]["mcpServers"]["membrick"]["args"][1].as_str(),
+            Some(path_b.as_str())
         );
     }
 

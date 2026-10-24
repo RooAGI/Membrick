@@ -14,6 +14,26 @@ use std::path::{Path, PathBuf};
 const SERVER_NAME: &str = "membrick";
 const HOOK_MARKER: &str = "--agy-hook";
 const UPDATE_PERMISSION: &str = "mcp(membrick/update_membrick)";
+const MANAGER_SERVER_NAME: &str = "membrick_manager";
+
+/// Register a user-global MCP entry that only manages project integrations.
+pub fn install_manager_config(config_path: Option<&Path>) -> Result<PathBuf> {
+    let path = config_path
+        .map(Path::to_path_buf)
+        .unwrap_or(default_config_path()?);
+    let executable = env::current_exe()?;
+    let mut settings = read_json_object(&path)?;
+    let servers = settings.entry("mcpServers").or_insert_with(|| json!({}));
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("AGY mcpServers must be an object"))?;
+    servers.insert(
+        MANAGER_SERVER_NAME.into(),
+        json!({"command":executable,"args":["--manager-serve"]}),
+    );
+    write_json_object(&path, &settings)?;
+    Ok(path)
+}
 
 pub type AgyServerOptions<'a> = GeminiCliServerOptions<'a>;
 
@@ -198,6 +218,20 @@ mod tests {
             .contains("mcp_config.json"));
         assert_eq!(HOOK_MARKER, "--agy-hook");
         let _ = root;
+    }
+
+    #[test]
+    fn global_manager_config_preserves_existing_servers() {
+        let path = temp_root().join("mcp_config.json");
+        fs::write(&path, r#"{"mcpServers":{"other":{"command":"other"}}}"#).unwrap();
+        install_manager_config(Some(&path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["mcpServers"][MANAGER_SERVER_NAME]["args"][0],
+            "--manager-serve"
+        );
+        assert_eq!(value["mcpServers"]["other"]["command"], "other");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

@@ -34,6 +34,7 @@ use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
 
 const SERVER_NAME: &str = "membrick";
+const LEGACY_MANAGER_SERVER_NAME: &str = "membrick_manager";
 const DEFAULT_QUERY_TOP_K: usize = 5;
 const MCP_STARTUP_TIMEOUT_SECONDS: i64 = 120;
 const HOOK_MARKER: &str = "--codex-hook";
@@ -164,6 +165,56 @@ pub fn install_user_config(root: &Path, config_path: Option<&Path>) -> Result<Pa
 
     write_text_object(&config_path, &toml::to_string_pretty(&config)?)
         .context("failed to write Codex config")?;
+    Ok(config_path)
+}
+
+/// Register the global setup-only MCP server. It never opens a project store.
+pub fn install_manager_config(config_path: Option<&Path>) -> Result<PathBuf> {
+    let config_path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => default_codex_config_path()?,
+    };
+    let executable = env::current_exe()
+        .context("failed to locate Membrick executable; refusing PATH-based installation")?
+        .to_string_lossy()
+        .into_owned();
+    let mut config = if config_path.exists() {
+        let current = fs::read_to_string(&config_path)?;
+        if current.trim().is_empty() {
+            TomlValue::Table(TomlMap::new())
+        } else {
+            current
+                .parse::<TomlValue>()
+                .context("failed to parse Codex TOML config")?
+        }
+    } else {
+        TomlValue::Table(TomlMap::new())
+    };
+    let table = config
+        .as_table_mut()
+        .context("Codex config must be a TOML table")?;
+    let servers = table
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| TomlValue::Table(TomlMap::new()))
+        .as_table_mut()
+        .context("Codex config 'mcp_servers' must be a table")?;
+    let mut entry = TomlMap::new();
+    entry.insert("command".to_string(), TomlValue::String(executable));
+    entry.insert(
+        "args".to_string(),
+        TomlValue::Array(vec![TomlValue::String("--manager-serve".into())]),
+    );
+    entry.insert("enabled".to_string(), TomlValue::Boolean(true));
+    entry.insert(
+        "startup_timeout_sec".to_string(),
+        TomlValue::Integer(MCP_STARTUP_TIMEOUT_SECONDS),
+    );
+    // Use the same Codex server ID in both contexts. In an uninstalled
+    // project this global entry exposes setup tools; the project's pinned
+    // config overrides it with the project's memory server after install.
+    servers.remove(LEGACY_MANAGER_SERVER_NAME);
+    servers.insert(SERVER_NAME.to_string(), TomlValue::Table(entry));
+    write_text_object(&config_path, &toml::to_string_pretty(&config)?)?;
     Ok(config_path)
 }
 
@@ -1239,6 +1290,29 @@ mod tests {
         let path = temp_path(name).with_extension("");
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn global_manager_config_preserves_servers_and_has_no_project_root() {
+        let path = temp_path("codex-global-manager");
+        fs::write(
+            &path,
+            "[mcp_servers.other]\ncommand = 'other'\n\n[mcp_servers.membrick]\ncommand = 'old-memory-server'\nenabled = false\n\n[mcp_servers.membrick_manager]\ncommand = 'old-manager'\n",
+        )
+        .unwrap();
+        install_manager_config(Some(&path)).unwrap();
+        let config: TomlValue = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let manager = &config["mcp_servers"][SERVER_NAME];
+        assert_eq!(manager["args"][0].as_str(), Some("--manager-serve"));
+        assert_eq!(manager["enabled"].as_bool(), Some(true));
+        assert!(manager.get("cwd").is_none());
+        assert!(config["mcp_servers"]
+            .as_table()
+            .unwrap()
+            .get(LEGACY_MANAGER_SERVER_NAME)
+            .is_none());
+        assert!(config["mcp_servers"]["other"].is_table());
+        let _ = fs::remove_file(path);
     }
 
     fn test_mcp(root: PathBuf, documents: Vec<SourceDocument>) -> CodexMcp {
