@@ -25,6 +25,11 @@ membrick install claude .
 
 This enables Claude Code to use Membrick in the project. It configures the MCP connection and hooks, installs the project memory skill, and preserves your other Claude Code settings.
 
+The MCP server is stored in Claude Code's local scope in `~/.claude.json`,
+under this project's canonical path. It is private to this user and does not
+change the MCP server used by other projects. Membrick's project behavior is
+controlled by `.membrick/server.toml`; Claude's config only launches Membrick.
+
 On Windows, run this in PowerShell from the project folder (adjust the path if
 you saved the executable elsewhere):
 
@@ -61,7 +66,7 @@ From the project directory, run:
 membrick uninstall claude .
 ```
 
-This removes the Membrick MCP entry and hook commands from Claude's config,
+This removes this project's local Membrick MCP entry and managed hook commands from Claude's config,
 plus the generated project memory skill when it has not been edited. Customized
 skills are kept. Other settings, `.membrick` data, and the executable remain.
 Restart Claude Code to reload its settings.

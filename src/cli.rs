@@ -150,6 +150,12 @@ pub struct Args {
     /// Skip the interactive release update check for this invocation.
     #[arg(long)]
     pub no_update_check: bool,
+    /// Install the user-global project manager for available agent clients.
+    #[arg(long, hide = true)]
+    pub global_setup: bool,
+    /// Serve the project-management-only MCP endpoint.
+    #[arg(long, hide = true)]
+    pub manager_serve: bool,
     #[arg(default_value = ".", hide = true)]
     pub path: String,
     #[arg(long, hide = true)]
@@ -521,6 +527,15 @@ pub fn parse() -> Args {
 fn normalize_provider_command(args: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut args: Vec<String> = args.into_iter().collect();
     normalize_project_command(&mut args);
+    if args.len() == 1 {
+        args.push("--global-setup".to_string());
+        return args;
+    }
+    if args.len() == 2 && args[1] == "setup" {
+        args.truncate(1);
+        args.push("--global-setup".to_string());
+        return args;
+    }
     if args.len() >= 2
         && matches!(
             args[1].as_str(),
@@ -801,12 +816,25 @@ fn replace_switch(args: &mut [String], from: &str, to: &str) {
 /// Run the CLI: parse args from the environment and execute.
 pub fn run() -> anyhow::Result<()> {
     if std::env::args_os().nth(1).is_none() {
-        Args::command().print_help()?;
-        println!();
-        return Ok(());
+        #[cfg(any(feature = "claude-code", feature = "codex", feature = "agy"))]
+        {
+            crate::integrations::project_manager::setup_global()?;
+            print_cli_help()?;
+            return Ok(());
+        }
+        #[cfg(not(any(feature = "claude-code", feature = "codex", feature = "agy")))]
+        {
+            return print_cli_help();
+        }
     }
     let args = parse();
     crate::engine::run(args)
+}
+
+fn print_cli_help() -> anyhow::Result<()> {
+    Args::command().print_help()?;
+    println!();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -881,6 +909,39 @@ mod tests {
     fn bare_project_path_is_rejected_instead_of_starting_a_scan() {
         let args = parse_public_args(&["."]).expect("bare paths are parsed as an explicit error");
         assert_eq!(args.unknown_command.as_deref(), Some("."));
+    }
+
+    #[test]
+    fn setup_without_provider_selects_global_manager_setup() {
+        let args =
+            parse_public_args(&[]).expect("running membrick without arguments sets up the manager");
+        assert!(args.global_setup);
+
+        let args = parse_public_args(&["setup"]).expect("bare setup is supported");
+        assert!(args.global_setup);
+
+        let args = parse_public_args(&["setup", "claude", "."]).expect("provider setup parses");
+        assert!(args.claude_code_install);
+        assert!(!args.global_setup);
+    }
+
+    #[test]
+    fn cli_help_lists_public_commands_and_options() {
+        let mut output = Vec::new();
+        Args::command()
+            .write_help(&mut output)
+            .expect("CLI help renders");
+        let output = String::from_utf8(output).expect("help is UTF-8");
+        for expected in [
+            "--no-update-check",
+            "membrick status [PATH]",
+            "membrick index [PATH]",
+            "membrick query <TEXT>",
+            "membrick install <provider> [PATH]",
+            "membrick verify <provider> [PATH]",
+        ] {
+            assert!(output.contains(expected), "CLI help is missing {expected}");
+        }
     }
 
     #[test]

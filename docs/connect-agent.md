@@ -5,6 +5,13 @@ Install it once for a project and the agent can look up earlier decisions and
 save useful outcomes as it works. Memories from connected agents are kept in
 the project's `.membrick/memory` folder.
 
+For a one-time user-level setup, run `membrick` after installing the executable.
+This adds a small project manager MCP to the available Codex, Claude Code, and
+AGY user configs. It can list registered projects and install or remove
+Codex/Claude project integrations. It does not receive project memory access.
+To add the current project directly from a terminal, use
+`membrick install codex .` or `membrick install claude .`.
+
 ## Choose your agent
 
 | Agent | Setup |

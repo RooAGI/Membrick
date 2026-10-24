@@ -24,7 +24,7 @@ use crate::integrations::agy::{
 use crate::integrations::claude_code::hooks::{run_hook, ClaudeHookKind};
 #[cfg(feature = "claude-code")]
 use crate::integrations::claude_code::{
-    install_hook_settings, install_memory_skill, install_user_config, run_server, run_status_line,
+    install_hook_settings, install_local_config, install_memory_skill, run_server, run_status_line,
     uninstall as uninstall_claude, ClaudeCodeServerOptions,
 };
 #[cfg(feature = "codex")]
@@ -83,6 +83,19 @@ use std::time::Instant;
 ///
 /// This is the main entry point used by the CLI wrapper in `main.rs`.
 pub fn run(args: crate::cli::Args) -> Result<()> {
+    #[cfg(feature = "agent-integrations")]
+    {
+        if args.global_setup {
+            return crate::integrations::project_manager::setup_global();
+        }
+        if args.manager_serve {
+            return crate::integrations::project_manager::run_server();
+        }
+    }
+    #[cfg(not(feature = "agent-integrations"))]
+    if args.global_setup || args.manager_serve {
+        anyhow::bail!("global project manager requires agent integrations");
+    }
     if let Some(command) = args.unknown_command.as_deref() {
         anyhow::bail!("unrecognized command or bare path: {command}; see `membrick --help`");
     }
@@ -454,6 +467,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             args.claude_code_config.as_deref().map(Path::new),
             args.claude_code_settings.as_deref().map(Path::new),
         )?;
+        crate::integrations::project_registry::unregister(Path::new(&args.path), "claude")?;
         println!("Removed the Claude Code Membrick integration. Project memory data and the Membrick executable were kept.");
         return Ok(());
     }
@@ -465,6 +479,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             args.codex_config.as_deref().map(Path::new),
             args.codex_settings.as_deref().map(Path::new),
         )?;
+        crate::integrations::project_registry::unregister(Path::new(&args.path), "codex")?;
         println!("Removed the Codex Membrick integration. Project memory data and the Membrick executable were kept.");
         return Ok(());
     }
@@ -479,11 +494,15 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         let written = install_memory_skill(Path::new(&args.path))?;
         println!("Wrote Claude Code memory skill to {}", written.display());
         let config_path = args.claude_code_config.as_deref().map(Path::new);
-        let written = install_user_config(Path::new(&args.path), config_path)?;
-        println!("Wrote Claude Code config to {}", written.display());
+        let written = install_local_config(Path::new(&args.path), config_path)?;
+        println!(
+            "Wrote Claude Code project-local MCP config to {}",
+            written.display()
+        );
         let settings_path = args.claude_code_settings.as_deref().map(Path::new);
         let written = install_hook_settings(Path::new(&args.path), settings_path)?;
         println!("Wrote Claude Code hook settings to {}", written.display());
+        crate::integrations::project_registry::register(Path::new(&args.path), "claude")?;
         return Ok(());
     }
 
@@ -504,6 +523,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         println!("Wrote Codex hook settings to {}", written.display());
         let written = install_codex_memory_policy(Path::new(&args.path))?;
         println!("Wrote Codex memory policy to {}", written.display());
+        crate::integrations::project_registry::register(Path::new(&args.path), "codex")?;
         return Ok(());
     }
 

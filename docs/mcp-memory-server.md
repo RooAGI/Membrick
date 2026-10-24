@@ -58,12 +58,16 @@ The memory behind these tools is the real thing, not a demo: the project's repla
 Each agent adapter exposes a provider-local MCP server over the host client's configured MCP transport. The installers wire it up automatically:
 
 ```bash
-# Claude Code: merges the MCP server entry into ~/.claude.json
+# Claude Code: adds a local-scope entry under this project's path in ~/.claude.json
 ./membrick install claude /path/to/project
 
-# Codex: merges mcp_servers.membrick into ~/.codex/config.toml
+# Codex: adds a project MCP entry to /path/to/project/.codex/config.toml
 ./membrick install codex /path/to/project
 ```
+
+Both provider entries launch Membrick against the selected project. Membrick
+loads project behavior from `.membrick/server.toml`; provider configuration
+only connects the host client to the local MCP process.
 
 Or run a server directly — for example, to point any MCP-capable client at it:
 

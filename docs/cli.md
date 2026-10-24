@@ -1,7 +1,21 @@
 # Command line
 
-Running `membrick` with no arguments displays help. Choose an explicit command
-to inspect or process a project. A folder path by itself does not start a scan.
+Running `membrick` with no arguments installs the global project manager MCP
+for the compiled Codex, Claude Code, and AGY integrations, then displays the
+CLI help. Restart those agents after setup. A folder path by itself does not
+start a scan.
+
+In Codex, the global `membrick` MCP entry exposes project-management tools in
+projects without a Membrick installation. The installed project's local
+config overrides that entry with the project-scoped memory server. The global
+manager can list installed projects, check project status, and install or
+remove Membrick for an explicit Codex or Claude Code project. It does not
+expose project memory tools. To enable project memory, run
+`membrick install codex PATH` or `membrick install claude PATH` from a terminal
+or ask the global manager to install it for that project. Installations are
+recorded in the user's Membrick config directory at
+`membrick/installed-projects.json`; uninstall removes only that provider's
+registration and leaves project memory data in place.
 
 ## Project commands
 

@@ -63,6 +63,8 @@ pub mod mcp_health;
 pub(crate) use crate::memory_api::workspace as mcp_index;
 pub mod mcp_tools;
 pub mod mcp_transport;
+pub(crate) mod project_manager;
+pub(crate) mod project_registry;
 pub mod recall;
 pub mod session_recording;
 
