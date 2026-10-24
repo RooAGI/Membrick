@@ -28,7 +28,9 @@ Installations made by the official installer check for updates once per day
 when you run Membrick interactively. Membrick asks before downloading and
 replacing its executable. MCP and hook processes do not check for updates.
 Pass `--no-update-check` to skip the check for one invocation. Binaries
-installed with Cargo or a package manager should be updated with that tool.
+installed with Cargo or a package manager should be updated with that tool. See
+[Updating Membrick](update-notifications.md) for update steps by installation
+method.
 
 On Windows, download `membrick-windows-x86_64.exe` from the releases page. In
 PowerShell, run it from the download folder; in the commands below, use
@@ -99,6 +101,8 @@ memory.
 Membrick connects to Codex, Claude Code, Gemini CLI, Antigravity CLI, OpenClaw,
 Hermes, Muse Code, and RooAGI AgentFlow. Choose your agent in the
 [agent setup guide](connect-agent.md) for the right installation steps.
+Already using Lint-AI? Follow the [migration guide](connect-agent.md#migrate-from-lint-ai)
+to switch your agent configuration to Membrick.
 
 ## More ways to use Membrick
 
