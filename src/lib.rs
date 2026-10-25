@@ -108,6 +108,7 @@ mod question_focus;
 mod reasoning_rules;
 mod report;
 #[cfg(feature = "experimental")]
+#[path = "code_review.rs"]
 mod review;
 mod rules;
 mod semantic_tags;

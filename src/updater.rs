@@ -221,7 +221,7 @@ pub(crate) fn install_cached_update(expected_version: &str) -> anyhow::Result<St
     }
 
     Ok(format!(
-        "Updated Membrick from {current} to {latest}. Restart the agent client to reconnect using the new version."
+        "Updated Membrick from {current} to {latest}. Fully quit Codex, Claude, or AGY, then reopen it to reconnect using the new version."
     ))
 }
 

@@ -23,3 +23,11 @@ supported workflow and let it manage PyO3 extension linker settings.
 
 In written responses, avoid `---` separators and keep punctuation and phrasing
 simple.
+
+## Rust source naming
+
+Do not introduce new production Rust modules with a basename already used by a
+module in another directory under `src/`. Use a descriptive filename that
+identifies the module's role. Existing duplicate basenames may remain unless
+the affected code is being refactored. Conventional `mod.rs` and `tests.rs`
+files are exempt.
