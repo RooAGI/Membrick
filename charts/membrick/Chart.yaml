@@ -2,8 +2,8 @@ apiVersion: v2
 name: membrick
 description: Persistent memory service for AI agents
 type: application
-version: 0.7.2
-appVersion: "0.7.2"
+version: 0.7.3
+appVersion: "0.7.3"
 home: https://www.rooagi.com
 sources:
   - https://github.com/RooAGI/Membrick

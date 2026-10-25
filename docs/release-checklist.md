@@ -45,21 +45,21 @@ these repository files. Verify them as separate release prerequisites.
 6. Record the merged commit, tag, workflow run links, published package
    versions, and any exceptions in the release record.
 
-## v0.7.2 release candidate
+## v0.7.3 release candidate
 
-Use this section for the current 0.7.2 patch candidate. Version metadata and
+Use this section for the current 0.7.3 patch candidate. Version metadata and
 release notes are in the working tree; publication is a separate step after the
 release PR is merged and all required checks pass.
 
-- [x] Choose `0.7.2` as the compatible patch release version.
-- [x] Add `docs/releases/0.7.2.md` with user-visible changes, upgrade guidance,
+- [x] Choose `0.7.3` as the compatible patch release version.
+- [x] Add `docs/releases/0.7.3.md` with user-visible changes, upgrade guidance,
   and storage compatibility.
-- [x] Align active Rust, Python, npm, native Node, platform package, OpenClaw,
+- [ ] Align active Rust, Python, npm, native Node, platform package, OpenClaw,
   Helm, citation, Docker example, and documentation-navigation versions.
-- [ ] Confirm `v0.7.2` and all package versions are unused in GitHub Releases,
+- [ ] Confirm `v0.7.3` and all package versions are unused in GitHub Releases,
   crates.io, PyPI, npm, and the five npm platform packages immediately before
   publishing.
-- [ ] Confirm the 0.7.2 release scope, migration behavior, compatibility limits,
+- [ ] Confirm the 0.7.3 release scope, migration behavior, compatibility limits,
   and known issues against the final merged candidate.
 - [ ] Verify account-side PyPI and crates.io Trusted Publisher settings,
   repository Actions permissions, and required environments.
@@ -75,7 +75,7 @@ release PR is merged and all required checks pass.
 - [ ] Save benchmark commands and artifacts. Redact secrets and obtain consent
   before retaining external users' transcripts.
 - [ ] Review the final release diff and confirm every included change belongs
-  in 0.7.2.
+  in 0.7.3.
 
 ## In the release PR
 
