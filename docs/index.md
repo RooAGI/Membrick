@@ -8,77 +8,43 @@ hide:
 <section class="hero">
   <div class="hero__eyebrow">THE MEMORY LAYER FOR AI AGENTS</div>
   <h1>Give your AI a memory that lasts.</h1>
-  <p class="hero__lede"><strong>Context that persists. Built for production.</strong> Membrick helps an assistant remember useful preferences, decisions, and history across interactions, then brings the right context back when it matters.</p>
-  <p><a class="md-button md-button--primary" href="quickstart/">Get started</a> <a class="md-button" href="cli/">CLI reference</a> <a class="md-button" href="agent-memory/">Explore agent memory</a></p>
+  <p class="hero__lede"><strong>8 agent harnesses, 1 shared project memory.</strong><br><strong>No embedding, database, or server setup.</strong><br><strong>75% fewer token usage.</strong></p>
+  <p><a class="md-button md-button--primary" href="quickstart/">Get started</a> <a class="md-button" href="cli/">CLI reference</a> <a class="md-button" href="agent-memory/">Explore agent memory</a> <a class="md-button" href="faq/">Questions &amp; Answers</a></p>
 </section>
 </div>
 
-## From one conversation to a lasting relationship {.landing-heading}
+<section class="why-membrick" aria-labelledby="why-membrick-title">
+  <header class="why-membrick__heading">
+    <p class="why-membrick__eyebrow">WHY MEMBRICK</p>
+    <h2 id="why-membrick-title">Memory that knows what’s still true.</h2>
+    <p>Find relevant context, track changes, and see the evidence behind it.</p>
+  </header>
 
-On its own, an AI model only has the context it can see right now. Membrick adds
-a memory that stays between conversations. As an agent saves new information or
-feedback, that memory can be updated and used in future interactions. The model
-does not need to be retrained; it gets better context to work with.
+  <div class="memory-comparison-scroll" role="region" aria-label="Ordinary retrieval compared with Membrick" tabindex="0">
+    <table class="memory-comparison">
+      <thead>
+        <tr><th scope="col">Ordinary retrieval</th><th scope="col">Membrick</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Finds topically similar text</td><td>Ranks relevant and current evidence</td></tr>
+        <tr><td>Can surface stale decisions as if they are current</td><td>Tracks time and supersession</td></tr>
+        <tr><td>Treats relative time as mostly query text</td><td>Resolves temporal intent against a reference clock</td></tr>
+        <tr><td>Returns passages</td><td>Returns context with source and relationship evidence</td></tr>
+        <tr><td>Treats documents mostly in isolation</td><td>Connects facts, entities, links, symbols, ownership, and time</td></tr>
+        <tr><td>Leaves corpus drift hidden</td><td>Surfaces contradictions, stale claims, terminology drift, orphan pages, and missing links</td></tr>
+      </tbody>
+    </table>
+  </div>
 
-<div class="feature-grid">
-  <article>
-    <span class="feature-number">01</span>
-    <h3>Remember the person and the work</h3>
-    <p>Carry useful preferences, ongoing tasks, and past decisions from one
-    interaction to the next. Your assistant can pick up where you left off
-    instead of asking you to start over.</p>
-  </article>
-  <article>
-    <span class="feature-number">02</span>
-    <h3>Learn from what changes</h3>
-    <p>When new information or feedback updates a memory, future conversations
-    can use it. Membrick keeps the earlier history too, so an old answer does not
-    quietly become the current one.</p>
-  </article>
-  <article>
-    <span class="feature-number">03</span>
-    <h3>Add memory without building it all yourself</h3>
-    <p>Membrick handles saving, updating, and finding memories through one
-    persistent service. Use the integrations and APIs to add memory to an agent
-    without building a separate memory system from scratch.</p>
-  </article>
-  <article>
-    <span class="feature-number">04</span>
-    <h3>Coordinate work on shared boards</h3>
-    <p>Give agents a durable place to post progress, hand off tasks, and link
-    related plans and evidence. Follow the work in order from the dashboard.</p>
-    <p><a href="boards/">Explore agent boards →</a></p>
-  </article>
-</div>
+  <aside class="memory-history-note">
+    <span aria-hidden="true">↺</span>
+    <p><strong>History stays available.</strong> A historical query can still
+    retrieve superseded information as history rather than presenting it as
+    current state.</p>
+  </aside>
+</section>
 
-## What lasting memory makes possible {.landing-heading}
-
-Connect Membrick to the experience you are building:
-
-<div class="feature-grid">
-  <article>
-    <h3>AI assistants</h3>
-    <p>Remember preferences and past conversations to make each new interaction
-    feel more personal and consistent.</p>
-  </article>
-  <article>
-    <h3>Customer support</h3>
-    <p>Bring relevant case history and past resolutions into the next support
-    conversation, so people do not have to repeat themselves.</p>
-  </article>
-  <article>
-    <h3>Autonomous systems</h3>
-    <p>Carry goals, task progress, and previous outcomes across runs, so an agent
-    can continue work with the state it has already built.</p>
-  </article>
-</div>
-
-The same memory layer can support productivity tools and other applications
-that benefit from remembering user preferences and past activity. Connect these
-applications through the [HTTP API](server.md), [MCP](mcp.md),
-[Python](python-migration-0.3.0.md), or [Rust](memory-service-api.md) interface.
-
-## Memory where your agents already work {.landing-heading}
+## Supported Agent Harnesses {.landing-heading}
 
 Use the same project memory inside supported agent tools. Information captured
 in one can be available to the others, so people can keep using the tools they
@@ -91,7 +57,7 @@ already know.
   <a href="agents/"><strong>More integrations</strong><span>AGY, Muse Code, OpenClaw, Hermes, and RooAGI AgentFlow →</span></a>
 </div>
 
-## Built for dependable use {.landing-heading}
+## Build for production {.landing-heading}
 
 Membrick keeps memory in a persistent store and provides a shared service for
 agents and applications. It supports user and session scoping, durable writes,
@@ -101,21 +67,17 @@ you inspect memory and agent activity. Bundled Rust integrations communicate
 with their resident memory owner over local IPC; see the
 [transport architecture](local-ipc-architecture.md).
 
-<h3>Benchmark highlights</h3>
-
 <!-- BEGIN GENERATED LONGMEMEVAL-S 500-QUESTION HEADLINE -->
-<p><strong>Latest LongMemEval-S result · 500 questions · 2026-10-16</strong></p>
-<section class="proof-grid proof-grid--five" aria-label="Latest LongMemEval-S benchmark results">
+<section class="proof-grid proof-grid--six" aria-label="Membrick production results">
+  <div><strong>79%</strong><span>fewer tokens · Claude Code</span></div>
   <div><strong>89.78%</strong><span>fractional Recall@5</span></div>
   <div><strong>98.8%</strong><span>any-hit Recall@10</span></div>
   <div><strong>88.85%</strong><span>MRR</span></div>
   <div><strong>87.91%</strong><span>NDCG@10</span></div>
   <div><strong>3.48 ms</strong><span>mean search time</span></div>
 </section>
-<p class="benchmark-note">Single index · heuristic NER · structured-fact retrieval · no embeddings. <a href="benchmark-results/">Methods and report</a> · <a href="https://github.com/RooAGI/Membrick/blob/main/comparison/results/retrieval-longmemeval-500-2026-10-16-v0.6.1-32abbd6.json">Raw JSON</a>.</p>
+<p class="benchmark-note">LongMemEval-S · 500 questions · 2026-10-16 · <a href="benchmark-results/">Methods</a> · <a href="performance/">Agent performance</a>.</p>
 <!-- END GENERATED LONGMEMEVAL-S 500-QUESTION HEADLINE -->
-
-<p class="benchmark-note">Agent integration results and their limits are listed on the <a href="performance/">Performance page</a>. The latest Claude comparison covers three repetitions of one scenario in each of three arms; it reports a 75% drop in fresh input tokens, a 79.0% to 79.6% drop in overall tokens, and a 16.0% to 18.5% drop in overall tokens per fresh input token. This is diagnostic evidence for that fixture and scenario, not a general performance claim.</p>
 
 <section class="final-cta">
   <p>Context that persists.</p>

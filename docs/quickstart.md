@@ -4,46 +4,112 @@ Download Membrick, save a few things you want your assistant to remember, and
 ask questions in plain language. You do not need to build the project or learn
 special memory syntax.
 
-## 1. Download Membrick
+## 1. Download or Update Membrick
 
-Get the latest published version from the
-[Membrick releases page](https://github.com/RooAGI/Membrick/releases/latest).
-Choose the download for your computer:
+### Install Membrick
 
-| Computer | Release download |
-|---|---|
-| Mac with Apple silicon | `membrick-macos-aarch64` |
-| Mac with Intel | `membrick-macos-x86_64` |
-| Linux, 64-bit | `membrick-linux-x86_64` |
-| Windows, 64-bit | `membrick-windows-x86_64.exe` |
+#### macOS or Linux: official installer
 
-On macOS or Linux, you can instead run the installer, which downloads the
-official release and checks its SHA-256 checksum:
+The installer downloads the release for your computer and verifies its
+SHA-256 checksum:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh
 ```
 
-Installations made by the official installer check for updates once per day
-when you run Membrick interactively. Membrick asks before downloading and
-replacing its executable. MCP and hook processes do not check for updates.
-Pass `--no-update-check` to skip the check for one invocation. Binaries
-installed with Cargo or a package manager should be updated with that tool. See
-[Updating Membrick](update-notifications.md) for update steps by installation
-method.
+#### Windows: standalone executable
 
-On Windows, download `membrick-windows-x86_64.exe` from the releases page. In
-PowerShell, run it from the download folder; in the commands below, use
-`.\membrick-windows-x86_64.exe` instead of `membrick`. You can create, edit, and
-remove memory files with Notepad or File Explorer.
+Download `membrick-windows-x86_64.exe` from the [Membrick releases
+page](https://github.com/RooAGI/Membrick/releases/latest). Run it from the
+download folder in PowerShell. To check the version, run:
 
-Open a new terminal if needed, then confirm it is ready:
+```powershell
+.\membrick-windows-x86_64.exe --version
+```
+
+#### npm
+
+```bash
+npm install --global membrick
+```
+
+For a Node.js project, install it locally with `npm install membrick`.
+
+#### Python
+
+For an isolated CLI installation, use `pipx`:
+
+```bash
+pipx install membrick
+```
+
+To add the package to an active Python environment, use
+`python -m pip install membrick` instead. The package also provides the Python
+memory API.
+
+#### Rust and Cargo
+
+```bash
+cargo install membrick --locked
+```
+
+The npm package also provides the Node.js memory API.
+
+### Update Membrick
+
+Use the update command that matches how you installed Membrick. You can also
+approve the `update_membrick` action in your connected agent, if it is
+available.
+
+| Installed with | Update command |
+|---|---|
+| Official installer (macOS or Linux) | Rerun the official installer command above. |
+| Standalone Windows executable | Download the latest `.exe` from the [releases page](https://github.com/RooAGI/Membrick/releases/latest) and replace the old executable. |
+| npm global | `npm update -g membrick` |
+| npm in a project | `npm update membrick` in that project |
+| pipx | `pipx upgrade membrick` |
+| pip | `python -m pip install --upgrade membrick` |
+| Cargo | `cargo install membrick --locked --force` |
+
+Installations made with the official installer check for updates once per day
+when you run Membrick interactively and ask before downloading and replacing
+the executable. Add `--no-update-check` to skip the check for one invocation.
+MCP and hook processes do not check for updates automatically.
+
+After installation or update, open a new terminal and check the installed
+version. On Windows, use the standalone executable command shown above.
 
 ```bash
 membrick --version
 ```
 
-## 2. Add something to remember
+After updating, fully quit and reopen Codex, Claude Code, or the agent client
+you use. This reconnects its MCP server to the updated Membrick. For details
+about update notices and approval, see
+[Update notifications](update-notifications.md).
+
+## 2. Migrate from Lint-AI
+
+If you already use Lint-AI in a project, this command installs Membrick and
+switches the selected agent's connection while preserving unrelated settings.
+Run it from the project directory. For example, to migrate Codex:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/migrate-lint-ai.sh | sh -s -- --agent codex --project .
+```
+
+Replace `codex` with `claude`, `gemini`, or `agy` to migrate another supported
+agent. The migration preserves existing project data under `.membrick`. When
+both `.lint-ai` and `.membrick` exist, non-conflicting files are merged and
+conflicting legacy files are kept in `.membrick/migration-archive`. The
+project-root `.lint-ai` directory is removed after migration. The old
+`lint-ai` executable remains installed; remove it with its package manager
+after confirming Membrick works.
+
+Fully quit and reopen the agent. Check its MCP list for `membrick`, then call
+a Membrick tool such as `membrick_status` to confirm the connection works.
+
+## 3. Add something to remember
 
 Create a folder for your memories. Save each thing you want to remember in a
 plain text or Markdown file. Write naturally; Membrick searches the words and
@@ -61,7 +127,7 @@ You can add another memory by creating another file or editing an existing one.
 These files stay on your computer unless you choose to connect them to another
 service.
 
-## 3. Ask a question
+## 4. Ask a question
 
 Ask Membrick a question about the memories in that folder:
 
@@ -83,7 +149,7 @@ To see which indexes already exist in the current project, run
 `membrick status .`. This only inspects existing index stores; it does not scan
 project files.
 
-## 4. Change or forget a memory
+## 5. Change or forget a memory
 
 Edit a file to change what it says. Run your question again to search the
 updated memory. To forget a memory, remove its file:
@@ -101,8 +167,8 @@ memory.
 Membrick connects to Codex, Claude Code, Gemini CLI, Antigravity CLI, OpenClaw,
 Hermes, Muse Code, and RooAGI AgentFlow. Choose your agent in the
 [agent setup guide](connect-agent.md) for the right installation steps.
-Already using Lint-AI? Follow the [migration guide](connect-agent.md#migrate-from-lint-ai)
-to switch your agent configuration to Membrick.
+Already using Lint-AI? See [Migrate from Lint-AI](#2-migrate-from-lint-ai)
+above to switch your agent configuration and project data to Membrick.
 
 ## More ways to use Membrick
 
