@@ -14,7 +14,7 @@ FlowRun and board APIs. It does not add an MCP server or change tool handlers.
 4. AgentFlow exposes the workflow tools and coordinates the run. Membrick
    stores the canonical FlowRun record, boards, and posts; its dashboard reads
    those same records. A provider runtime owns its own execution/checkpoint
-   state and correlates it to the FlowRun/task IDs.
+   state and correlates it to the FlowRun and board post IDs.
 
 AgentFlow owns template authoring, publishing, immutable versions, and
 resolution. Its catalog resolver returns the exact `flow_template`

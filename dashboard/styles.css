@@ -1187,21 +1187,19 @@ button.board-link { padding: 0; border: 0; background: transparent; cursor: poin
 .flow-reference { display: inline-flex; align-items: center; gap: 7px; padding: 6px 9px; border: 1px solid var(--line-soft); border-radius: 7px; background: var(--surface-2); }
 .flow-reference > small { color: var(--muted); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
 .flow-reference .mono { color: var(--text-2); font-size: 10px; overflow-wrap: anywhere; }
-.flow-tasks { display: grid; gap: 8px; }
-.flow-task { padding: 12px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--surface-2); }
-.flow-task__head, .flow-event__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-.flow-task__head h3 { font-size: 12px; overflow-wrap: anywhere; }
-.flow-task__meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
-.flow-task__meta > span { display: grid; gap: 3px; color: var(--text-2); font-size: 10px; overflow-wrap: anywhere; }
-.flow-task__meta small, .flow-evidence > small { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
-.flow-task__summary, .flow-task__blocker, .flow-task__review { margin-top: 9px; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
-.flow-task__blocker strong { color: var(--warn-ink); }
-.flow-task__review strong { color: var(--info-ink); }
-.flow-task__posts, .flow-event__post { display: grid; justify-items: start; gap: 5px; margin-top: 10px; }
-.flow-task__posts > small, .flow-event__post > small { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
-.flow-task__posts .board-link, .flow-event__post .board-link { max-width: 100%; text-align: left; white-space: normal; overflow-wrap: anywhere; }
-.flow-evidence { display: grid; gap: 5px; margin-top: 10px; }
-.flow-evidence > span { padding: 5px 7px; border: 1px solid var(--line-soft); border-radius: 5px; color: var(--text-2); font: 10px var(--mono); overflow-wrap: anywhere; }
+.flow-work-posts { display: grid; gap: 8px; }
+.flow-work-post { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--surface-2); }
+.flow-work-post__head, .flow-event__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.flow-work-post__head h4 { font-size: 12px; overflow-wrap: anywhere; }
+.flow-work-post > p { color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.flow-work-post > dl { display: grid; gap: 6px; margin: 0; }
+.flow-work-post > dl > div { display: grid; grid-template-columns: minmax(110px, .24fr) 1fr; gap: 10px; }
+.flow-work-post dt { color: var(--muted); text-transform: capitalize; }
+.flow-work-post dd { margin: 0; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.flow-work-post__status { padding: 4px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--text-2); font: 10px var(--mono); white-space: nowrap; }
+.flow-event__post { display: grid; justify-items: start; gap: 5px; margin-top: 10px; }
+.flow-event__post > small { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }
+.flow-event__post .board-link { max-width: 100%; text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .flow-timeline { display: grid; gap: 8px; }
 .flow-event { padding: 11px; border: 1px solid var(--line-soft); border-radius: 8px; background: var(--surface-2); }
 .flow-event__head > div { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
@@ -1321,7 +1319,7 @@ button.board-link { padding: 0; border: 0; background: transparent; cursor: poin
   .board-history__head { align-items: flex-start; flex-direction: column; gap: 8px; }
   .board-detail__head { gap: 10px; }
   .board-detail__badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-  .board-detail__head, .board-post__head, .flow-detail__head, .flow-task__head, .flow-event__head { flex-direction: column; }
+  .board-detail__head, .board-post__head, .flow-detail__head, .flow-work-post__head, .flow-event__head { flex-direction: column; }
   .board-post__head time { white-space: normal; }
   .board-source-label { white-space: normal; }
   .board-post__fields dl > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
@@ -1332,6 +1330,5 @@ button.board-link { padding: 0; border: 0; background: transparent; cursor: poin
   .template-section { padding: 11px; }
   .template-reference-grid { grid-template-columns: minmax(0, 1fr); }
   .flow-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .flow-task__meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .flow-event__data dl > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .flow-work-post > dl > div, .flow-event__data dl > div { grid-template-columns: minmax(0, 1fr); gap: 2px; }
 }

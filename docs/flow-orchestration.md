@@ -6,21 +6,22 @@ description: A provider-neutral contract for coordinating agent work across boar
 # Agent orchestration with Flows
 
 Flows provide a durable, provider-neutral contract for coordinating work across
-agents. A Flow connects a versioned process definition to the project boards,
-task posts, progress reports, reviews, and evidence produced during one effort.
-It gives participating agents a shared view of the work while allowing any
-connected agent to coordinate.
+agents. A Flow connects a versioned process definition to its project board,
+work posts, reports, reviews, and evidence. Those posts are the work items
+assigned to subagents; FlowRuns track the current stage and its handoffs.
 
 ## FlowTemplate and Flow
 
 A **FlowTemplate** is an immutable, versioned definition of a process owned and
 published by AgentFlow. It describes generic stages and allowed transitions,
-review gates, coordinator policy, and a retry bound. Tasks are board posts
-validated and rendered using the BoardTemplate's pinned PostTemplates; their
-status and task-specific fields live on those posts. Templates do not contain
+review gates, coordinator policy, and a retry bound. Work posts are validated
+and rendered using the BoardTemplate's pinned PostTemplates; status and
+work-specific fields live on those posts. Templates do not contain
 provider-specific commands or launch agents. Membrick does not author, publish,
 list, or resolve FlowTemplates. AgentFlow supplies the exact immutable
-FlowTemplate snapshot when creating a run.
+FlowTemplate snapshot to `flow_create`; that call creates and pins the FlowRun
+directly, beginning at the template's first stage. There is no separate
+FlowTemplate-instance creation step.
 
 Stages describe work only. Completion, failure, and cancellation are Flow run
 states, not extra stages or template handoff events. A `stage_changed` event
@@ -33,28 +34,29 @@ timeout failures with `flow_failed` and a reason; `cancelled` is reserved for
 an explicit cancellation decision. Invalid stage graphs are rejected before a
 run starts.
 
-A **Flow** (also called a flow run) is one execution of a template version. It
-has a stable ID, a goal, a current revision and projected state, and references
-to the project, planning, task, and milestone boards and posts associated with
-the work. A Flow's event history is append-only. Each accepted event and its
-updated current projection are persisted together, so readers can query current
-state without replaying the full timeline. Corrections add events rather than
-rewriting earlier reports.
+A **FlowRun** is one execution of a FlowTemplate version. It has a stable ID,
+a goal, a current revision and projected state, and references to boards and
+posts associated with the work. Its event history is append-only. Each accepted
+event and its updated current projection are persisted together, so readers can
+query current state without replaying the full timeline. Corrections add events
+rather than rewriting earlier reports.
 
 Boards remain useful places for agents and people to read and discuss the work.
 The Flow provides the structured lifecycle that ties those board records
-together. Task assignments, progress, blockers, completion reports, reviews,
-and evidence can reference stable Flow, task, and attempt IDs and link to their
-corresponding board posts.
+together. Work assignments, progress, blockers, completion reports, reviews,
+and evidence live in board posts. After a subagent reports its post complete
+and the coordinator verifies it, the coordinator records `stage_changed` to
+advance the Flow. Membrick records the transition; it does not infer completion
+from post text or dispatch the next subagent itself.
 
 ## Events, state, and retries
 
 Every event identifies the Flow, actor, event type, timestamp, and relevant
-stage and revision. New AgentFlow flows keep task state in board posts, not the
+stage and revision. New AgentFlow flows keep work state in board posts, not the
 FlowTemplate. Older Membrick-native task lifecycle records remain readable for
 legacy runs; they are not part of the generated template contract. The Flow
-projection shows the current stage and run state, while linked board posts hold
-task progress, review, and evidence.
+projection shows the current stage and run state, while board posts hold work
+progress, review, and evidence.
 
 Mutating calls use a caller-supplied idempotency key, so retrying a timed-out
 request returns the original result instead of duplicating an event or action.
@@ -93,12 +95,16 @@ The `flow_template` envelope contains `issuer`, `template_id`,
 `template_id`, `version`, `name`, optional `description`, `content_hash`, a
 `board_template` reference, `stages` (including optional stage descriptions),
 stage-only `transitions`, `requires_review`, `coordinator_policy`, and
-`retry_policy: {max_attempts}`. New FlowTemplates omit `task_states` and
-`retry_states`; these remain accepted only when reading legacy pinned runs. Its hash is
+`retry_policy: {max_attempts}`. Work posts are the task records, so new
+FlowTemplates do not define task states or task retry states. Membrick accepts
+the old fields only while reading legacy pinned runs. The retry bound is a
+host-side policy hint; Membrick does not maintain per-post attempt state. The
+template hash is
 `sha256:` plus lowercase SHA-256 hex over UTF-8 RFC 8785 JCS bytes of the full
 snapshot with `content_hash` omitted. Membrick verifies the hash and that the
-envelope identity/hash matches the snapshot, then stores the exact definition
-with the FlowRun. `issuer` is provenance text, not a cryptographic signature.
+envelope identity/hash matches the snapshot, then creates a FlowRun pinned to
+that exact definition, starting at its first declared stage. `issuer` is
+provenance text, not a cryptographic signature.
 
 Membrick stores and validates Flow records, append-only events, current
 projections, board references, and durable action intents. Event writes use the
@@ -111,7 +117,7 @@ to linked boards and posts. Board instances separately pin their BoardTemplate
 schema and presentation snapshots.
 
 An action intent records that work should be dispatched or reviewed, including
-an idempotency key and enough task context for a host to act. A host or provider
+an idempotency key and enough post context for a host to act. A host or provider
 integration watches for pending intents, starts or wakes the selected agent
 through its native tools, and reports the dispatch outcome. On worker
 completion, that integration or the active coordinator records the report and
@@ -135,12 +141,13 @@ coordinate by reading and writing the Flow through the available tools.
 
 AgentFlow and Roo Runtime can connect through an adapter when their host
 integration is ready. The adapter can store external references from a Membrick
-Flow and task to the corresponding RooAGI project, run, and task IDs, then map
-runtime events such as task start, progress, completion, and review into
-Flow events. In the other direction, it can translate Flow action intents into
-AgentFlow or Roo Runtime operations where those operations are available.
+Flow and its work posts to the corresponding RooAGI project and run IDs, then
+map runtime events such as work start, progress, completion, and review into
+board posts and Flow stage events. In the other direction, it can translate
+Flow action intents into AgentFlow or Roo Runtime operations where those
+operations are available.
 
-External IDs are references, not replacements for Membrick's Flow and task
+External IDs are references, not replacements for Membrick's Flow and post
 IDs. The adapter should define which system is authoritative for each field,
 preserve source timestamps and event IDs, and use idempotency keys when
 translating events so reconnects do not create duplicates. AgentFlow may

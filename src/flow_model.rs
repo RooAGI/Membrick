@@ -212,6 +212,9 @@ pub struct FlowRun {
     pub revision: u64,
     pub coordinator: Option<FlowCoordinator>,
     pub coordinator_fence: u64,
+    /// Legacy task projection. New stage-only FlowRuns keep their work in
+    /// board posts and omit this field from their serialized projection.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tasks: BTreeMap<String, FlowTask>,
     pub pending_actions: Vec<FlowActionIntent>,
     pub created_by: String,
@@ -227,8 +230,10 @@ pub struct FlowEvent {
     pub revision: u64,
     pub actor: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
     pub kind: FlowEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     #[serde(default)]
     pub post_id: Option<String>,
