@@ -1091,7 +1091,7 @@ impl MemoryService {
                 &[FlowReference {
                     kind: FlowReferenceKind::Post,
                     id: post_id.to_string(),
-                    relation: format!("task_report:{}", event.task_id.as_deref().unwrap_or("flow")),
+                    relation: "flow_post".to_string(),
                 }],
             )?;
         }

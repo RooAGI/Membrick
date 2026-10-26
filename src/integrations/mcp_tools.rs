@@ -1000,12 +1000,12 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "flow_create".into(),
-            description: "Create a durable Flow run from an existing board and an exact AgentFlow-owned pinned FlowTemplate. Membrick has no FlowTemplate catalog; resolve the immutable definition through AgentFlow and provide its full pinned snapshot. New snapshots use stages and stage handoffs; task states are board-post fields. Reuse request_id for retries. Flow creation records coordination state; it does not launch an agent.".into(),
+            description: "Create a durable Flow run from an existing board and an exact AgentFlow-owned FlowTemplate. Membrick has no FlowTemplate catalog; resolve the immutable definition through AgentFlow and provide it as flow_template. The FlowRun tracks stages and stage handoffs; work items and their progress are board posts. Reuse request_id for retries. Flow creation records coordination state; it does not launch an agent.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
                     "board_id":{"type":"string","description":"Existing workspace board that anchors this Flow."},
-                    "flow_template":{"type":"object","description":"Exact FlowTemplate envelope resolved by AgentFlow. snapshot contains the full immutable definition, including template_id, version, content_hash, board_template, stage descriptions and stage-only transitions, review/coordinator policy, and retry_policy.max_attempts. New snapshots omit task_states and retry_states; those fields are accepted only for legacy pinned runs.","required":["issuer","template_id","version","content_hash","snapshot"],"properties":{"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object"}}},
+                    "flow_template":{"type":"object","description":"Exact FlowTemplate resolved by AgentFlow and used to create this FlowRun. snapshot is the immutable definition, including template_id, version, content_hash, board_template, stages with descriptions, allowed stage transitions, coordinator/review policy, and retry_policy.max_attempts. Work is represented by board posts; task states and task retry states are not part of this contract.","required":["issuer","template_id","version","content_hash","snapshot"],"properties":{"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object"}}},
                     "goal":{"type":"string","minLength":1},
                     "references":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["board","post"]},"id":{"type":"string"},"relation":{"type":"string"}},"required":["kind","id","relation"],"additionalProperties":false}},
                     "created_by":{"type":"string","description":"Agent identity creating the Flow; defaults to the provider identity."},
@@ -1022,7 +1022,7 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "flow_event_append".into(),
-            description: "Append one validated Flow lifecycle event using expected_revision. Mutations are append-only and idempotent by event_id/request_id. For stage-only templates, stage_changed advances between declared stages; after work in the terminal stage is complete, append stage_completed with data.stage set to that stage ID. Membrick then derives Flow state as completed. Legacy task-based runs retain their task review events. Use coordinator_claimed or coordinator_handed_off events to claim or hand off the coordinator role; these update the fencing token. This records shared state and never dispatches an agent.".into(),
+            description: "Append one validated Flow lifecycle event using expected_revision. Work units are board posts, not Flow tasks. After a subagent reports its post complete and the coordinator verifies it, use stage_changed with data.stage set to the next declared stage. After work in the terminal stage is complete, append stage_completed with data.stage set to that stage ID; Membrick then derives Flow state as completed. Mutations are append-only and idempotent by event_id/request_id. Use coordinator_claimed or coordinator_handed_off events to manage the coordinator fence. This records shared state and never dispatches an agent.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -1032,11 +1032,9 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
                     "event_id":{"type":"string","description":"Stable unique event identity; reuse unchanged on retry."},
                     "request_id":{"type":"string","description":"Idempotency key; reuse unchanged on retry."},
                     "actor":{"type":"string","description":"Caller-supplied agent identity authoring the event. MCP does not authenticate this identity; coordinator checks are cooperative fencing, not participant authorization."},
-                    "attempt_id":{"type":"string"},
-                    "kind":{"type":"string","enum":["flow_started","stage_changed","stage_completed","coordinator_claimed","coordinator_handed_off","coordinator_released","task_created","task_assigned","task_started","progress","blocked","ready_for_review","review_approved","review_changes_requested","task_cancelled","flow_completed","flow_cancelled","flow_failed","action_requested","action_consumed","reference_added"]},
-                    "task_id":{"type":"string"},
-                    "post_id":{"type":"string","description":"Existing post ID on this Flow's board. Required for task lifecycle events; use reference_added for later board links."},
-                    "data":{"type":"object","description":"Event-specific structured fields such as stage IDs, task title/assignee, progress summary, blocker/next action, review verdict/evidence, or action name/payload."}
+                    "kind":{"type":"string","enum":["flow_started","stage_changed","stage_completed","coordinator_claimed","coordinator_handed_off","coordinator_released","flow_cancelled","flow_failed","action_requested","action_consumed","reference_added"]},
+                    "post_id":{"type":"string","description":"Optional existing board post that records the work or evidence associated with this stage transition or outcome."},
+                    "data":{"type":"object","description":"Event-specific structured fields such as the next/current stage ID, failure reason, linked reference, or action name/payload."}
                 },
                 "required":["flow_id","expected_revision","event_id","request_id","actor","kind"],
                 "additionalProperties":false
@@ -1100,9 +1098,7 @@ pub(crate) fn dispatch_flow_tool(
             "event_id",
             "request_id",
             "actor",
-            "attempt_id",
             "kind",
-            "task_id",
             "post_id",
             "data",
         ],
