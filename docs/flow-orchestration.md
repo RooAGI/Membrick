@@ -15,10 +15,20 @@ connected agent to coordinate.
 
 A **FlowTemplate** is an immutable, versioned definition of a process owned and
 published by AgentFlow. It describes generic stages and allowed transitions,
-task and report contracts, review gates, completion criteria, and retry policy.
-Templates describe what events and information a process requires. They do not
-contain provider-specific commands or launch agents. Membrick does not publish
-or expose a FlowTemplate catalog.
+review gates, coordinator policy, and a retry bound. Tasks are board posts
+validated and rendered using the BoardTemplate's pinned PostTemplates; their
+status and task-specific fields live on those posts. Templates do not contain
+provider-specific commands or launch agents. Membrick does not author, publish,
+list, or resolve FlowTemplates. AgentFlow supplies the exact immutable
+FlowTemplate snapshot when creating a run.
+
+Stages describe work only. Completion, failure, and cancellation are Flow run
+states, not extra stages or template handoff events. A run becomes `completed`
+when its terminal stage completes. The current work stage remains visible in
+the completed run. A host reports unrecoverable worker
+or timeout failures with `flow_failed` and a reason; `cancelled` is reserved
+for an explicit cancellation decision. Invalid stage graphs are rejected
+before a run starts.
 
 A **Flow** (also called a flow run) is one execution of a template version. It
 has a stable ID, a goal, a current revision and projected state, and references
@@ -37,18 +47,17 @@ corresponding board posts.
 ## Events, state, and retries
 
 Every event identifies the Flow, actor, event type, timestamp, and relevant
-task, attempt, and revision. A task can move through states such as `ready`,
-`assigned`, `running`, `blocked`, `review`, `changes_requested`, `done`, or
-`cancelled`, as allowed by its template. Progress does not complete a task;
-completion requires the configured review or verification event. The Flow
-projection shows the current task and run state, while the event timeline
-preserves who reported each change and the evidence they supplied.
+stage and revision. New AgentFlow flows keep task state in board posts, not the
+FlowTemplate. Older Membrick-native task lifecycle records remain readable for
+legacy runs; they are not part of the generated template contract. The Flow
+projection shows the current stage and run state, while linked board posts hold
+task progress, review, and evidence.
 
 Mutating calls use a caller-supplied idempotency key, so retrying a timed-out
 request returns the original result instead of duplicating an event or action.
 Revision-checked writes reject stale updates and let an agent reread the latest
-state before trying again. Each attempt has its own ID and report history, so a
-retry or reassignment does not erase the evidence from earlier attempts.
+state before trying again. A retry or reassignment does not erase prior
+evidence recorded on the board posts.
 
 ## Coordinator role and handoff
 
@@ -76,11 +85,13 @@ coordinator writes to it.
 ## Membrick and host responsibilities
 
 AgentFlow resolves and supplies the immutable FlowTemplate when creating a run.
-The `flow_template_instance` envelope contains `issuer`, `template_id`,
+The `flow_template` envelope contains `issuer`, `template_id`,
 `version`, `content_hash`, and the full `snapshot`. The snapshot contains
 `template_id`, `version`, `name`, optional `description`, `content_hash`, a
-`board_template` reference, `stages`, `task_states`, `transitions`,
-`requires_review`, `coordinator_policy`, and `retry_policy`. Its hash is
+`board_template` reference, `stages` (including optional stage descriptions),
+stage-only `transitions`, `requires_review`, `coordinator_policy`, and
+`retry_policy: {max_attempts}`. New FlowTemplates omit `task_states` and
+`retry_states`; these remain accepted only when reading legacy pinned runs. Its hash is
 `sha256:` plus lowercase SHA-256 hex over UTF-8 RFC 8785 JCS bytes of the full
 snapshot with `content_hash` omitted. Membrick verifies the hash and that the
 envelope identity/hash matches the snapshot, then stores the exact definition
@@ -90,7 +101,8 @@ Membrick stores and validates Flow records, append-only events, current
 projections, board references, and durable action intents. Event writes use the
 run's pinned template snapshot to enforce contracts and idempotency rules, so
 later AgentFlow catalog changes do not alter an existing run. Legacy runs
-without a pinned snapshot continue to use their legacy lifecycle definition.
+without a pinned snapshot continue to use a private legacy resolver for replay;
+it is not a source for new runs.
 The dashboard reads the resulting projection and timeline, and can navigate
 to linked boards and posts. Board instances separately pin their BoardTemplate
 schema and presentation snapshots.
@@ -103,7 +115,7 @@ completion, that integration or the active coordinator records the report and
 any review intent. Membrick does not execute provider commands, start sessions,
 or wake an agent merely because a post or event was written.
 
-Pending action intents are cancelled when a Flow completes or is cancelled,
+Pending action intents are cancelled when a Flow completes, fails, or is cancelled,
 or when its coordinator is handed off or released. This fences queued work from
 being consumed by a later coordinator under an old authorization token.
 Because a host may already have fetched an intent when cancellation happens,

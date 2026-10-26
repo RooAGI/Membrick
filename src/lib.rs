@@ -51,6 +51,7 @@ mod config;
 mod conversation_state;
 mod conversational_rerank;
 mod daemon;
+#[path = "flow_model.rs"]
 pub mod flow;
 mod ids;
 mod index;

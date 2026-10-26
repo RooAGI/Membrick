@@ -17,8 +17,8 @@ FlowRun and board APIs. It does not add an MCP server or change tool handlers.
    state and correlates it to the FlowRun/task IDs.
 
 AgentFlow owns template authoring, publishing, immutable versions, and
-resolution. Its catalog resolver returns the exact `flow_template_instance`
-and board `template_instance` snapshots. Membrick verifies and pins those
+resolution. Its catalog resolver returns the exact `flow_template`
+and board `board_template` snapshots. Membrick verifies and pins those
 snapshots; it does not query AgentFlow to render or validate an existing
 instance. Each `content_hash` is `sha256:` plus lowercase SHA-256 hex of the
 RFC 8785 canonical JSON snapshot with `content_hash` omitted. This checks
@@ -47,8 +47,8 @@ retry are out of the initial tool set; if added later, each must be a separate
 revision-checked, approval-gated mutation.
 
 At the backend boundary, AgentFlow resolves the exact catalog bundle, calls
-Membrick's generic `board_open` with the pinned BoardTemplate instance, then
-calls Membrick `flow_create` with the pinned FlowTemplate instance. Status
+Membrick's generic `board_open` with the pinned BoardTemplate, then
+calls Membrick `flow_create` with the pinned FlowTemplate. Status
 maps to `flow_get`; board operations map to `board_read` and `board_post` on
 the same resident records. These internal Membrick tools are not separately
 exposed to ChatGPT.

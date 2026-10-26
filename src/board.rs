@@ -89,7 +89,7 @@ pub fn default_board(owner: &str, workspace: &str, session_id: &str) -> Board {
         title: format!("{DEFAULT_BOARD_TITLE} (session {session_id})"),
         board_type: DEFAULT_BOARD_TYPE.to_string(),
         links: Vec::new(),
-        template_instance: None,
+        board_template: None,
         fields: None,
         // Synthetic boards predate any persistent record; the real
         // timestamp is set when the record is created.
@@ -167,7 +167,7 @@ pub struct TemplatePresentation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostTemplateSnapshot {
+pub struct PinnedPostTemplate {
     pub template_id: String,
     pub version: u32,
     pub content_hash: String,
@@ -178,24 +178,24 @@ pub struct PostTemplateSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemplateSnapshot {
+pub struct BoardTemplateSnapshot {
     pub schema: TemplateSchema,
     pub presentation: TemplatePresentation,
     #[serde(default)]
-    pub post_templates: Vec<PostTemplateSnapshot>,
+    pub post_templates: Vec<PinnedPostTemplate>,
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, Value>,
 }
 
 /// Immutable template identity and snapshot supplied by the template owner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TemplateInstance {
+pub struct PinnedBoardTemplate {
     pub contract_version: u32,
     pub issuer: String,
     pub template_id: String,
     pub version: u32,
     pub content_hash: String,
-    pub snapshot: TemplateSnapshot,
+    pub snapshot: BoardTemplateSnapshot,
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, Value>,
 }
@@ -235,33 +235,33 @@ fn validate_schema(schema: &TemplateSchema) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn validate_template_instance(instance: &TemplateInstance) -> anyhow::Result<()> {
-    if instance.contract_version != 1 || instance.version == 0 {
-        anyhow::bail!("unsupported template instance contract or version");
+pub fn validate_pinned_board_template(template: &PinnedBoardTemplate) -> anyhow::Result<()> {
+    if template.contract_version != 1 || template.version == 0 {
+        anyhow::bail!("unsupported pinned BoardTemplate contract or version");
     }
-    if instance.issuer.trim().is_empty()
-        || instance.issuer.len() > 128
-        || instance.template_id.trim().is_empty()
-        || instance.template_id.len() > 128
+    if template.issuer.trim().is_empty()
+        || template.issuer.len() > 128
+        || template.template_id.trim().is_empty()
+        || template.template_id.len() > 128
     {
         anyhow::bail!("template issuer and ID must be 1-128 bytes");
     }
-    let snapshot_json = serde_json::to_value(&instance.snapshot)?;
+    let snapshot_json = serde_json::to_value(&template.snapshot)?;
     if serde_json::to_vec(&snapshot_json)?.len() > TEMPLATE_SNAPSHOT_MAX_BYTES {
         anyhow::bail!("template snapshot exceeds 65536 bytes");
     }
     validate_snapshot_depth(&snapshot_json, 0)?;
-    validate_schema(&instance.snapshot.schema)?;
-    if instance.snapshot.post_templates.len() > 100 {
+    validate_schema(&template.snapshot.schema)?;
+    if template.snapshot.post_templates.len() > 100 {
         anyhow::bail!("template snapshot may contain at most 100 post templates");
     }
     validate_presentation(
-        &instance.snapshot.presentation,
-        &instance.snapshot.schema,
-        Some(&instance.snapshot.post_templates),
+        &template.snapshot.presentation,
+        &template.snapshot.schema,
+        Some(&template.snapshot.post_templates),
     )?;
     let mut refs = std::collections::HashSet::new();
-    for post in &instance.snapshot.post_templates {
+    for post in &template.snapshot.post_templates {
         if post.template_id.trim().is_empty()
             || post.template_id.len() > 128
             || post.version == 0
@@ -273,7 +273,7 @@ pub fn validate_template_instance(instance: &TemplateInstance) -> anyhow::Result
         validate_presentation(&post.presentation, &post.schema, None)?;
         verify_post_template_hash(post)?;
     }
-    verify_template_hash(instance)?;
+    verify_board_template_hash(template)?;
     Ok(())
 }
 
@@ -306,7 +306,7 @@ fn validate_snapshot_depth(value: &Value, depth: usize) -> anyhow::Result<()> {
 fn validate_presentation(
     presentation: &TemplatePresentation,
     schema: &TemplateSchema,
-    available_post_templates: Option<&[PostTemplateSnapshot]>,
+    available_post_templates: Option<&[PinnedPostTemplate]>,
 ) -> anyhow::Result<()> {
     if presentation.version != 1 {
         anyhow::bail!(
@@ -472,7 +472,7 @@ fn validate_presentation(
                     })?;
                 let selected_schemas: Vec<&TemplateSchema> = match available_post_templates {
                     Some(available) => {
-                        let selected: Vec<&PostTemplateSnapshot> = available
+                        let selected: Vec<&PinnedPostTemplate> = available
                             .iter()
                             .filter(|post| {
                                 template_ids.is_empty()
@@ -642,8 +642,8 @@ fn presentation_value_matches(field_type: TemplateFieldType, value: &Value) -> b
     }
 }
 
-fn verify_template_hash(instance: &TemplateInstance) -> anyhow::Result<()> {
-    let post_refs: Vec<Value> = instance
+fn verify_board_template_hash(template: &PinnedBoardTemplate) -> anyhow::Result<()> {
+    let post_refs: Vec<Value> = template
         .snapshot
         .post_templates
         .iter()
@@ -656,16 +656,16 @@ fn verify_template_hash(instance: &TemplateInstance) -> anyhow::Result<()> {
         })
         .collect();
     let definition = json!({
-        "template_id": instance.template_id,
-        "version": instance.version,
-        "schema": instance.snapshot.schema,
-        "presentation": instance.snapshot.presentation,
+        "template_id": template.template_id,
+        "version": template.version,
+        "schema": template.snapshot.schema,
+        "presentation": template.snapshot.presentation,
         "post_templates": post_refs,
     });
-    verify_hash(&instance.content_hash, &definition, "board template")
+    verify_hash(&template.content_hash, &definition, "board template")
 }
 
-fn verify_post_template_hash(post: &PostTemplateSnapshot) -> anyhow::Result<()> {
+fn verify_post_template_hash(post: &PinnedPostTemplate) -> anyhow::Result<()> {
     let definition = json!({
         "template_id": post.template_id,
         "version": post.version,
@@ -759,7 +759,7 @@ pub struct Board {
     #[serde(default)]
     pub links: Vec<BoardLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_instance: Option<TemplateInstance>,
+    pub board_template: Option<PinnedBoardTemplate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Value>,
     pub created_at: String,
@@ -831,10 +831,10 @@ pub fn board_doc_filters(board: &Board) -> BTreeMap<String, String> {
     f.insert(BOARD_WORKSPACE_FILTER.to_string(), board.workspace.clone());
     f.insert(BOARD_KEY_FILTER.to_string(), board.key.clone());
     f.insert(BOARD_TYPE_FILTER.to_string(), board.board_type.clone());
-    if let Some(template_instance) = &board.template_instance {
+    if let Some(board_template) = &board.board_template {
         f.insert(
             BOARD_TEMPLATE_ID_FILTER.to_string(),
-            template_instance.template_id.clone(),
+            board_template.template_id.clone(),
         );
     }
     f
@@ -901,7 +901,7 @@ pub fn board_from_doc_content(content: &str) -> Option<Board> {
     serde_json::from_str(content).ok()
 }
 
-/// Realistic AgentFlow-style template instances with correct JCS hashes.
+/// Realistic AgentFlow-style pinned templates with correct JCS hashes.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
     use super::*;
@@ -932,9 +932,9 @@ pub(crate) mod test_fixtures {
                "schema": schema, "presentation": presentation})
     }
 
-    /// A project BoardTemplate instance pinning one task PostTemplate. The
+    /// A project pinned BoardTemplate pinning one task PostTemplate. The
     /// caller may add presentation components; hashes are recomputed.
-    pub(crate) fn project_instance_with(version: u32, extra_components: Vec<Value>) -> Value {
+    pub(crate) fn project_template_with(version: u32, extra_components: Vec<Value>) -> Value {
         let schema = json!({"version": 1, "fields": [
             {"id": "goal", "type": "string", "required": true, "label": "Goal"},
             {"id": "success_criteria", "type": "string_list", "required": true},
@@ -963,8 +963,8 @@ pub(crate) mod test_fixtures {
                             "post_templates": [task]}})
     }
 
-    pub(crate) fn project_instance(version: u32) -> TemplateInstance {
-        serde_json::from_value(project_instance_with(version, Vec::new())).unwrap()
+    pub(crate) fn project_template(version: u32) -> PinnedBoardTemplate {
+        serde_json::from_value(project_template_with(version, Vec::new())).unwrap()
     }
 
     pub(crate) fn project_fields() -> Value {
@@ -1014,7 +1014,7 @@ mod tests {
         assert!(!is_default_alias(&a));
     }
 
-    fn golden_post_template() -> PostTemplateSnapshot {
+    fn golden_post_template() -> PinnedPostTemplate {
         serde_json::from_value(json!({
             "template_id": "task",
             "version": 1,
@@ -1064,21 +1064,21 @@ mod tests {
 
     #[test]
     fn legacy_board_and_post_records_deserialize_without_template_data() {
-        // Pre-typed record: no type, links, template_instance, or fields.
+        // Pre-typed record: no type, links, board_template, or fields.
         let board = board_from_doc_content(
             r#"{"board_id":"board:u:ws:k","owner":"u","workspace":"ws","key":"k","title":"K","created_at":"2026-01-01T00:00:00Z"}"#,
         )
         .expect("legacy board parses");
         assert_eq!(board.board_type, DEFAULT_BOARD_TYPE);
         assert!(board.links.is_empty());
-        assert!(board.template_instance.is_none() && board.fields.is_none());
+        assert!(board.board_template.is_none() && board.fields.is_none());
         // Typed-board prototype record carrying the retired built-in refs.
         let prototype = board_from_doc_content(
             r#"{"board_id":"board:u:ws:p","owner":"u","workspace":"ws","key":"p","title":"P","type":"project","links":[],"template_id":"project","template_version":1,"created_at":"2026-01-01T00:00:00Z"}"#,
         )
         .expect("prototype board parses");
         assert_eq!(prototype.board_type, "project");
-        assert!(prototype.template_instance.is_none());
+        assert!(prototype.board_template.is_none());
         let post: BoardPost = serde_json::from_str(
             r#"{"post_id":"p1","board_id":"board:u:ws:k","author_agent_id":"a","provider":"codex","content":"hi","sequence":1,"created_at":"t"}"#,
         )

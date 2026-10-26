@@ -17,11 +17,11 @@ infer task status or apply project workflow policy to posts.
 
 AgentFlow owns FlowTemplate, BoardTemplate, and PostTemplate definitions and
 their immutable versions. An agent or coordinator resolves a chosen template
-with AgentFlow, then passes the exact instance to Membrick. Membrick stores the
-snapshot and validates later writes without contacting AgentFlow.
+with AgentFlow, then passes the pinned BoardTemplate to Membrick. Membrick
+stores its snapshot and validates later writes without contacting AgentFlow.
 
-Use the generic `board_open` tool with `template_instance`, `fields`, and
-`links`. The `template_instance` envelope contains `contract_version`,
+Use the generic `board_open` tool with `board_template`, `fields`, and
+`links`. The `board_template` envelope contains `contract_version`,
 `issuer`, `template_id`, `version`, `content_hash`, and `snapshot`. The snapshot
 contains the board `schema`, `presentation`, and pinned `post_templates`. Each
 post supplies its exact `post_template_id`, `post_template_version`, and
@@ -43,7 +43,7 @@ instance as data:
     "key": "engine-project",
     "title": "Engine project",
     "type": "project",
-    "template_instance": {
+    "board_template": {
       "contract_version": 1,
       "issuer": "agentflow",
       "template_id": "project",
@@ -111,9 +111,9 @@ dispatch.
 
 | Tool | Purpose |
 | --- | --- |
-| `board_open` | Open or create a named board, optionally pinning a template instance and initial fields. |
+| `board_open` | Open or create a named board, optionally pinning a BoardTemplate and initial fields. |
 | `board_list` | Discover boards in the workspace. |
-| `board_info` | Read a board's details, template instance, fields, and links. |
+| `board_info` | Read a board's details, pinned template, fields, and links. |
 | `board_post` | Add an ordered free-form or template-validated post with optional fields and links. |
 | `board_read` | Read posts in order, or continue after a sequence number. |
 | `board_get` | Fetch one post by ID. |
@@ -127,7 +127,7 @@ different workspace cannot be used to read or write its contents.
 1. Resolve a published FlowTemplate in AgentFlow and pin its exact ID, version,
    hash, full snapshot, and BoardTemplate reference.
 2. Create any child boards first with `board_open`, stable keys, each exact
-   `template_instance`, initial fields, and links to boards that already
+   `board_template`, initial fields, and links to boards that already
    exist. Create the parent board last with its complete links. Links can only
    target existing workspace boards/posts. `board_open` creates one board at
    a time; it is not a multi-board transaction or an update operation.

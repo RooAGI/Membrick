@@ -37,6 +37,7 @@ pub enum FlowState {
     Active,
     Completed,
     Cancelled,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,15 +58,21 @@ pub struct FlowReference {
 pub struct FlowStage {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub transitions_to: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlowTransition {
     pub event: FlowEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_task_state: Option<FlowTaskState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_task_state: Option<FlowTaskState>,
     pub requires_coordinator: bool,
     pub requires_reviewer: bool,
@@ -74,6 +81,9 @@ pub struct FlowTransition {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FlowRetryPolicy {
     pub max_attempts: u32,
+    /// Legacy-only task retry policy. Omitted from newly generated stage-only
+    /// AgentFlow templates, but retained to replay older pinned runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retry_states: Vec<FlowTaskState>,
 }
 
@@ -88,6 +98,8 @@ pub struct FlowTemplate {
     pub content_hash: String,
     pub board_template: FlowBoardTemplateRef,
     pub stages: Vec<FlowStage>,
+    /// Legacy-only task lifecycle contract. New AgentFlow templates omit it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_states: Vec<FlowTaskState>,
     pub transitions: Vec<FlowTransition>,
     pub requires_review: bool,
@@ -104,7 +116,7 @@ pub struct FlowBoardTemplateRef {
 
 /// Uniform reference envelope used when an AgentFlow definition is pinned to a run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FlowTemplateInstance {
+pub struct PinnedFlowTemplate {
     pub issuer: String,
     pub template_id: String,
     pub version: u32,
@@ -131,6 +143,7 @@ pub enum FlowEventKind {
     TaskCancelled,
     FlowCompleted,
     FlowCancelled,
+    FlowFailed,
     ActionRequested,
     ActionConsumed,
     ReferenceAdded,
@@ -190,7 +203,7 @@ pub struct FlowRun {
     pub template_version: u32,
     /// Exact AgentFlow-owned definition pinned at creation. Missing only on legacy stored runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_template_instance: Option<FlowTemplateInstance>,
+    pub flow_template: Option<PinnedFlowTemplate>,
     pub goal: String,
     pub references: Vec<FlowReference>,
     pub stage: String,
@@ -256,7 +269,7 @@ pub struct FlowCreateRequest {
     pub owner: String,
     pub workspace: String,
     pub board_id: String,
-    pub flow_template_instance: FlowTemplateInstance,
+    pub flow_template: PinnedFlowTemplate,
     pub goal: String,
     #[serde(default)]
     pub references: Vec<FlowReference>,
@@ -266,7 +279,7 @@ pub struct FlowCreateRequest {
 
 /// The default provider-neutral lifecycle contract. Hosts can map its events
 /// to provider-native flows while Membrick stores shared coordination state.
-fn builtin_templates() -> Vec<FlowTemplate> {
+fn legacy_flow_templates() -> Vec<FlowTemplate> {
     use FlowEventKind as E;
     use FlowTaskState as T;
     let states = vec![
@@ -283,27 +296,20 @@ fn builtin_templates() -> Vec<FlowTemplate> {
         FlowStage {
             id: "planning".into(),
             name: "Planning".into(),
+            description: None,
             transitions_to: vec!["execution".into()],
         },
         FlowStage {
             id: "execution".into(),
             name: "Execution".into(),
+            description: None,
             transitions_to: vec!["review".into()],
         },
         FlowStage {
             id: "review".into(),
             name: "Review".into(),
-            transitions_to: vec!["execution".into(), "complete".into()],
-        },
-        FlowStage {
-            id: "complete".into(),
-            name: "Complete".into(),
-            transitions_to: vec![],
-        },
-        FlowStage {
-            id: "cancelled".into(),
-            name: "Cancelled".into(),
-            transitions_to: vec![],
+            description: None,
+            transitions_to: vec!["execution".into()],
         },
     ];
     let mut transitions = vec![
@@ -329,15 +335,6 @@ fn builtin_templates() -> Vec<FlowTemplate> {
             event: E::StageChanged,
             from_stage: Some("review".into()),
             to_stage: Some("execution".into()),
-            from_task_state: None,
-            to_task_state: None,
-            requires_coordinator: true,
-            requires_reviewer: false,
-        },
-        FlowTransition {
-            event: E::FlowCompleted,
-            from_stage: Some("review".into()),
-            to_stage: Some("complete".into()),
             from_task_state: None,
             to_task_state: None,
             requires_coordinator: true,
@@ -472,21 +469,33 @@ pub(crate) fn legacy_flow_template(
     template_id: &str,
     version: Option<u32>,
 ) -> Option<FlowTemplate> {
-    builtin_templates().into_iter().find(|template| {
+    legacy_flow_templates().into_iter().find(|template| {
         template.id == template_id && version.map_or(true, |value| value == template.version)
     })
 }
 
-pub fn validate_flow_template_instance(instance: &FlowTemplateInstance) -> anyhow::Result<()> {
-    if instance.issuer.trim().is_empty() || instance.issuer.len() > 128 {
+pub fn validate_pinned_flow_template(template: &PinnedFlowTemplate) -> anyhow::Result<()> {
+    if template.issuer.trim().is_empty() || template.issuer.len() > 128 {
         anyhow::bail!("FlowTemplate issuer must be 1-128 bytes");
     }
-    validate_flow_template(&instance.snapshot)?;
+    validate_flow_template(&template.snapshot)?;
     anyhow::ensure!(
-        instance.template_id == instance.snapshot.id
-            && instance.version == instance.snapshot.version
-            && instance.content_hash == instance.snapshot.content_hash,
-        "FlowTemplate instance envelope does not match its snapshot identity/hash"
+        template.template_id == template.snapshot.id
+            && template.version == template.snapshot.version
+            && template.content_hash == template.snapshot.content_hash,
+        "pinned FlowTemplate identity/hash does not match its snapshot"
+    );
+    Ok(())
+}
+
+/// Validate a template supplied for a new run. The legacy task-state shape is
+/// accepted only when replaying existing snapshots, never when starting a run.
+pub fn validate_new_pinned_flow_template(template: &PinnedFlowTemplate) -> anyhow::Result<()> {
+    validate_pinned_flow_template(template)?;
+    anyhow::ensure!(
+        template.snapshot.task_states.is_empty()
+            && template.snapshot.retry_policy.retry_states.is_empty(),
+        "new FlowRuns require a stage-only AgentFlow FlowTemplate"
     );
     Ok(())
 }
@@ -511,7 +520,6 @@ pub fn validate_flow_template(template: &FlowTemplate) -> anyhow::Result<()> {
     }
     if template.stages.is_empty()
         || template.stages.len() > 64
-        || template.task_states.is_empty()
         || template.task_states.len() > 32
         || template.transitions.is_empty()
         || template.transitions.len() > 256
@@ -519,6 +527,9 @@ pub fn validate_flow_template(template: &FlowTemplate) -> anyhow::Result<()> {
         || template.retry_policy.retry_states.len() > 32
     {
         anyhow::bail!("FlowTemplate lifecycle definition exceeds supported bounds");
+    }
+    if template.task_states.is_empty() && !template.retry_policy.retry_states.is_empty() {
+        anyhow::bail!("stage-only FlowTemplates cannot declare retry_states");
     }
     let template_bytes = serde_jcs::to_vec(&serde_json::to_value(template)?)?;
     if template_bytes.len() > 64 * 1024 {
@@ -532,6 +543,13 @@ pub fn validate_flow_template(template: &FlowTemplate) -> anyhow::Result<()> {
         if stage.name.trim().is_empty() || stage.name.len() > 256 {
             anyhow::bail!("FlowTemplate stage names must be 1-256 bytes");
         }
+        if stage
+            .description
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024)
+        {
+            anyhow::bail!("FlowTemplate stage descriptions must be at most 1024 bytes");
+        }
     }
     let mut task_states = std::collections::HashSet::new();
     for state in &template.task_states {
@@ -540,6 +558,15 @@ pub fn validate_flow_template(template: &FlowTemplate) -> anyhow::Result<()> {
         }
     }
     for transition in &template.transitions {
+        if template.task_states.is_empty()
+            && (transition.event != FlowEventKind::StageChanged
+                || transition.from_stage.is_none()
+                || transition.to_stage.is_none()
+                || transition.from_task_state.is_some()
+                || transition.to_task_state.is_some())
+        {
+            anyhow::bail!("new FlowTemplates may declare stage handoffs only");
+        }
         if transition
             .from_stage
             .as_ref()
@@ -561,6 +588,41 @@ pub fn validate_flow_template(template: &FlowTemplate) -> anyhow::Result<()> {
                 .is_some_and(|value| !task_states.contains(value))
         {
             anyhow::bail!("FlowTemplate transition references an undeclared task state");
+        }
+    }
+    if template.task_states.is_empty() {
+        let declared_edges: std::collections::HashSet<(&str, &str)> = template
+            .stages
+            .iter()
+            .flat_map(|stage| {
+                stage
+                    .transitions_to
+                    .iter()
+                    .map(move |target| (stage.id.as_str(), target.as_str()))
+            })
+            .collect();
+        let actual_edges: std::collections::HashSet<(&str, &str)> = template
+            .transitions
+            .iter()
+            .filter_map(|transition| {
+                Some((
+                    transition.from_stage.as_deref()?,
+                    transition.to_stage.as_deref()?,
+                ))
+            })
+            .collect();
+        if declared_edges != actual_edges {
+            anyhow::bail!(
+                "FlowTemplate stage transitions must exactly match stages.transitions_to"
+            );
+        }
+        if template.stages.iter().any(|stage| {
+            stage
+                .transitions_to
+                .iter()
+                .any(|target| !stage_ids.contains(target))
+        }) {
+            anyhow::bail!("FlowTemplate stage graph references an unknown stage");
         }
     }
     let mut definition = serde_json::to_value(template)?;
@@ -623,23 +685,29 @@ impl FlowRun {
         owner: String,
         workspace: String,
         board_id: String,
-        template_instance: &FlowTemplateInstance,
+        flow_template: &PinnedFlowTemplate,
         goal: String,
         references: Vec<FlowReference>,
         created_by: String,
         timestamp: String,
     ) -> Self {
+        let initial_stage = flow_template
+            .snapshot
+            .stages
+            .first()
+            .map(|stage| stage.id.clone())
+            .unwrap_or_default();
         Self {
             flow_id,
             owner,
             workspace,
             board_id,
-            template_id: template_instance.template_id.clone(),
-            template_version: template_instance.version,
-            flow_template_instance: Some(template_instance.clone()),
+            template_id: flow_template.template_id.clone(),
+            template_version: flow_template.version,
+            flow_template: Some(flow_template.clone()),
             goal,
             references,
-            stage: "planning".into(),
+            stage: initial_stage,
             state: FlowState::Active,
             revision: 0,
             coordinator: None,
