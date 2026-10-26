@@ -1225,7 +1225,11 @@ mod tests {
         let mut envelope = flow_template_fixture();
         envelope.version = 2;
         let err = create(&mut service, &board_id, envelope, "b").unwrap_err();
-        assert!(err.to_string().contains("envelope does not match"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("pinned FlowTemplate identity/hash does not match"),
+            "{err}"
+        );
 
         let mut other_board = flow_template_fixture();
         other_board.snapshot.board_template.content_hash = format!("sha256:{}", "2".repeat(64));
