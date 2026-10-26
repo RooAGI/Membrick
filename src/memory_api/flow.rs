@@ -1150,6 +1150,59 @@ mod tests {
         }
     }
 
+    /// Small stage-only graph used to exercise the AgentFlow lifecycle contract.
+    fn stage_flow_fixture() -> PinnedFlowTemplate {
+        let board = project_template(1);
+        let mut template = flow_template_fixture().snapshot;
+        template.id = "stage_lifecycle".into();
+        template.name = "Stage lifecycle".into();
+        template.stages = vec![
+            FlowStage {
+                id: "intake".into(),
+                name: "Intake".into(),
+                description: None,
+                transitions_to: vec!["work".into()],
+            },
+            FlowStage {
+                id: "work".into(),
+                name: "Work".into(),
+                description: None,
+                transitions_to: vec!["finish".into()],
+            },
+            FlowStage {
+                id: "finish".into(),
+                name: "Finish".into(),
+                description: None,
+                transitions_to: Vec::new(),
+            },
+        ];
+        template.transitions = [("intake", "work"), ("work", "finish")]
+            .into_iter()
+            .map(|(from, to)| FlowTransition {
+                event: FlowEventKind::StageChanged,
+                from_stage: Some(from.into()),
+                to_stage: Some(to.into()),
+                from_task_state: None,
+                to_task_state: None,
+                requires_coordinator: true,
+                requires_reviewer: false,
+            })
+            .collect();
+        template.board_template = FlowBoardTemplateRef {
+            template_id: board.template_id,
+            version: board.version,
+            content_hash: board.content_hash,
+        };
+        let snapshot = hashed(template);
+        PinnedFlowTemplate {
+            issuer: "agentflow".into(),
+            template_id: snapshot.id.clone(),
+            version: snapshot.version,
+            content_hash: snapshot.content_hash.clone(),
+            snapshot,
+        }
+    }
+
     fn project_board(service: &mut MemoryService) -> String {
         service
             .board_open_or_create(
@@ -1182,6 +1235,46 @@ mod tests {
             "coordinator",
             request_id,
         )
+    }
+
+    fn append(
+        service: &mut MemoryService,
+        snapshot: &FlowSnapshot,
+        kind: FlowEventKind,
+        actor: &str,
+        fence: Option<u64>,
+        data: Value,
+        suffix: &str,
+    ) -> anyhow::Result<FlowSnapshot> {
+        service.flow_event_append(FlowEventAppend {
+            owner: OWNER.into(),
+            workspace: WS.into(),
+            flow_id: snapshot.run.flow_id.clone(),
+            expected_revision: snapshot.run.revision,
+            coordinator_fence: fence,
+            event_id: format!("event-{suffix}"),
+            request_id: format!("request-{suffix}"),
+            actor: actor.into(),
+            provider: "test".into(),
+            attempt_id: None,
+            kind,
+            task_id: None,
+            post_id: None,
+            data,
+        })
+    }
+
+    fn claim(service: &mut MemoryService, snapshot: &FlowSnapshot, actor: &str) -> FlowSnapshot {
+        append(
+            service,
+            snapshot,
+            FlowEventKind::CoordinatorClaimed,
+            actor,
+            None,
+            json!({}),
+            &format!("claim-{actor}"),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1253,5 +1346,456 @@ mod tests {
             "{err}"
         );
         assert!(service.flow_list(OWNER, WS).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_only_flow_advances_and_completes_only_at_its_terminal_stage() {
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        let board_id = project_board(&mut service);
+        let mut snapshot = create(
+            &mut service,
+            &board_id,
+            stage_flow_fixture(),
+            "stage-create",
+        )
+        .unwrap();
+        assert_eq!(snapshot.run.stage, "intake");
+        assert_eq!(snapshot.run.state, FlowState::Active);
+        assert!(snapshot.run.tasks.is_empty());
+
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageChanged,
+            "coordinator",
+            None,
+            json!({"stage": "work"}),
+            "stage-without-claim",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("active coordinator"));
+        assert_eq!(
+            service
+                .flow_get(OWNER, WS, &snapshot.run.flow_id)
+                .unwrap()
+                .unwrap()
+                .run
+                .revision,
+            snapshot.run.revision
+        );
+
+        snapshot = claim(&mut service, &snapshot, "coordinator");
+        let fence = snapshot.run.coordinator_fence;
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageChanged,
+            "coordinator",
+            Some(fence),
+            json!({"stage": "finish"}),
+            "undeclared-edge",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not allowed"));
+
+        snapshot = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageChanged,
+            "coordinator",
+            Some(fence),
+            json!({"stage": "work"}),
+            "to-work",
+        )
+        .unwrap();
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageCompleted,
+            "coordinator",
+            Some(fence),
+            json!({"stage": "work"}),
+            "complete-nonterminal",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("terminal stage"));
+
+        snapshot = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageChanged,
+            "coordinator",
+            Some(fence),
+            json!({"stage": "finish"}),
+            "to-finish",
+        )
+        .unwrap();
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageCompleted,
+            "coordinator",
+            Some(fence),
+            json!({"stage": "work"}),
+            "complete-wrong-stage",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("current stage"));
+
+        snapshot = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageCompleted,
+            "coordinator",
+            Some(fence),
+            json!({"stage": "finish"}),
+            "complete-finish",
+        )
+        .unwrap();
+        assert_eq!(snapshot.run.state, FlowState::Completed);
+        assert!(append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::FlowCancelled,
+            "coordinator",
+            Some(fence),
+            json!({}),
+            "after-completion",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cannot accept"));
+    }
+
+    #[test]
+    fn coordinator_claim_handoff_release_and_fencing_are_enforced() {
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        let board_id = project_board(&mut service);
+        let mut snapshot = create(
+            &mut service,
+            &board_id,
+            stage_flow_fixture(),
+            "coord-create",
+        )
+        .unwrap();
+        snapshot = claim(&mut service, &snapshot, "first");
+        let first_fence = snapshot.run.coordinator_fence;
+
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::CoordinatorClaimed,
+            "second",
+            None,
+            json!({}),
+            "double-claim",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already has"));
+
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::CoordinatorHandedOff,
+            "first",
+            Some(first_fence.saturating_sub(1)),
+            json!({"next_coordinator": "second", "next_provider": "test"}),
+            "stale-handoff",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fencing token"));
+
+        snapshot = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::CoordinatorHandedOff,
+            "first",
+            Some(first_fence),
+            json!({"next_coordinator": "second", "next_provider": "test"}),
+            "handoff",
+        )
+        .unwrap();
+        let second_fence = snapshot.run.coordinator_fence;
+        assert_eq!(
+            snapshot.run.coordinator.as_ref().unwrap().agent_id,
+            "second"
+        );
+        assert!(second_fence > first_fence);
+
+        let error = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::StageChanged,
+            "first",
+            Some(first_fence),
+            json!({"stage": "work"}),
+            "old-owner-stage-change",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ownership conflict"));
+
+        snapshot = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::CoordinatorReleased,
+            "second",
+            Some(second_fence),
+            json!({}),
+            "release",
+        )
+        .unwrap();
+        assert!(snapshot.run.coordinator.is_none());
+        assert!(snapshot.run.coordinator_fence > second_fence);
+    }
+
+    #[test]
+    fn flow_event_retry_is_idempotent_and_revision_conflicts_are_rejected() {
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        let board_id = project_board(&mut service);
+        let snapshot = create(
+            &mut service,
+            &board_id,
+            stage_flow_fixture(),
+            "retry-create",
+        )
+        .unwrap();
+        let event = FlowEventAppend {
+            owner: OWNER.into(),
+            workspace: WS.into(),
+            flow_id: snapshot.run.flow_id.clone(),
+            expected_revision: snapshot.run.revision,
+            coordinator_fence: None,
+            event_id: "stable-event".into(),
+            request_id: "stable-request".into(),
+            actor: "coordinator".into(),
+            provider: "test".into(),
+            attempt_id: None,
+            kind: FlowEventKind::CoordinatorClaimed,
+            task_id: None,
+            post_id: None,
+            data: json!({}),
+        };
+        let first = service.flow_event_append(event.clone()).unwrap();
+        let retry = service.flow_event_append(event.clone()).unwrap();
+        assert_eq!(retry.run.revision, first.run.revision);
+        assert_eq!(retry.events.len(), first.events.len());
+
+        let mut changed = event;
+        changed.data = json!({"different": true});
+        let error = service.flow_event_append(changed).unwrap_err();
+        assert!(error.to_string().contains("reused with different"));
+
+        let stale = FlowEventAppend {
+            event_id: "stale-event".into(),
+            request_id: "stale-request".into(),
+            expected_revision: snapshot.run.revision,
+            ..FlowEventAppend {
+                owner: OWNER.into(),
+                workspace: WS.into(),
+                flow_id: snapshot.run.flow_id,
+                expected_revision: 0,
+                coordinator_fence: None,
+                event_id: String::new(),
+                request_id: String::new(),
+                actor: "coordinator".into(),
+                provider: "test".into(),
+                attempt_id: None,
+                kind: FlowEventKind::CoordinatorReleased,
+                task_id: None,
+                post_id: None,
+                data: json!({}),
+            }
+        };
+        let error = service.flow_event_append(stale).unwrap_err();
+        assert!(error.to_string().contains("revision conflict"));
+    }
+
+    #[test]
+    fn action_intents_require_current_coordinator_and_are_consumed_once() {
+        let mut service = MemoryService::in_memory(PipelineOptions::default());
+        let board_id = project_board(&mut service);
+        let mut snapshot = create(
+            &mut service,
+            &board_id,
+            stage_flow_fixture(),
+            "action-create",
+        )
+        .unwrap();
+        snapshot = claim(&mut service, &snapshot, "coordinator");
+        let fence = snapshot.run.coordinator_fence;
+        snapshot = append(
+            &mut service,
+            &snapshot,
+            FlowEventKind::ActionRequested,
+            "coordinator",
+            Some(fence),
+            json!({"action_id": "notify", "action": "notify_user", "payload": {"message": "ready"}}),
+            "action-request",
+        )
+        .unwrap();
+        let pending = service
+            .flow_pending_actions(OWNER, WS, &snapshot.run.flow_id, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].action_id, "notify");
+
+        let error = service
+            .flow_action_consume(
+                OWNER,
+                WS,
+                &snapshot.run.flow_id,
+                "notify",
+                snapshot.run.revision,
+                fence.saturating_sub(1),
+                "worker",
+                "test",
+                "consume-stale",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("stale coordinator"));
+
+        snapshot = service
+            .flow_action_consume(
+                OWNER,
+                WS,
+                &snapshot.run.flow_id,
+                "notify",
+                snapshot.run.revision,
+                fence,
+                "worker",
+                "test",
+                "consume-once",
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot.run.pending_actions[0].state,
+            FlowActionState::Consumed
+        );
+        assert_eq!(
+            snapshot.run.pending_actions[0].consumed_by.as_deref(),
+            Some("worker")
+        );
+        assert!(service
+            .flow_pending_actions(OWNER, WS, &snapshot.run.flow_id, 10)
+            .unwrap()
+            .is_empty());
+        let error = service
+            .flow_action_consume(
+                OWNER,
+                WS,
+                &snapshot.run.flow_id,
+                "notify",
+                snapshot.run.revision,
+                fence,
+                "worker",
+                "test",
+                "consume-twice",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("already consumed"));
+    }
+
+    #[test]
+    fn cancellation_failure_release_and_handoff_cancel_pending_actions() {
+        for (terminal_kind, terminal_data, suffix, expected_state) in [
+            (
+                FlowEventKind::FlowCancelled,
+                json!({}),
+                "cancel",
+                FlowState::Cancelled,
+            ),
+            (
+                FlowEventKind::FlowFailed,
+                json!({"reason": "blocked"}),
+                "fail",
+                FlowState::Failed,
+            ),
+        ] {
+            let mut service = MemoryService::in_memory(PipelineOptions::default());
+            let board_id = project_board(&mut service);
+            let mut snapshot = create(
+                &mut service,
+                &board_id,
+                stage_flow_fixture(),
+                &format!("terminal-create-{suffix}"),
+            )
+            .unwrap();
+            snapshot = claim(&mut service, &snapshot, "coordinator");
+            let fence = snapshot.run.coordinator_fence;
+            snapshot = append(
+                &mut service,
+                &snapshot,
+                FlowEventKind::ActionRequested,
+                "coordinator",
+                Some(fence),
+                json!({"action_id": "pending", "action": "notify"}),
+                &format!("pending-{suffix}"),
+            )
+            .unwrap();
+            snapshot = append(
+                &mut service,
+                &snapshot,
+                terminal_kind,
+                "coordinator",
+                Some(fence),
+                terminal_data,
+                &format!("terminal-{suffix}"),
+            )
+            .unwrap();
+            assert_eq!(snapshot.run.state, expected_state);
+            assert_eq!(
+                snapshot.run.pending_actions[0].state,
+                FlowActionState::Cancelled
+            );
+            assert!(service
+                .flow_pending_actions(OWNER, WS, &snapshot.run.flow_id, 10)
+                .is_err());
+        }
+
+        for (event_kind, suffix) in [
+            (FlowEventKind::CoordinatorReleased, "released"),
+            (FlowEventKind::CoordinatorHandedOff, "handed-off"),
+        ] {
+            let mut service = MemoryService::in_memory(PipelineOptions::default());
+            let board_id = project_board(&mut service);
+            let mut snapshot = create(
+                &mut service,
+                &board_id,
+                stage_flow_fixture(),
+                &format!("intent-create-{suffix}"),
+            )
+            .unwrap();
+            snapshot = claim(&mut service, &snapshot, "coordinator");
+            let fence = snapshot.run.coordinator_fence;
+            snapshot = append(
+                &mut service,
+                &snapshot,
+                FlowEventKind::ActionRequested,
+                "coordinator",
+                Some(fence),
+                json!({"action_id": "pending", "action": "notify"}),
+                &format!("pending-{suffix}"),
+            )
+            .unwrap();
+            let data = if event_kind == FlowEventKind::CoordinatorHandedOff {
+                json!({"next_coordinator": "next", "next_provider": "test"})
+            } else {
+                json!({})
+            };
+            snapshot = append(
+                &mut service,
+                &snapshot,
+                event_kind,
+                "coordinator",
+                Some(fence),
+                data,
+                &format!("invalidate-{suffix}"),
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot.run.pending_actions[0].state,
+                FlowActionState::Cancelled
+            );
+        }
     }
 }
