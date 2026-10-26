@@ -233,7 +233,7 @@ function renderBoardList() {
     list.dataset.signature = signature;
     list.innerHTML = state.boards.length ? state.boards.map(board => `
       <button class="board-choice" type="button" data-board-id="${esc(board.board_id)}">
-        <span class="board-choice__top"><strong>${esc(board.title || board.key)}</strong>${board.type && board.type !== 'general' ? `<span class="board-choice__type">${esc(board.type)}</span>` : ''}${board.template_instance ? '<span class="board-choice__type board-choice__type--template">template</span>' : ''}</span>
+        <span class="board-choice__top"><strong>${esc(board.title || board.key)}</strong>${board.type && board.type !== 'general' ? `<span class="board-choice__type">${esc(board.type)}</span>` : ''}${board.board_template ? '<span class="board-choice__type board-choice__type--template">template</span>' : ''}</span>
         <small class="board-choice__key">${esc(board.key)}</small>
         <span class="board-choice__meta" data-board-meta="${esc(board.board_id)}">${esc(boardMetaText(board.board_id))}</span>
       </button>`).join('') : '<div class="empty-state">No boards yet. Agents can open a project board and link planning, task, and milestone boards.</div>';
@@ -747,7 +747,7 @@ function flowPostLink(postId, label = 'Linked board post') {
 
 // FlowRuns pin their AgentFlow template snapshot; legacy runs only carry the ID.
 function flowTemplateName(run) {
-  return run.flow_template_instance?.snapshot?.name || run.template_id || 'Unknown template';
+  return run.flow_template?.snapshot?.name || run.template_id || 'Unknown template';
 }
 
 function renderFlowDetail(snapshot) {
@@ -795,7 +795,7 @@ function renderFlowDetail(snapshot) {
   document.querySelector('#flow-detail').innerHTML = `
     <div class="flow-detail__head"><div><p class="eyebrow">Flow · ${esc(run.flow_id || '')}</p><h2>${esc(run.goal || 'Untitled Flow')}</h2><p class="muted">Created by ${esc(run.created_by || 'unknown agent')} · ${esc(run.created_at ? new Date(run.created_at).toLocaleString() : 'date unavailable')}</p></div><span class="flow-source-label">Flow projection · Membrick recorded</span></div>
     <div class="flow-summary">
-      <div><small>Template</small><strong>${esc(flowTemplateName(run))} · v${esc(run.template_version || '—')}</strong>${run.flow_template_instance?.content_hash ? `<small class="mono">${esc(run.flow_template_instance.content_hash)}</small>` : ''}</div>
+      <div><small>Template</small><strong>${esc(flowTemplateName(run))} · v${esc(run.template_version || '—')}</strong>${run.flow_template?.content_hash ? `<small class="mono">${esc(run.flow_template.content_hash)}</small>` : ''}</div>
       <div><small>Current stage</small><strong>${esc(run.stage || '—')}</strong></div>
       <div><small>Run state</small><strong><span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span></strong></div>
       <div><small>Revision</small><strong>${fmt(run.revision || 0)}</strong></div>
@@ -1021,7 +1021,7 @@ async function linkedBoardCards(board, component, used) {
     const entry = target.startsWith('board:') ? await linkedBoardEntry(target, used) : null;
     const linked = entry?.board || state.boards.find(item => item.board_id === target);
     const label = linked?.title || linked?.key || target;
-    const linkedInstance = linked?.template_instance;
+    const linkedInstance = linked?.board_template;
     const linkedSnapshot = linkedInstance?.snapshot;
     const childComponents = Array.isArray(linkedSnapshot?.presentation?.components) ? linkedSnapshot.presentation.components : [];
     const childHero = childComponents.find(item => item?.kind === 'hero');
@@ -1307,7 +1307,7 @@ async function renderBoardDetail(snapshot) {
   const generation = state.boardGeneration;
   const usedLinked = new Set();
   const board = snapshot.board;
-  const instance = board.template_instance || null;
+  const instance = board.board_template || null;
   const templateSnapshot = instance?.snapshot || null;
   const loadedPosts = snapshot.posts || [];
   // Keep chronological history for pagination, while also showing the newest

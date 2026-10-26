@@ -880,14 +880,14 @@ pub(crate) fn board_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "board_open".to_string(),
-            description: "Open a shared board by key, creating it if needed. Optionally pass an immutable template_instance snapshot from the template owner and structured fields. Membrick stores that exact version and validates structured posts against it without looking up a catalog. Without a template_instance, the board remains free-form. Calling board_open twice with the same key and same template returns the same board; a conflicting template is rejected. Share the returned board_id with subagents.".to_string(),
+            description: "Open a shared board by key, creating it if needed. Optionally pass an immutable board_template snapshot from the template owner and structured fields. Membrick stores that exact version and validates structured posts against it without looking up a catalog. Without a board_template, the board remains free-form. Calling board_open twice with the same key and same template returns the same board; a conflicting template is rejected. Share the returned board_id with subagents.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "key": {"type": "string", "description": "Caller-supplied board key, e.g. \"pr-81-review\". Unique within the workspace. \"default\" is reserved for the current session's board; keys starting with \"session:\" are rejected."},
                     "title": {"type": "string", "description": "Human-readable board title."},
                     "type": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$", "description": "Descriptive board type, e.g. project, planning, tasks, milestone, or general. It does not change board behavior."},
-                    "template_instance": {"type":"object", "description":"Immutable versioned template and full schema/presentation snapshot from the template owner. The snapshot includes child post_templates.", "required":["contract_version","issuer","template_id","version","content_hash","snapshot"], "properties":{"contract_version":{"type":"integer","const":1},"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object","required":["schema","presentation","post_templates"],"properties":{"schema":{"type":"object"},"presentation":{"type":"object"},"post_templates":{"type":"array","maxItems":100,"items":{"type":"object"}}}}}},
+                    "board_template": {"type":"object", "description":"Immutable versioned template and full schema/presentation snapshot from the template owner. The snapshot includes child post_templates.", "required":["contract_version","issuer","template_id","version","content_hash","snapshot"], "properties":{"contract_version":{"type":"integer","const":1},"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object","required":["schema","presentation","post_templates"],"properties":{"schema":{"type":"object"},"presentation":{"type":"object"},"post_templates":{"type":"array","maxItems":100,"items":{"type":"object"}}}}}},
                     "fields": {"type":"object", "description":"Structured board values matching the pinned template schema. Unknown fields are preserved for forward compatibility."},
                     "links": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"target": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Board ID, post ID, https URL, or repo: reference."}, "relation": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Agent-supplied relation label, e.g. contains, plans, tracks, depends_on, evidence_for."}}, "required": ["target", "relation"], "additionalProperties": false}},
                     "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
@@ -929,7 +929,7 @@ pub(crate) fn board_tool_definitions() -> Vec<ToolDefinition> {
                     "board_id": {"type": "string", "description": "For a shared board, pass the exact board_id returned by board_open or board_post. Omit (or pass \"default\") only for this session's private default board."},
                     "content": {"type": "string", "description": "Post content, e.g. \"The parser failure comes from the empty input path.\""},
                     "title": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional short label for this post."},
-                    "post_template_id": {"type": "string", "description": "ID of a post template in the board's pinned template_instance snapshot."},
+                    "post_template_id": {"type": "string", "description": "ID of a post template in the board's pinned board_template snapshot."},
                     "post_template_version": {"type": "integer", "minimum": 1, "description": "Required on templated boards; exact version of post_template_id."},
                     "fields": {"type": "object", "description": "Required on templated boards; structured data validated against the selected post template."},
                     "links": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"target": {"type": "string", "minLength": 1, "maxLength": 2048}, "relation": {"type": "string", "minLength": 1, "maxLength": 64}}, "required": ["target", "relation"], "additionalProperties": false}},
@@ -1000,18 +1000,18 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "flow_create".into(),
-            description: "Create a durable Flow run from an existing board and an exact AgentFlow-owned FlowTemplate instance. Provide the full pinned definition and reuse request_id for retries. Flow creation records coordination state; it does not launch an agent.".into(),
+            description: "Create a durable Flow run from an existing board and an exact AgentFlow-owned pinned FlowTemplate. Membrick has no FlowTemplate catalog; resolve the immutable definition through AgentFlow and provide its full pinned snapshot. New snapshots use stages and stage handoffs; task states are board-post fields. Reuse request_id for retries. Flow creation records coordination state; it does not launch an agent.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
                     "board_id":{"type":"string","description":"Existing workspace board that anchors this Flow."},
-                    "flow_template_instance":{"type":"object","description":"Exact FlowTemplate envelope resolved by AgentFlow. snapshot contains the complete definition, including template_id, version, content_hash, board_template, stages, task_states, transitions, review and retry policy.","required":["issuer","template_id","version","content_hash","snapshot"],"properties":{"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object"}}},
+                    "flow_template":{"type":"object","description":"Exact FlowTemplate envelope resolved by AgentFlow. snapshot contains the full immutable definition, including template_id, version, content_hash, board_template, stage descriptions and stage-only transitions, review/coordinator policy, and retry_policy.max_attempts. New snapshots omit task_states and retry_states; those fields are accepted only for legacy pinned runs.","required":["issuer","template_id","version","content_hash","snapshot"],"properties":{"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object"}}},
                     "goal":{"type":"string","minLength":1},
                     "references":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["board","post"]},"id":{"type":"string"},"relation":{"type":"string"}},"required":["kind","id","relation"],"additionalProperties":false}},
                     "created_by":{"type":"string","description":"Agent identity creating the Flow; defaults to the provider identity."},
                     "request_id":{"type":"string","description":"Unique idempotency key; reuse on retry."}
                 },
-                "required":["board_id","flow_template_instance","goal","request_id"],
+                "required":["board_id","flow_template","goal","request_id"],
                 "additionalProperties":false
             }),
         },
@@ -1022,7 +1022,7 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "flow_event_append".into(),
-            description: "Append one validated Flow lifecycle event using expected_revision. Mutations are append-only and idempotent by event_id/request_id. Progress leaves a task running; task completion requires the template's independent review event. Use coordinator_claimed or coordinator_handed_off events to claim or hand off the coordinator role; these update the fencing token. This records shared state and never dispatches an agent.".into(),
+            description: "Append one validated Flow lifecycle event using expected_revision. Mutations are append-only and idempotent by event_id/request_id. For stage-only templates, stage_changed advances between declared stages; after work in the terminal stage is complete, append stage_completed with data.stage set to that stage ID. Membrick then derives Flow state as completed. Legacy task-based runs retain their task review events. Use coordinator_claimed or coordinator_handed_off events to claim or hand off the coordinator role; these update the fencing token. This records shared state and never dispatches an agent.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -1033,7 +1033,7 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
                     "request_id":{"type":"string","description":"Idempotency key; reuse unchanged on retry."},
                     "actor":{"type":"string","description":"Caller-supplied agent identity authoring the event. MCP does not authenticate this identity; coordinator checks are cooperative fencing, not participant authorization."},
                     "attempt_id":{"type":"string"},
-                    "kind":{"type":"string","enum":["flow_started","stage_changed","coordinator_claimed","coordinator_handed_off","coordinator_released","task_created","task_assigned","task_started","progress","blocked","ready_for_review","review_approved","review_changes_requested","task_cancelled","flow_completed","flow_cancelled","action_requested","action_consumed","reference_added"]},
+                    "kind":{"type":"string","enum":["flow_started","stage_changed","stage_completed","coordinator_claimed","coordinator_handed_off","coordinator_released","task_created","task_assigned","task_started","progress","blocked","ready_for_review","review_approved","review_changes_requested","task_cancelled","flow_completed","flow_cancelled","flow_failed","action_requested","action_consumed","reference_added"]},
                     "task_id":{"type":"string"},
                     "post_id":{"type":"string","description":"Existing post ID on this Flow's board. Required for task lifecycle events; use reference_added for later board links."},
                     "data":{"type":"object","description":"Event-specific structured fields such as stage IDs, task title/assignee, progress summary, blocker/next action, review verdict/evidence, or action name/payload."}
@@ -1086,7 +1086,7 @@ pub(crate) fn dispatch_flow_tool(
         "flow_list" => &[],
         "flow_create" => &[
             "board_id",
-            "flow_template_instance",
+            "flow_template",
             "goal",
             "references",
             "created_by",
@@ -1132,13 +1132,13 @@ pub(crate) fn dispatch_flow_tool(
         }
         "flow_create" => {
             let board_id = required_str(arguments, "board_id")?;
-            let template_instance = arguments
-                .get("flow_template_instance")
+            let flow_template = arguments
+                .get("flow_template")
                 .cloned()
-                .ok_or_else(|| "missing required argument: flow_template_instance".to_string())
+                .ok_or_else(|| "missing required argument: flow_template".to_string())
                 .and_then(|value| {
-                    serde_json::from_value::<crate::flow::FlowTemplateInstance>(value)
-                        .map_err(|error| format!("invalid flow_template_instance: {error}"))
+                    serde_json::from_value::<crate::flow::PinnedFlowTemplate>(value)
+                        .map_err(|error| format!("invalid flow_template: {error}"))
                 })?;
             let goal = required_str(arguments, "goal")?;
             let references = arguments
@@ -1160,7 +1160,7 @@ pub(crate) fn dispatch_flow_tool(
                     owner,
                     workspace,
                     board_id,
-                    template_instance,
+                    flow_template,
                     goal,
                     references,
                     created_by,
@@ -1292,7 +1292,7 @@ pub(crate) fn dispatch_board_tool(
             "key": board.key,
             "title": board.title,
             "type": board.board_type,
-            "template_instance": board.template_instance,
+            "board_template": board.board_template,
             "fields": board.fields,
             "links": board.links,
             "owner": board.owner,
@@ -1323,7 +1323,7 @@ pub(crate) fn dispatch_board_tool(
             "key",
             "title",
             "type",
-            "template_instance",
+            "board_template",
             "fields",
             "links",
             "session_id",
@@ -1374,19 +1374,19 @@ pub(crate) fn dispatch_board_tool(
                 None => crate::board::DEFAULT_BOARD_TYPE,
             };
             let links = parse_links(arguments)?;
-            let template_instance = arguments
-                .get("template_instance")
+            let board_template = arguments
+                .get("board_template")
                 .cloned()
-                .map(serde_json::from_value::<crate::board::TemplateInstance>)
+                .map(serde_json::from_value::<crate::board::PinnedBoardTemplate>)
                 .transpose()
-                .map_err(|error| format!("invalid template_instance: {error}"))?;
+                .map_err(|error| format!("invalid board_template: {error}"))?;
             let fields = arguments.get("fields");
             // The "default" key is an alias for the current session's
             // board, not a separate board.
             let board = if crate::board::is_default_alias(key) {
                 if board_type != crate::board::DEFAULT_BOARD_TYPE
                     || !links.is_empty()
-                    || template_instance.is_some()
+                    || board_template.is_some()
                     || fields.is_some()
                 {
                     return Err(
@@ -1403,14 +1403,14 @@ pub(crate) fn dispatch_board_tool(
                     .map_err(|e| e.to_string())?
             } else {
                 service
-                    .board_open_instance(
+                    .board_open_or_create(
                         owner,
                         workspace,
                         key,
                         title,
                         board_type,
                         &links,
-                        template_instance.as_ref(),
+                        board_template.as_ref(),
                         fields,
                     )
                     .map_err(|e| e.to_string())?

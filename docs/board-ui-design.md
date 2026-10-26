@@ -17,12 +17,12 @@ board tools.
 | `GET /api/boards/:board_id?limit=100&after_sequence=N` | The selected board, a page of its posts, `has_more`, and `next_after_sequence`. |
 
 A board record has `board_id`, `key`, `title`, `type`, `created_at`, `links`,
-and, when templated, `template_instance` and `fields`. A post has `post_id`,
+and, when templated, `board_template` and `fields`. A post has `post_id`,
 `sequence`, `author_agent_id`, `provider`, `created_at`, `title`, `content`,
 `links`, and, when templated, `post_template_id`, `post_template_version`,
 and `fields`.
 
-`template_instance.snapshot` holds the board `schema`, the board
+`board_template.snapshot` holds the board `schema`, the board
 `presentation`, and the pinned `post_templates`. A post's schema and
 presentation come from the `post_templates` entry with the same
 `template_id` and `version`.
@@ -34,7 +34,7 @@ presentation come from the `post_templates` entry with the same
 | Board selector | `/api/boards`, sorted by title | Always |
 | Back link and board path | Links the reader followed in this view | The reader followed a link to another board |
 | Header | `title`, `key`, `type` (as a label only), `created_at` | Always |
-| Template provenance | `template_instance` issuer, template ID, version, content hash, contract version, and pinned post templates | The board is templated |
+| Template provenance | `board_template` issuer, template ID, version, content hash, contract version, and pinned post templates | The board is templated |
 | Live marker | Polling state (see below) | Always |
 | Goal header | `hero` component: `title_field`, `summary_fields` | The presentation declares `hero` |
 | Summary fields | `fields` component: `field_ids` | Declared |

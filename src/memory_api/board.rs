@@ -130,10 +130,10 @@ impl MemoryService {
         board_type: &str,
         links: &[crate::board::BoardLink],
     ) -> anyhow::Result<crate::board::Board> {
-        self.board_open_instance(owner, workspace, key, title, board_type, links, None, None)
+        self.board_open_or_create(owner, workspace, key, title, board_type, links, None, None)
     }
 
-    pub fn board_open_instance(
+    pub fn board_open_or_create(
         &mut self,
         owner: &str,
         workspace: &str,
@@ -141,7 +141,7 @@ impl MemoryService {
         title: &str,
         board_type: &str,
         links: &[crate::board::BoardLink],
-        template_instance: Option<&crate::board::TemplateInstance>,
+        board_template: Option<&crate::board::PinnedBoardTemplate>,
         fields: Option<&serde_json::Value>,
     ) -> anyhow::Result<crate::board::Board> {
         use crate::board::*;
@@ -159,13 +159,13 @@ impl MemoryService {
         }
         let links = normalize_board_links(links)?;
         self.validate_board_links(&links, owner, workspace)?;
-        if let Some(instance) = template_instance {
-            validate_template_instance(instance)?;
+        if let Some(instance) = board_template {
+            validate_pinned_board_template(instance)?;
             if let Some(fields) = fields {
                 validate_template_fields(&instance.snapshot.schema, fields)?;
             }
         } else if fields.is_some() {
-            anyhow::bail!("board fields require a template_instance");
+            anyhow::bail!("board fields require a board_template");
         }
         if key.starts_with(SESSION_BOARD_KEY_PREFIX) {
             anyhow::bail!(
@@ -184,7 +184,7 @@ impl MemoryService {
             title,
             board_type,
             &links,
-            template_instance,
+            board_template,
             fields,
         )
     }
@@ -256,7 +256,7 @@ impl MemoryService {
         title: &str,
         board_type: &str,
         links: &[crate::board::BoardLink],
-        template_instance: Option<&crate::board::TemplateInstance>,
+        board_template: Option<&crate::board::PinnedBoardTemplate>,
         fields: Option<&serde_json::Value>,
     ) -> anyhow::Result<crate::board::Board> {
         use crate::board::*;
@@ -274,12 +274,12 @@ impl MemoryService {
             });
         if let Some(doc) = persisted {
             if let Some(board) = board_from_doc_content(&doc.content) {
-                if let Some(template_instance) = template_instance {
+                if let Some(board_template) = board_template {
                     if board
-                        .template_instance
+                        .board_template
                         .as_ref()
                         .map(|existing| &existing.content_hash)
-                        != Some(&template_instance.content_hash)
+                        != Some(&board_template.content_hash)
                     {
                         anyhow::bail!(
                             "board key already exists with a different template; choose a new key"
@@ -294,7 +294,7 @@ impl MemoryService {
         }
         // A new templated board must satisfy its schema's required fields;
         // only a lookup of an existing board may omit them.
-        if let Some(instance) = template_instance {
+        if let Some(instance) = board_template {
             let empty = serde_json::Value::Object(Default::default());
             validate_template_fields(&instance.snapshot.schema, fields.unwrap_or(&empty))?;
         }
@@ -306,7 +306,7 @@ impl MemoryService {
             title: title.to_string(),
             board_type: board_type.to_string(),
             links: links.to_vec(),
-            template_instance: template_instance.cloned(),
+            board_template: board_template.cloned(),
             fields: fields.cloned(),
             created_at: Utc::now().to_rfc3339(),
         };
@@ -688,7 +688,7 @@ impl MemoryService {
         let board = self
             .board_info(&board_id, owner, workspace, session_id)?
             .ok_or_else(|| anyhow::anyhow!("unknown board_id: {board_id}"))?;
-        match (&board.template_instance, post_template_id, post_template_version, fields) {
+        match (&board.board_template, post_template_id, post_template_version, fields) {
             (Some(instance), Some(template_id), Some(version), Some(fields)) => {
                 let post_template = instance.snapshot.post_templates.iter()
                     .find(|item| item.template_id == template_id && item.version == version)
@@ -700,7 +700,7 @@ impl MemoryService {
             }
             (Some(_), _, _, _) => anyhow::bail!("templated boards require post_template_id, post_template_version, and fields from the pinned snapshot on every post"),
             (None, None, None, None) => {}
-            (None, _, _, _) => anyhow::bail!("post template metadata and fields require a board with template_instance"),
+            (None, _, _, _) => anyhow::bail!("post template metadata and fields require a board with board_template"),
         }
         // A retry returns the original post only if the complete normalized
         // request matches. Reusing an ID for different content is a conflict,
@@ -1446,10 +1446,10 @@ mod tests {
     fn open_project(
         service: &mut MemoryService,
         key: &str,
-        instance: &TemplateInstance,
+        instance: &PinnedBoardTemplate,
         fields: Option<&Value>,
     ) -> anyhow::Result<Board> {
-        service.board_open_instance(
+        service.board_open_or_create(
             OWNER,
             WS,
             key,
@@ -1485,7 +1485,7 @@ mod tests {
         )
     }
 
-    fn instance_from(value: Value) -> TemplateInstance {
+    fn instance_from(value: Value) -> PinnedBoardTemplate {
         serde_json::from_value(value).unwrap()
     }
 
@@ -1496,10 +1496,10 @@ mod tests {
     #[test]
     fn templated_board_open_pins_snapshot_and_is_idempotent() {
         let mut service = svc();
-        let instance = project_instance(1);
+        let instance = project_template(1);
         let fields = project_fields();
         let board = open_project(&mut service, "launch", &instance, Some(&fields)).unwrap();
-        let pinned = board.template_instance.as_ref().unwrap();
+        let pinned = board.board_template.as_ref().unwrap();
         assert_eq!(pinned.content_hash, instance.content_hash);
         assert_eq!(pinned.snapshot.post_templates.len(), 1);
         assert_eq!(board.fields.as_ref(), Some(&fields));
@@ -1512,7 +1512,7 @@ mod tests {
         assert_eq!(lookup.fields.as_ref(), Some(&fields));
         // A plain key/title open returns the templated board as-is.
         let plain = service.board_open(OWNER, WS, "launch", "x").unwrap();
-        assert!(plain.template_instance.is_some());
+        assert!(plain.board_template.is_some());
     }
 
     #[test]
@@ -1521,14 +1521,14 @@ mod tests {
         open_project(
             &mut service,
             "launch",
-            &project_instance(1),
+            &project_template(1),
             Some(&project_fields()),
         )
         .unwrap();
         let err = open_project(
             &mut service,
             "launch",
-            &project_instance(2),
+            &project_template(2),
             Some(&project_fields()),
         )
         .unwrap_err();
@@ -1538,7 +1538,7 @@ mod tests {
         let err = open_project(
             &mut service,
             "launch",
-            &project_instance(1),
+            &project_template(1),
             Some(&other_fields),
         )
         .unwrap_err();
@@ -1551,7 +1551,7 @@ mod tests {
         let err = open_project(
             &mut service,
             "plain",
-            &project_instance(1),
+            &project_template(1),
             Some(&project_fields()),
         )
         .unwrap_err();
@@ -1561,7 +1561,7 @@ mod tests {
     #[test]
     fn tampered_hashes_are_rejected() {
         let mut service = svc();
-        let mut wrong_board = project_instance(1);
+        let mut wrong_board = project_template(1);
         wrong_board.content_hash = format!("sha256:{}", "0".repeat(64));
         let err =
             open_project(&mut service, "a", &wrong_board, Some(&project_fields())).unwrap_err();
@@ -1571,7 +1571,7 @@ mod tests {
             "{err}"
         );
 
-        let mut wrong_post = project_instance_with(1, Vec::new());
+        let mut wrong_post = project_template_with(1, Vec::new());
         wrong_post["snapshot"]["post_templates"][0]["content_hash"] =
             json!(format!("sha256:{}", "1".repeat(64)));
         let err = open_project(
@@ -1588,7 +1588,7 @@ mod tests {
         );
 
         // Schema edited after hashing: the pinned hash no longer matches.
-        let mut edited = project_instance_with(1, Vec::new());
+        let mut edited = project_template_with(1, Vec::new());
         edited["snapshot"]["schema"]["fields"][0]["required"] = json!(false);
         let err = open_project(
             &mut service,
@@ -1606,7 +1606,7 @@ mod tests {
         let mut service = svc();
         let fields = project_fields();
         // Oversized: many large unknown metadata strings inside the snapshot.
-        let mut big = project_instance_with(1, Vec::new());
+        let mut big = project_template_with(1, Vec::new());
         for i in 0..10 {
             big["snapshot"][format!("x_blob_{i}")] = json!("x".repeat(8000));
         }
@@ -1620,7 +1620,7 @@ mod tests {
         let err = open_project(
             &mut service,
             "many",
-            &instance_from(project_instance_with(1, many)),
+            &instance_from(project_template_with(1, many)),
             Some(&fields),
         )
         .unwrap_err();
@@ -1630,13 +1630,13 @@ mod tests {
         for _ in 0..20 {
             deep = json!({ "n": deep });
         }
-        let mut nested = project_instance_with(1, Vec::new());
+        let mut nested = project_template_with(1, Vec::new());
         nested["snapshot"]["x_deep"] = deep;
         let err =
             open_project(&mut service, "deep", &instance_from(nested), Some(&fields)).unwrap_err();
         assert!(err.to_string().contains("nesting exceeds 16"), "{err}");
 
-        let bad_ref = project_instance_with(
+        let bad_ref = project_template_with(
             1,
             vec![json!({"kind": "fields", "field_ids": ["not_in_schema"]})],
         );
@@ -1644,16 +1644,16 @@ mod tests {
             open_project(&mut service, "ref", &instance_from(bad_ref), Some(&fields)).unwrap_err();
         assert!(err.to_string().contains("unknown schema field"), "{err}");
 
-        let mut unknown_type = project_instance_with(1, Vec::new());
+        let mut unknown_type = project_template_with(1, Vec::new());
         unknown_type["snapshot"]["schema"]["fields"][0]["type"] = json!("date");
-        let err = serde_json::from_value::<TemplateInstance>(unknown_type).unwrap_err();
+        let err = serde_json::from_value::<PinnedBoardTemplate>(unknown_type).unwrap_err();
         assert!(err.to_string().contains("unknown variant"), "{err}");
     }
 
     #[test]
     fn board_fields_are_validated_against_the_pinned_schema() {
         let mut service = svc();
-        let instance = project_instance(1);
+        let instance = project_template(1);
         let err =
             open_project(&mut service, "a", &instance, Some(&json!({"goal": "x"}))).unwrap_err();
         assert!(err.to_string().contains("success_criteria"), "{err}");
@@ -1670,10 +1670,10 @@ mod tests {
         let err = open_project(&mut service, "c", &instance, None).unwrap_err();
         assert!(err.to_string().contains("missing required field"), "{err}");
         let err = service
-            .board_open_instance(OWNER, WS, "d", "D", "general", &[], None, Some(&json!({})))
+            .board_open_or_create(OWNER, WS, "d", "D", "general", &[], None, Some(&json!({})))
             .unwrap_err();
         assert!(
-            err.to_string().contains("require a template_instance"),
+            err.to_string().contains("require a board_template"),
             "{err}"
         );
     }
@@ -1684,7 +1684,7 @@ mod tests {
         let board = open_project(
             &mut service,
             "launch",
-            &project_instance(1),
+            &project_template(1),
             Some(&project_fields()),
         )
         .unwrap();
@@ -1744,7 +1744,7 @@ mod tests {
         .unwrap_err();
         assert!(
             err.to_string()
-                .contains("require a board with template_instance"),
+                .contains("require a board with board_template"),
             "{err}"
         );
     }
@@ -1755,7 +1755,7 @@ mod tests {
         let board = open_project(
             &mut service,
             "launch",
-            &project_instance(1),
+            &project_template(1),
             Some(&project_fields()),
         )
         .unwrap();
@@ -1796,7 +1796,7 @@ mod tests {
     fn template_data_survives_restart_on_every_read_path() {
         let dir = temp_dir("template-restart");
         let options = PipelineOptions::default();
-        let instance = project_instance(1);
+        let instance = project_template(1);
         let target = {
             let mut service = MemoryService::at_path(&dir, options.clone()).unwrap();
             service
@@ -1810,7 +1810,7 @@ mod tests {
         let (board_id, post_id) = {
             let mut service = MemoryService::at_path(&dir, options.clone()).unwrap();
             let board = service
-                .board_open_instance(
+                .board_open_or_create(
                     OWNER,
                     WS,
                     "launch",
@@ -1842,7 +1842,7 @@ mod tests {
         };
         let mut reopened = MemoryService::at_path(&dir, options).unwrap();
         let check_board = |board: &Board| {
-            let pinned = board.template_instance.as_ref().expect("snapshot kept");
+            let pinned = board.board_template.as_ref().expect("snapshot kept");
             assert_eq!(pinned.content_hash, instance.content_hash);
             assert_eq!(pinned.version, 1);
             let kinds: Vec<&str> = pinned
