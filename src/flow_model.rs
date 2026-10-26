@@ -129,6 +129,7 @@ pub struct PinnedFlowTemplate {
 pub enum FlowEventKind {
     FlowStarted,
     StageChanged,
+    StageCompleted,
     CoordinatorClaimed,
     CoordinatorHandedOff,
     CoordinatorReleased,

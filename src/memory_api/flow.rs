@@ -239,6 +239,34 @@ fn apply_event(
             run.stage = next;
             mark_completed_if_all_tasks_done(run);
         }
+        FlowEventKind::StageCompleted => {
+            anyhow::ensure!(
+                template.task_states.is_empty(),
+                "stage_completed is only supported for stage-only FlowTemplates"
+            );
+            actor_is_coordinator(
+                run,
+                &event.actor,
+                event.data.get("coordinator_fence").and_then(Value::as_u64),
+            )?;
+            let completed_stage = required_string(&event.data, "stage")?;
+            anyhow::ensure!(
+                completed_stage == run.stage,
+                "stage_completed must name the current stage {:?}",
+                run.stage
+            );
+            let stage = template
+                .stages
+                .iter()
+                .find(|stage| stage.id == run.stage)
+                .ok_or_else(|| anyhow::anyhow!("current stage is missing from FlowTemplate"))?;
+            anyhow::ensure!(
+                stage.transitions_to.is_empty(),
+                "stage_completed is only valid for a terminal stage; advance to a declared next stage"
+            );
+            run.state = FlowState::Completed;
+            cancel_pending_actions(run);
+        }
         FlowEventKind::ReferenceAdded => {
             actor_is_coordinator(
                 run,

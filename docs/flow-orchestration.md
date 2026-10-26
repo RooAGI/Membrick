@@ -23,12 +23,15 @@ list, or resolve FlowTemplates. AgentFlow supplies the exact immutable
 FlowTemplate snapshot when creating a run.
 
 Stages describe work only. Completion, failure, and cancellation are Flow run
-states, not extra stages or template handoff events. A run becomes `completed`
-when its terminal stage completes. The current work stage remains visible in
-the completed run. A host reports unrecoverable worker
-or timeout failures with `flow_failed` and a reason; `cancelled` is reserved
-for an explicit cancellation decision. Invalid stage graphs are rejected
-before a run starts.
+states, not extra stages or template handoff events. A `stage_changed` event
+advances between declared stages. After the coordinator finishes and verifies
+the work in the terminal stage, it appends `stage_completed` with that stage's
+ID; Membrick then derives the Flow state as `completed`. The current work stage
+remains visible in the completed run. This event is valid only for a terminal
+stage in a stage-only FlowTemplate. A host reports unrecoverable worker or
+timeout failures with `flow_failed` and a reason; `cancelled` is reserved for
+an explicit cancellation decision. Invalid stage graphs are rejected before a
+run starts.
 
 A **Flow** (also called a flow run) is one execution of a template version. It
 has a stable ID, a goal, a current revision and projected state, and references

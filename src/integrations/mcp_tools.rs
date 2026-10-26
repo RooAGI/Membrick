@@ -1022,7 +1022,7 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "flow_event_append".into(),
-            description: "Append one validated Flow lifecycle event using expected_revision. Mutations are append-only and idempotent by event_id/request_id. Progress leaves a task running; task completion requires the template's independent review event. Use coordinator_claimed or coordinator_handed_off events to claim or hand off the coordinator role; these update the fencing token. This records shared state and never dispatches an agent.".into(),
+            description: "Append one validated Flow lifecycle event using expected_revision. Mutations are append-only and idempotent by event_id/request_id. For stage-only templates, stage_changed advances between declared stages; after work in the terminal stage is complete, append stage_completed with data.stage set to that stage ID. Membrick then derives Flow state as completed. Legacy task-based runs retain their task review events. Use coordinator_claimed or coordinator_handed_off events to claim or hand off the coordinator role; these update the fencing token. This records shared state and never dispatches an agent.".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -1033,7 +1033,7 @@ pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
                     "request_id":{"type":"string","description":"Idempotency key; reuse unchanged on retry."},
                     "actor":{"type":"string","description":"Caller-supplied agent identity authoring the event. MCP does not authenticate this identity; coordinator checks are cooperative fencing, not participant authorization."},
                     "attempt_id":{"type":"string"},
-                    "kind":{"type":"string","enum":["flow_started","stage_changed","coordinator_claimed","coordinator_handed_off","coordinator_released","task_created","task_assigned","task_started","progress","blocked","ready_for_review","review_approved","review_changes_requested","task_cancelled","flow_completed","flow_cancelled","flow_failed","action_requested","action_consumed","reference_added"]},
+                    "kind":{"type":"string","enum":["flow_started","stage_changed","stage_completed","coordinator_claimed","coordinator_handed_off","coordinator_released","task_created","task_assigned","task_started","progress","blocked","ready_for_review","review_approved","review_changes_requested","task_cancelled","flow_completed","flow_cancelled","flow_failed","action_requested","action_consumed","reference_added"]},
                     "task_id":{"type":"string"},
                     "post_id":{"type":"string","description":"Existing post ID on this Flow's board. Required for task lifecycle events; use reference_added for later board links."},
                     "data":{"type":"object","description":"Event-specific structured fields such as stage IDs, task title/assignee, progress summary, blocker/next action, review verdict/evidence, or action name/payload."}
