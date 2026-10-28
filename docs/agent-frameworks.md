@@ -81,7 +81,7 @@ limits, concurrency behavior, and measured performance.
 When the framework supports MCP, register Membrick as an MCP server and make
 the `search` tool available to the agent. Use `record_session` only when you
 want capture-only event recording; it is independent from searchable memory.
-The [MCP interface guide](mcp.md) documents the available tools and state
+The [agent connection guide](connect-agent.md#mcp-tools) documents the available tools and state
 controls.
 
 ## Framework adapter checklist

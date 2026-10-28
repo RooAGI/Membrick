@@ -78,6 +78,7 @@ struct CodexConfig {
 }
 
 struct CodexMcp {
+    backend: mcp_tools::MemoryBackend,
     lifecycle: lifecycle::AdapterLifecycle,
     root: PathBuf,
     max_bytes: usize,
@@ -135,22 +136,30 @@ pub fn install_user_config(root: &Path, config_path: Option<&Path>) -> Result<Pa
         .as_table_mut()
         .context("Codex config 'mcp_servers' must be a table")?;
     mcp_servers.remove("lint-ai");
-    let mut entry = TomlMap::new();
-    entry.insert("command".to_string(), TomlValue::String(executable));
-    entry.insert(
-        "startup_timeout_sec".to_string(),
-        TomlValue::Integer(MCP_STARTUP_TIMEOUT_SECONDS),
-    );
-    // This is a user-global config entry. Keep it disabled and unpinned so
-    // projects without their own trusted override cannot accidentally query
-    // another repository's memory.
-    entry.insert(
-        "args".to_string(),
-        TomlValue::Array(vec![TomlValue::String("--codex-serve".to_string())]),
-    );
-    entry.insert("enabled".to_string(), TomlValue::Boolean(false));
-    entry.insert("tools".to_string(), codex_update_tool_approval_config());
-    mcp_servers.insert("membrick".to_string(), TomlValue::Table(entry));
+    // Global setup's manager entry uses the same name, and the project config
+    // overrides it inside the project. Replacing it here would leave every
+    // other folder without the manager.
+    if !mcp_servers
+        .get(SERVER_NAME)
+        .is_some_and(codex_entry_runs_manager)
+    {
+        let mut entry = TomlMap::new();
+        entry.insert("command".to_string(), TomlValue::String(executable));
+        entry.insert(
+            "startup_timeout_sec".to_string(),
+            TomlValue::Integer(MCP_STARTUP_TIMEOUT_SECONDS),
+        );
+        // This is a user-global config entry. Keep it disabled and unpinned so
+        // projects without their own trusted override cannot accidentally query
+        // another repository's memory.
+        entry.insert(
+            "args".to_string(),
+            TomlValue::Array(vec![TomlValue::String("--codex-serve".to_string())]),
+        );
+        entry.insert("enabled".to_string(), TomlValue::Boolean(false));
+        entry.insert("tools".to_string(), codex_update_tool_approval_config());
+        mcp_servers.insert(SERVER_NAME.to_string(), TomlValue::Table(entry));
+    }
 
     // Codex Desktop and newer Codex CLI builds gate lifecycle hooks behind
     // the stable `features.hooks` flag. Preserve all existing feature flags
@@ -166,6 +175,15 @@ pub fn install_user_config(root: &Path, config_path: Option<&Path>) -> Result<Pa
     write_text_object(&config_path, &toml::to_string_pretty(&config)?)
         .context("failed to write Codex config")?;
     Ok(config_path)
+}
+
+fn codex_entry_runs_manager(entry: &TomlValue) -> bool {
+    entry
+        .get("args")
+        .and_then(TomlValue::as_array)
+        .and_then(|args| args.first())
+        .and_then(TomlValue::as_str)
+        == Some("--manager-serve")
 }
 
 /// Register the global setup-only MCP server. It never opens a project store.
@@ -513,6 +531,7 @@ pub fn run_server(root: &Path, options: CodexServerOptions<'_>) -> Result<()> {
     crate::local_ipc::ensure_provider_resident(root, "codex")?;
     tracing::debug!("MCP server starting");
     let mcp = CodexMcp {
+        backend: mcp_tools::MemoryBackend::Resident,
         lifecycle: lifecycle::AdapterLifecycle::new(root),
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
@@ -520,14 +539,7 @@ pub fn run_server(root: &Path, options: CodexServerOptions<'_>) -> Result<()> {
         max_depth: options.max_depth,
         max_total_bytes: options.max_total_bytes,
         ignore_paths: options.ignore_paths.to_vec(),
-        workspace_watcher: if cfg!(test) {
-            Some(mcp_index::WorkspaceWatcher::new(
-                root,
-                options.ignore_paths,
-            )?)
-        } else {
-            None
-        },
+        workspace_watcher: None,
         store: Mutex::new(None),
     };
     mcp.serve()
@@ -540,7 +552,7 @@ impl CodexMcp {
             .lock()
             .map_err(|_| anyhow::anyhow!("MCP index lock poisoned"))?;
         anyhow::ensure!(
-            !mcp_tools::resident_backend_enabled(),
+            !self.backend.is_resident(),
             "MCP memory indexes are owned by the resident Membrick server"
         );
         let file_changes = self
@@ -557,6 +569,7 @@ impl CodexMcp {
                     RecordingProvider::Codex,
                     &self.root,
                     file_changes,
+                    self.backend,
                 )
             {
                 tracing::warn!("failed to save workspace file changes: {error:#}");
@@ -645,6 +658,8 @@ impl CodexMcp {
                     if let Err(error) = self.lifecycle.bind(session) {
                         tracing::warn!("could not bind Codex adapter session: {error:#}");
                     }
+                } else {
+                    self.lifecycle.tool_call();
                 }
                 let tool = params
                     .get("name")
@@ -716,20 +731,13 @@ impl CodexMcp {
             return mcp_tools::call_update_tool(id, &arguments);
         }
 
-        if mcp_tools::resident_backend_enabled()
-            && (mcp_tools::is_flow_tool_name(tool_name)
+        if self.backend.is_resident()
+            && (mcp_tools::is_extension_tool_name(tool_name)
                 || matches!(
                     tool_name,
                     "search"
                         | "info"
                         | "list_memories"
-                        | "board_open"
-                        | "board_list"
-                        | "board_info"
-                        | "board_post"
-                        | "board_read"
-                        | "board_get"
-                        | "board_search"
                         | "add_memory"
                         | "get_memory"
                         | "delete_memory"
@@ -742,11 +750,17 @@ impl CodexMcp {
         }
 
         match tool_name {
-            name if mcp_tools::is_flow_tool_name(name) => {
+            name if mcp_tools::is_extension_tool_name(name) => {
                 let mut service = self.store()?;
                 let service = service.as_mut().expect("initialized");
-                mcp_tools::call_board_or_memory_tool(
-                    name, id, &arguments, service, &self.root, "codex",
+                mcp_tools::call_mcp_tool_with_backend(
+                    name,
+                    id,
+                    &arguments,
+                    service,
+                    &self.root,
+                    "codex",
+                    self.backend,
                 )
             }
             "search" => {
@@ -956,58 +970,6 @@ impl CodexMcp {
                     error: None,
                 })
             }
-            "board_open" | "board_list" | "board_info" | "board_post" | "board_read"
-            | "board_get" | "board_search" => {
-                let mut service = self.store()?;
-                let service = service.as_mut().expect("MCP store initialized");
-                #[cfg(test)]
-                service.sync_shared_memory(&mcp_index::shared_memory_root(&self.root))?;
-                // Resolve the session from the composed service, which tracks
-                // hook activity, then perform board operations against the
-                // persistent shared-memory service. Do not mutate the
-                // composed in-memory search view for board writes.
-                let mut board_arguments = arguments.clone();
-                if board_arguments.get("session_id").is_none() {
-                    if let Some(session_id) =
-                        mcp_tools::resolve_search_session_id(&board_arguments, service, "codex")
-                            .map_err(anyhow::Error::msg)?
-                    {
-                        board_arguments["session_id"] = json!(session_id);
-                    }
-                }
-                // Board owner/workspace: the workspace root scopes boards;
-                // "mcp" is the stable owner for agent-posted boards.
-                let workspace = self.root.to_string_lossy().to_string();
-                let result = crate::memory_api::MemoryService::with_shared_memory(
-                    &self.root,
-                    |board_service| {
-                        mcp_tools::dispatch_board_tool(
-                            tool_name,
-                            &board_arguments,
-                            board_service,
-                            "mcp",
-                            &workspace,
-                            RecordingProvider::Codex.as_str(),
-                        )
-                        .map_err(anyhow::Error::msg)
-                    },
-                )
-                .map_err(|error| error.to_string());
-                match result {
-                    Ok(payload) => Ok(JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: Some(json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&payload)?,
-                            }]
-                        })),
-                        error: None,
-                    }),
-                    Err(message) => Ok(error_response(id, -32602, &message)),
-                }
-            }
             "add_memory" | "get_memory" | "delete_memory" => {
                 let mut service = self.store()?;
                 let service = service.as_mut().expect("MCP store initialized");
@@ -1137,8 +1099,7 @@ impl CodexMcp {
             },
         ]
         .into_iter()
-        .chain(mcp_tools::board_tool_definitions())
-        .chain(mcp_tools::flow_tool_definitions())
+        .chain(mcp_tools::extension_tool_definitions())
         .chain(mcp_tools::memory_tool_definitions())
         .chain(std::iter::once(mcp_tools::update_tool_definition()))
         .collect()
@@ -1324,6 +1285,20 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn project_install_keeps_global_manager_entry() {
+        let path = temp_path("codex-install-keeps-manager");
+        fs::write(&path, "").unwrap();
+        install_manager_config(Some(&path)).unwrap();
+        install_user_config(&env::current_dir().unwrap(), Some(&path)).unwrap();
+        let config: TomlValue = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let manager = &config["mcp_servers"][SERVER_NAME];
+        assert_eq!(manager["args"][0].as_str(), Some("--manager-serve"));
+        assert_eq!(manager["enabled"].as_bool(), Some(true));
+        assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+        let _ = fs::remove_file(path);
+    }
+
     fn test_mcp(root: PathBuf, documents: Vec<SourceDocument>) -> CodexMcp {
         let mut store = IndexStore::new(segmented_store_options());
         for document in documents {
@@ -1331,6 +1306,7 @@ mod tests {
         }
         store.refresh().unwrap();
         CodexMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             lifecycle: lifecycle::AdapterLifecycle::new(&root),
             root,
             max_bytes: 0,
@@ -1393,6 +1369,7 @@ mod tests {
         .unwrap();
 
         let mcp = CodexMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             lifecycle: lifecycle::AdapterLifecycle::new(&root),
             root: root.clone(),
             max_bytes: 5_000_000,
@@ -1630,6 +1607,7 @@ args = ["old"]
         let _ = fs::remove_file(settings_path);
     }
 
+    #[cfg(feature = "flowboard-tests")]
     #[test]
     fn tools_list_exposes_search_info_and_recording() {
         let root = temp_dir("mcp-tools");
@@ -1647,6 +1625,8 @@ args = ["old"]
             .unwrap()
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
+            // The server tests link a test-only extension into this binary.
+            .filter(|name| !name.starts_with("test_serialization_"))
             .collect::<Vec<_>>();
         assert_eq!(
             names,
@@ -1663,6 +1643,7 @@ args = ["old"]
                 "board_list".to_string(),
                 "board_info".to_string(),
                 "board_post".to_string(),
+                "board_post_edit".to_string(),
                 "board_read".to_string(),
                 "board_get".to_string(),
                 "board_search".to_string(),
@@ -1680,6 +1661,38 @@ args = ["old"]
                 "enrich_doc".to_string(),
                 "update_membrick".to_string()
             ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "flowboard-tests")]
+    #[test]
+    fn board_post_edit_is_dispatched() {
+        let root = temp_dir("codex-board-post-edit-dispatch");
+        let mcp = test_mcp(root.clone(), vec![]);
+        let response = mcp
+            .handle_request(JsonRpcRequest {
+                id: Some(json!(1)),
+                method: "tools/call".to_string(),
+                params: Some(json!({
+                    "name": "board_post_edit",
+                    "arguments": {
+                        "board_id": "board:mcp:test:missing-board",
+                        "post_id": "missing-post",
+                        "content": "updated"
+                    }
+                })),
+            })
+            .unwrap();
+
+        let message = response
+            .error
+            .expect("missing post returns an error")
+            .message;
+        assert_ne!(message, "unknown tool");
+        assert!(
+            message.contains("post") || message.contains("board"),
+            "unexpected error: {message}"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1738,6 +1751,7 @@ args = ["old"]
     fn tools_list_does_not_initialize_store() {
         let root = temp_dir("mcp-lazy-store");
         let mcp = CodexMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             lifecycle: lifecycle::AdapterLifecycle::new(&root),
             root: root.clone(),
             max_bytes: 1_000_000,

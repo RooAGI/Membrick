@@ -1,426 +1,96 @@
-# IndexStore and MemoryIndex Concurrency
+# Index concurrency and publication
 
-This note captures the recommended concurrency model for large Membrick
-deployments.
+Membrick separates one mutable writer from immutable search snapshots. The
+resident owns a project's persistent stores and is the only process allowed to
+write them. Search requests keep using a published snapshot while accepted
+changes are applied and a replacement snapshot is built.
 
-The [write publication implementation and verification plan](write-publication-plan.md)
-tracks the incremental refresh and proposed background builder. The staged
-writer behavior below describes the current implementation.
+## Ownership and workspace isolation
 
-## Current Model
+The resident has one workspace runtime per open project root. It canonicalizes
+requested roots, checks them against the configured allowlist, and initializes
+allowed additional workspaces on first use. The default active-workspace cap is
+8, including the primary workspace; `--max-active-workspaces` changes it. An
+allowed but unopened workspace is rejected when the cap is full rather than
+opened implicitly.
 
-`IndexStore` is the mutable owner of the corpus state:
+Each runtime coordinates two logical stores: project source documents and
+captured agent memories. They share the resident's bounded writer queue,
+publication worker, and composed search view, while `MemoryService` selects the
+target store for each operation. Search reads use the matching immutable view.
+The resident's IPC and HTTP listeners route into these runtimes. A standalone
+server or an embedded `MemoryService` must acquire the project owner lock before
+opening a project's store, so two processes cannot write the same project
+concurrently.
 
-- source documents
-- derived `DocRecord`s
-- chunk lifecycle metadata
-- temporal facts
-- the current semantic `MemoryIndex` snapshot
-
-`MemoryIndex` is the immutable semantic query snapshot. It is optimized for
-batch construction and fast reads over compact global structures, including
-the snapshot's Tantivy lexical index. It is not the right object to mutate
-incrementally in place.
-
-`IndexStore::refresh()` builds and publishes a complete immutable generation.
-Membrick accepts requests through its resident local IPC listener or its
-standalone HTTP listener. Both listeners use the same API router and workspace
-registry. Bundled Rust MCP adapters and lifecycle hooks use local IPC; custom
-clients and separately configured integrations can use HTTP. For each open
-workspace, the server has one mutable `MemoryService` owner and a detached
-published `MemoryService` read view. The indexes are shared through `Arc`;
-visibility and reranking metadata are captured with the same generation. Each
-search retains that view independently of the mutable owner's lock. The
-workspace registry keeps these owners isolated by canonical project root.
-
-The resident workspace owner contains two private backing stores: workspace
-source documents and shared captured memories. Both use one bounded writer
-queue. Target facades select the store through `MemoryService`; they share
-admission capacity, the owner, the published snapshot, and one background
-builder. Board and lifecycle writes also enter this queue. A global flush
-waits for the captured target revisions of both stores, so a provider write
-cannot be left unpublished by a workspace-only flush.
-
-## Workspace Registry and Resource Bounds
-
-The primary `--project-root` is opened at startup and is allowed by default.
-Additional projects must be configured with repeatable `--workspace-root PATH`
-options. At request time, the registry canonicalizes the requested path and
-requires an exact match in that allowlist before opening stores, creating
-workspace data, or starting a watcher. A parent directory or unlisted sibling
-does not grant access to its projects.
-
-Workspace-aware MCP calls, provider searches, document upserts, and hooks use
-the same registry. The primary workspace and each additional workspace retain
-one `MemoryService`, writer queue, published search view, and watcher. The
-first request for an allowed additional root initializes it lazily. Calls for
-the same root share one initialization; opening a different root does not block
-searches against already-open roots.
-
-The number of resident workspaces is bounded by `--max-active-workspaces`,
-which defaults to 8 and includes the primary workspace. Opening a workspace
-reserves capacity while initialization is in progress. If the cap is full, an
-allowed but unopened workspace receives HTTP `429` and is not initialized.
-Active runtimes remain resident until server shutdown; idle eviction is not
-implemented. Restarting the server releases the resident workspace slots.
-
-```mermaid
-flowchart LR
-    Agent[Provider MCP client] --> Adapter[Bundled Rust adapter]
-    Adapter -->|local IPC| Backend[Resident Membrick owner]
-    Hooks[Provider hooks] -->|local IPC| Backend
-    Http[Custom HTTP clients] -->|TCP HTTP| Backend
-    Backend --> Registry[Canonical-root allowlist and capacity cap]
-    Registry --> A[Workspace A runtime]
-    Registry --> B[Workspace B runtime]
-    A --> QA[One bounded writer queue]
-    QA --> MA[Resident MemoryService A]
-    MA --> SA[Published search view A]
-    B --> QB[One bounded writer queue]
-    QB --> MB[Resident MemoryService B]
-    MB --> SB[Published search view B]
-```
-
-On macOS and Linux, the local endpoint is a user-private Unix domain socket;
-Windows uses a named pipe. The resident owner starts on the first provider
-request. The standalone HTTP server is a separate listener mode. Do not run
-both modes as writers for the same workspace stores. See
-[Local IPC server architecture](local-ipc-architecture.md) for startup,
-endpoint security, and the transport comparison.
-
-The compatibility endpoint `POST /provider-memory/add/batch` has no workspace
-field and continues to write to the primary workspace. Workspace-aware MCP
-upserts and hook routes resolve the requested project through the registry,
-regardless of whether the request arrived over local IPC or standalone HTTP.
-Provider search uses the requested workspace when supplied and otherwise
-searches the primary workspace.
+See [local IPC architecture](local-ipc-architecture.md) for startup and
+transport details and the [`MemoryService` boundary](memory-service-api.md) for
+the domain API.
 
 ## Staged writes through HTTP or IPC
 
-```mermaid
-flowchart LR
-    Http[HTTP add requests] --> Q[Bounded queue]
-    Ipc[IPC add requests] --> Q
-    Q --> W[Single writer]
-    W --> J[Append and sync journal]
-    J --> M[Mutable IndexStore]
-    M --> R[Freeze accumulated changes]
-    R --> B[One background builder]
-    B --> S[Published immutable generation]
-    Search --> S
-    M --> C[Periodic or explicit checkpoint]
-    C --> D[Persist records and core]
-    D --> T[Reclaim journal]
-```
-
-With a disk-backed `--index`, HTTP `/add` and `/add/batch` endpoints and
-workspace-aware IPC equivalents acknowledge after validating and syncing their
-transaction to `pending-adds.jsonl`, then applying it to the mutable store. They do not refresh for each add. The default response includes
-`published: false` when the request is staged; it has no final adjudication.
-
-Publication starts 250 ms after the first pending add, or after 512 pending
-documents. These are scheduling triggers, not latency guarantees: rebuilds,
-checkpoints and queued writes take additional time. The deadline is not reset
-by incoming writes. One background builder creates a frozen generation while
-the writer continues accepting staged adds. The admission queue holds 32
-commands; full admission returns `429`. Snapshot capture and checkpoints still
-hold the mutable owner and can delay acknowledgements.
-Unpublished document accumulation is also bounded at 32,768 documents and returns
-`429` when admission would exceed it. In-memory services have the same publication
-contract but cannot promise restart durability.
-
-Full checkpoints run every 30 seconds and on explicit flush. Publication can
-reuse unchanged segments without rewriting the full persisted corpus each time.
-Checkpoint builds capture a journal boundary and matching records and index.
-After syncing that generation, the owner atomically retains only journal
-transactions after its captured boundary. Writes accepted during the build
-remain recoverable. Startup replays complete transaction lines
-idempotently and drops an interrupted final line. A remaining journal forces a
-rebuild, including when a crash left newer records alongside an older core.
-Committed journal corruption fails startup instead of silently dropping writes.
-
-`POST /flush` and `POST /v1/memories/refresh` capture a target revision and wait
-until it is published and checkpointed. The writer continues accepting later
-adds while building that generation. Deferred flush and visibility replies are
-bounded at 32; exceeding that limit returns `429` before accepting another write.
-SIGINT and SIGTERM drain HTTP requests and flush before
-shutdown. A killed process recovers acknowledged writes from its journal.
-Cancelling an HTTP request does not cancel a command already admitted to the writer.
-
-Use `?wait_for_visibility=true` on either add endpoint for immediate visibility
-and the existing final adjudication response. Idempotently retrying that request
-after publication also returns its final receipt. Synchronous library calls,
-hooks and provider-memory HTTP endpoints retain their immediate publication
-behavior; synchronous mutations checkpoint outstanding staged adds before
-returning, so a later restart cannot replay an add that was subsequently deleted.
-
-Configure the primary HTTP writer with:
-
-| Server option | Default | Meaning |
-|---|---:|---|
-| `--refresh-interval-ms` | 250 | Delay from the first pending add |
-| `--refresh-batch-size` | 512 | Pending documents that trigger publication |
-| `--checkpoint-interval-seconds` | 30 | Full checkpoint cadence |
-
-All values must be positive. Disk-backed staging requires a single process
-owner of the index root. It is not a distributed writer protocol; direct writes
-from a second process to the same root are unsupported. Use a dedicated `--index`
-root for the primary HTTP ingestion server and route its writes through that server.
-Source-document, record, and chunk-lifecycle maps are shared with copy-on-write
-between generations; temporal facts and semantic-relation metadata are still
-cloned at capture. Searches keep using the previous generation during a
-background build. Checkpoint serialization and file commits still hold the
-owner and can delay acceptance. Synchronous library/provider mutations wait
-for the active builder and checkpoint before returning.
-
-## Recommended Rule
-
-There are two separate concurrency questions:
-
-- snapshot publication: how many replacements for the currently queryable
-  state should be built at the same time
-- segmentation: whether one logical corpus should be represented by many
-  smaller queryable `MemoryIndex` segments
-
-For snapshot publication, build at most one replacement generation at a time.
-
-In steady state, a store should have:
-
-- one published query generation used by readers
-- zero or one pending query generation for the next revision
-
-If the store is not segmented, a query generation is one `MemoryIndex`. If the
-store is segmented, a query generation is a set of `MemoryIndex` segments plus a
-router/merge layer.
-
-Avoid building many complete replacement generations for the same store. They
-duplicate most of the corpus in memory, compete for CPU, and usually finish with
-obsolete revisions when writes continue arriving.
-
-## Segmented MemoryIndex Sets
-
-For large corpora, `IndexStore` can publish many smaller `MemoryIndex` segments
-as one logical search surface.
-
-Examples:
-
-- docs corpus: one segment per folder, product area, or bounded chunk range
-- one giant document: split into chunks, then pack those chunks into bounded
-  segments
-- agent memory: one segment per session, or per session window, when session is
-  the natural routing unit
-
-This is different from creating many unrelated `IndexStore`s. The `IndexStore`
-can still be the persistent owner of records, lifecycle metadata, and lexical
-state, while the query layer owns a set of immutable segment snapshots.
-
-A reasonable segment policy is:
-
-- route-based segment when a stable key exists, such as folder, repo, session,
-  tenant, language, or time window
-- size-based segment when no stable key is small enough
-- configurable default chunk/document limit per segment
-- rebuild only the changed segment when possible
-- publish the new segment set atomically as one generation
-
-For a giant document split into chunks, the rough upper bound is:
-
-```text
-segment_count = ceil(total_chunks / memory_index_chunk_limit)
-```
-
-That segment count is not automatically the desired CPU concurrency. The build
-concurrency should be capped separately by available cores, memory headroom, and
-I/O pressure:
-
-```text
-build_parallelism = min(segment_count, configured_parallelism, resource_limit)
-```
-
-In other words, `memory_index_chunk_limit` controls segment size. A separate
-parallelism limit controls how many segment builds can run at once.
-
-The chunking/build pipeline is another level of parallelism. Its worker count
-should normally be a small CPU-bound limit, for example four workers by default,
-rather than the number of segments. That keeps the pipeline predictable:
-
-```text
-chunk_pipeline_workers = min(configured_workers, cpu_limit)
-```
-
-## Implemented Segmented Query Path
-
-The current implementation builds validated segment snapshots, routes queries
-to fixed or adaptive candidate sets, and merges segment results against shared
-global BM25 statistics. It remains a single-process segmented index, not a
-remote sharded storage system.
-
-The implemented units are:
-
-1. Define `MemoryIndexSegment`.
-   - `segment_id`
-   - `boundary`, such as folder, session, language, time window, or chunk range
-   - `doc_ids`
-   - one inner `MemoryIndex`
-   - one compact `SegmentProfile`
-2. Build profiles for existing records without changing query behavior.
-3. Add a router that ranks segments for a query.
-4. Query the top N routed segments and merge top-k results.
-5. Expand the routed set adaptively when requested and evidence coverage is
-   insufficient.
-6. Publish the replacement segment set as one immutable generation.
-
-This gives a small benchmarkable ladder. Each step can be compared against the
-current one-global-`MemoryIndex` baseline.
-
-## Segment Routing
-
-Routing should start with cheap sparse statistics that match the current
-implementation.
-
-`MemoryIndex` already derives:
-
-- important terms
-- key entities
-- topics
-- document type guesses
-- temporal metadata
-- group/session metadata
-- sparse postings
-
-A `SegmentProfile` can summarize these as normalized distributions:
-
-- term distribution
-- entity distribution
-- topic distribution
-- doc type distribution
-- optional time range
-- optional route keys, such as folder/session/language
-
-The first router can use sparse similarity:
-
-```text
-score(segment, query) =
-  lexical_overlap(query_terms, segment_terms)
-  + entity_overlap(query_entities, segment_entities)
-  + topic_match(query_topic, segment_topics)
-  + route_key_bonus
-  + temporal_window_bonus
-```
-
-For a more ML-style router, treat the query as a sparse distribution and compare
-it with each segment profile. KL divergence can work if smoothing is handled
-carefully:
-
-```text
-route_score = -KL(query_distribution || segment_distribution)
-```
-
-Jensen-Shannon divergence may be safer for early implementation because it is
-symmetric and bounded:
-
-```text
-route_score = 1 - JS(query_distribution, segment_distribution)
-```
-
-K-means is useful at segment construction time when there is no obvious boundary
-like folder or session. In that case, cluster chunks/documents by sparse
-term/entity vectors, then build one `MemoryIndex` per cluster. For docs and
-agent-memory corpora, explicit boundaries should be tried first because they are
-easier to explain and update incrementally.
-
-The router should keep recall safeguards:
-
-- query at least one fallback segment when routing confidence is low
-- query more segments for broad or ambiguous questions
-- preserve a `query_all_segments` debug mode
-- record segment routing diagnostics in benchmarks
-
-## Freshness Modes
-
-The useful public API shape is likely three query modes:
-
-- `Fresh`: synchronously refresh before query; best for correctness-sensitive
-  reads and small stores.
-- `LatestAvailable`: query the current snapshot immediately and start or poll a
-  background refresh when the store is dirty; best default for large stores.
-- `SnapshotOnly`: query the current snapshot without starting refresh work; best
-  for high-QPS serving paths where refresh is scheduled separately.
-
-The existing `query()` method behaves like `Fresh`.
-
-## When To Use Multiple IndexStores
-
-Use multiple `IndexStore`s only when there is a stable routing boundary that
-queries can exploit before search:
-
-- tenant or organization
-- product area
-- repository
-- project or workspace
-- time partition, if most queries target a known window
-- language, once multi-language support has separate analyzers or ranking rules
-
-Do not shard only because the corpus is large. Sharding helps when it reduces
-the candidate set for most queries. If every query must fan out to every shard,
-the system pays extra orchestration and merge cost while losing global ranking
-context.
-
-When the desired behavior is "one corpus, many searchable pieces," prefer
-segmented `MemoryIndex` sets inside one logical `IndexStore` before splitting
-into many independent stores.
-
-## Large Corpus Strategy
-
-For a huge corpus, prefer this order:
-
-1. Keep one `IndexStore` per routable corpus scope.
-2. Add `MemoryIndex` segmentation inside that store when the corpus is too large
-   for one snapshot.
-3. Publish one query generation at a time, where a generation may contain many
-   segments.
-4. Rebuild only changed segments when possible.
-5. Cap segment build parallelism separately from segment count.
-6. Debounce rebuilds when many writes arrive together.
-7. Add a scheduled refresh path for serving workloads.
-8. Split into multiple `IndexStore`s only after query routing data shows most
-   queries hit a subset.
-
-This model keeps memory bounded and avoids rebuilding obsolete snapshots.
-
-## Current Implementation and Remaining Work
-
-Current behavior:
-
-- `SourceDocument` is the canonical ingestion unit.
-- `MemoryIndexLayout` selects `Single`, `Segmented`, or `AdaptiveSegmented`.
-- Segmented layouts build one validated `MemoryIndex` per group/session
-  boundary and publish the complete set as one generation.
-- Fixed routing queries the configured top-N segments. Adaptive routing starts
-  at the same top-N and expands to `max_query_n` when evidence coverage is
-  insufficient.
-- Empty or low-signal routes execute a bounded deterministic fallback, and
-  diagnostics report the segments actually executed.
-- The primary HTTP server stages adds and schedules publication through one
-  writer. Searches retain a detached `MemoryService` view and its immutable
-  snapshot independently of the mutable owner lock.
-- Segmented refreshes rebuild affected segments and share unchanged segment
-  indexes. Single-index refreshes rebuild that index. Publication replaces the
-  complete generation atomically; query postings are not mutated in place.
-- Full checkpoints persist records, lifecycle metadata and the binary core.
-  Scheduled publications defer that corpus-wide persistence until checkpoint.
-
-Operational metrics that remain useful include segment count, selected segment
-IDs, routed relevant-segment recall, snapshot generation, build duration, and
-query latency by routing mode.
-
-## Validation of staged writes
-
-`cargo test --lib` passed all 808 tests after this change. New coverage exercises
-journal replay, incomplete tails, committed corruption, interrupted checkpoints,
-symlink refusal, final receipt completion, deletion without resurrection,
-concurrent adds, retained read generations, reads during a held owner lock,
-publication during continuous writes, cancellation and bounded queue admission.
-An HTTP test covers staged acknowledgement, flush, immediate-visibility retries
-and user isolation. The release server built successfully, and the uv MkDocs
-build and three generated-site tests passed.
+For disk-backed workspace writes through the staged HTTP and IPC endpoints,
+the resident validates the operation, appends and syncs its transaction to
+`pending-adds.jsonl`, and applies it to the mutable store. The acknowledgement
+may say `published: false`: the write is durable and accepted, but a search
+snapshot containing it is not published yet.
+
+Publication is scheduled 250 ms after the first pending add or when 512
+documents are pending. These are scheduling triggers, not visibility
+deadlines. The writer continues accepting work while one background builder
+constructs the next snapshot. Admission is bounded: the command queue holds 32
+commands and unpublished accumulation is capped at 32,768 documents. Saturated
+requests receive `429` before acceptance.
+
+Full checkpoints run every 30 seconds and on explicit flush. A checkpoint
+captures a journal boundary and a matching record/index generation, persists
+that state, then reclaims only journal entries covered by the checkpoint.
+Startup replays complete transaction lines idempotently and discards an
+interrupted final line. Corruption in a committed transaction fails startup
+rather than silently losing accepted data.
+
+`POST /flush` and `POST /v1/memories/refresh` wait for the captured target
+revision to publish and checkpoint. `wait_for_visibility=true` on an add waits
+for the accepted write to reach that published state and returns its final
+receipt. Later writes do not move an earlier request's target. A request
+cancellation does not undo work already admitted to the writer. Shutdown drains
+requests and flushes; after a crash, the journal is replayed.
+
+Memory operations exposed by `MemoryService` and many provider endpoints
+publish synchronously. Source-document upserts and durable transcript capture
+can use the resident's staged publication and capture workers. The caller's
+operation contract determines whether acceptance, persistence, or published
+visibility is the completion point. In-memory services can publish snapshots
+but do not provide disk-restart durability.
+
+## Single and segmented snapshots
+
+`MemoryIndexLayout` selects a single index, a fixed-width segmented index, or
+adaptive segmented routing. A snapshot is replaced as one generation; readers
+never observe in-place mutation of its postings. Segmented refreshes can reuse
+unchanged segment indexes and rebuild affected segments. Single-index refreshes
+rebuild the single index. Routing diagnostics identify selected and executed
+segments, and segmented queries use shared corpus BM25 statistics when merging
+their candidates.
+
+The resident's production pipeline defaults to a segmented layout with a
+five-segment starting breadth. Adaptive expansion, global-arm fusion, and
+other query settings are configurable. See [distributed query architecture](distributed-query-architecture.md)
+for the local segment query and reduction model. The word “distributed” there
+describes fan-out across local segments; it does not mean that the resident is
+a replicated multi-node writer.
+
+## Operational guidance
+
+- Route project writes through its resident. Do not open a second writable
+  service for the same store.
+- Use the staged HTTP endpoint when asynchronous publication is useful; set
+  `wait_for_visibility=true` when the caller needs a searchable result before
+  returning.
+- Treat `429` admission errors as not accepted and retry after backoff with the
+  same request identity when the operation contract supports it.
+- Monitor queue admission, pending documents, publication latency, checkpoint
+  duration, snapshot generation, selected segments, and completeness.
+
+For server flags and request behavior, see the [server guide](server.md) and
+[HTTP API reference](api/http-overview.md).

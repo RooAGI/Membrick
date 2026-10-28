@@ -36,8 +36,16 @@ pub(crate) fn setup_global() -> Result<()> {
     for (client, path) in installed {
         println!("  {client}: {}", path.display());
     }
-    println!("Restart those agents to load the global Membrick project manager.");
-    println!("Project memory tools remain separate and are enabled with `membrick install <provider> .`.");
+    println!("Each agent now has one `membrick` MCP server. Outside installed projects it");
+    println!("shows the project manager tools. Inside a project installed with");
+    println!("`membrick install <provider> .` the same server shows that project's memory tools.");
+    #[cfg(feature = "agy")]
+    {
+        println!("AGY has no project-level MCP config, so its one global `membrick` server");
+        println!("runs the manager until you install an AGY project. After that it serves that");
+        println!("project's memory tools in every folder, until `membrick uninstall agy <PATH>`.");
+    }
+    println!("Restart those agents to load the change.");
     Ok(())
 }
 
@@ -112,18 +120,18 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "membrick_project_status".into(),
-            description: "Check Membrick registration and project state for one explicit project path and provider (codex or claude). This manager does not read project memories.".into(),
-            input_schema: json!({"type":"object","properties":{"project_path":{"type":"string"},"provider":{"type":"string","enum":["codex","claude"]}},"required":["project_path","provider"],"additionalProperties":false}),
+            description: "Check Membrick registration and project state for one explicit project path and provider (codex, claude or agy).This manager does not read project memories.".into(),
+            input_schema: json!({"type":"object","properties":{"project_path":{"type":"string"},"provider":{"type":"string","enum":["codex","claude","agy"]}},"required":["project_path","provider"],"additionalProperties":false}),
         },
         ToolDefinition {
             name: "membrick_install_project".into(),
-            description: "Install Membrick's project-scoped MCP, hooks, and guidance for one explicit project path and provider (codex or claude). Writes provider configuration; call only when the user asks to install or enable Membrick for that project.".into(),
-            input_schema: json!({"type":"object","properties":{"project_path":{"type":"string"},"provider":{"type":"string","enum":["codex","claude"]}},"required":["project_path","provider"],"additionalProperties":false}),
+            description: "Install Membrick's project-scoped MCP, hooks, and guidance for one explicit project path and provider (codex, claude or agy).Writes provider configuration; call only when the user asks to install or enable Membrick for that project. For agy, AGY has one global membrick server, so the install replaces this manager and any other AGY project in every folder until the project is removed.".into(),
+            input_schema: json!({"type":"object","properties":{"project_path":{"type":"string"},"provider":{"type":"string","enum":["codex","claude","agy"]}},"required":["project_path","provider"],"additionalProperties":false}),
         },
         ToolDefinition {
             name: "membrick_remove_project".into(),
             description: "Remove Membrick's provider configuration for one explicit project path. Keeps the project's .membrick data and the global project manager. Call only when the user asks to remove Membrick from that project.".into(),
-            input_schema: json!({"type":"object","properties":{"project_path":{"type":"string"},"provider":{"type":"string","enum":["codex","claude"]}},"required":["project_path","provider"],"additionalProperties":false}),
+            input_schema: json!({"type":"object","properties":{"project_path":{"type":"string"},"provider":{"type":"string","enum":["codex","claude","agy"]}},"required":["project_path","provider"],"additionalProperties":false}),
         },
     ]
 }
@@ -186,8 +194,8 @@ fn required_provider(args: &Value) -> Result<&str> {
         .and_then(Value::as_str)
         .context("provider is required")?;
     anyhow::ensure!(
-        matches!(provider, "codex" | "claude"),
-        "provider must be codex or claude"
+        matches!(provider, "codex" | "claude" | "agy"),
+        "provider must be codex, claude or agy"
     );
     Ok(provider)
 }
@@ -257,7 +265,7 @@ mod tests {
         .unwrap_err();
         assert!(error
             .to_string()
-            .contains("provider must be codex or claude"));
+            .contains("provider must be codex, claude or agy"));
     }
 
     #[test]

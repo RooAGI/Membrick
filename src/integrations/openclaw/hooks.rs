@@ -110,7 +110,12 @@ pub fn run_hook(kind: OpenClawHookKind, fallback_root: &Path) -> Result<()> {
             return Ok(());
         }
     };
-    let output = process_hook(kind, input, fallback_root);
+    let output = process_hook(
+        kind,
+        input,
+        fallback_root,
+        crate::integrations::mcp_tools::MemoryBackend::Resident,
+    );
     emit(&output)
 }
 
@@ -123,11 +128,12 @@ pub fn process_http_hook(kind: OpenClawHookKind, value: Value, fallback_root: &P
             .get("session_id")
             .cloned()
             .unwrap_or_default();
-        crate::integrations::mcp_tools::upsert_hook_document(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             fallback_root,
             "openclaw",
             &session_id,
-            document,
+            vec![document],
+            crate::integrations::mcp_tools::MemoryBackend::Resident,
         )
     })
 }
@@ -148,12 +154,23 @@ pub fn process_http_hook_with_writer(
     };
     // HTTP callers cannot choose the server's workspace via hook fields.
     match fallback_root.canonicalize() {
-        Ok(root) => process_hook_at_root(kind, input, &root, &mut publish),
+        Ok(root) => process_hook_at_root(
+            kind,
+            input,
+            &root,
+            &mut publish,
+            crate::integrations::mcp_tools::MemoryBackend::Resident,
+        ),
         Err(_) => default_output(kind, &input),
     }
 }
 
-fn process_hook(kind: OpenClawHookKind, input: OpenClawHookInput, fallback_root: &Path) -> Value {
+fn process_hook(
+    kind: OpenClawHookKind,
+    input: OpenClawHookInput,
+    fallback_root: &Path,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Value {
     let root = match resolve_root(&input, kind, fallback_root) {
         Ok(root) => root,
         Err(error) => {
@@ -161,20 +178,23 @@ fn process_hook(kind: OpenClawHookKind, input: OpenClawHookInput, fallback_root:
             return default_output(kind, &input);
         }
     };
+    // OpenClaw hook input names no session, so this marks the provider only.
+    crate::integrations::provider_lifecycle::note_activity(&root, "openclaw", None);
     let mut publish = |document: crate::SourceDocument| {
         let session_id = document
             .filters
             .get("session_id")
             .cloned()
             .unwrap_or_default();
-        crate::integrations::mcp_tools::upsert_hook_document(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             &root,
             "openclaw",
             &session_id,
-            document,
+            vec![document],
+            backend,
         )
     };
-    process_hook_at_root(kind, input, &root, &mut publish)
+    process_hook_at_root(kind, input, &root, &mut publish, backend)
 }
 
 fn process_hook_at_root(
@@ -182,6 +202,7 @@ fn process_hook_at_root(
     input: OpenClawHookInput,
     root: &Path,
     publish: &mut dyn FnMut(crate::SourceDocument) -> Result<()>,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Value {
     let session_id = session_id(&input, kind);
     if let Err(error) = record_event_if_enabled(
@@ -193,7 +214,7 @@ fn process_hook_at_root(
     ) {
         tracing::warn!("Membrick OpenClaw session recording failed open: {error:#}");
     }
-    let output = match handle_hook(kind, &input, &root, publish) {
+    let output = match handle_hook(kind, &input, &root, publish, backend) {
         Ok(output) => output,
         Err(error) => {
             tracing::warn!("Membrick OpenClaw hook failed open: {error:#}");
@@ -216,9 +237,10 @@ fn handle_hook(
     input: &OpenClawHookInput,
     root: &Path,
     publish: &mut dyn FnMut(crate::SourceDocument) -> Result<()>,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<Value> {
     match kind {
-        OpenClawHookKind::Bootstrap => handle_bootstrap(input, root),
+        OpenClawHookKind::Bootstrap => handle_bootstrap_with_backend(input, root, backend),
         OpenClawHookKind::AgentEnd => handle_agent_end(input, root, publish),
         OpenClawHookKind::BeforeReset => handle_before_reset(input, root, publish),
         OpenClawHookKind::SessionStart => handle_session_start(input),
@@ -338,7 +360,11 @@ fn current_timestamp() -> String {
 /// Recall from the OpenClaw memory store and return the bootstrap-file list
 /// with `MEMBRICK.md` appended (replacing any stale entry with the same name so
 /// repeated per-turn firings stay idempotent).
-fn handle_bootstrap(input: &OpenClawHookInput, root: &Path) -> Result<Value> {
+fn handle_bootstrap_with_backend(
+    input: &OpenClawHookInput,
+    root: &Path,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<Value> {
     let existing = input
         .event
         .pointer("/context/bootstrapFiles")
@@ -359,7 +385,7 @@ fn handle_bootstrap(input: &OpenClawHookInput, root: &Path) -> Result<Value> {
         } else {
             query
         };
-        let memories = retrieve_memories(root, query)?;
+        let memories = retrieve_memories_with_backend(root, query, backend)?;
         if !memories.trim().is_empty() {
             // The injected file lives at the resolved root (which already
             // fell back to the install root when the event omitted
@@ -377,13 +403,18 @@ fn handle_bootstrap(input: &OpenClawHookInput, root: &Path) -> Result<Value> {
     Ok(json!({ "bootstrapFiles": files }))
 }
 
-fn retrieve_memories(root: &Path, query: &str) -> Result<String> {
-    let results = crate::integrations::mcp_tools::search_hook_documents(
+fn retrieve_memories_with_backend(
+    root: &Path,
+    query: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<String> {
+    let results = crate::integrations::mcp_tools::search_hook_documents_with_backend(
         root,
         "openclaw",
         None,
         query,
         DEFAULT_TOP_K,
+        backend,
     )?;
     let mut output = String::new();
     for result in results
@@ -644,6 +675,23 @@ fn handle_shutdown() -> Result<Value> {
 }
 
 #[cfg(test)]
+fn handle_bootstrap(input: &OpenClawHookInput, root: &Path) -> Result<Value> {
+    handle_bootstrap_with_backend(
+        input,
+        root,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+#[cfg(test)]
+fn retrieve_memories(root: &Path, query: &str) -> Result<String> {
+    retrieve_memories_with_backend(
+        root,
+        query,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -851,7 +899,11 @@ mod tests {
     #[test]
     fn bootstrap_uses_default_query_without_user_text() {
         let root = test_root();
-        write_memory_doc(&root, "seed-1", "Decisions about the implemented changes were recorded after we resolved the deployment failures.");
+        write_memory_doc(
+            &root,
+            "seed-1",
+            "Decisions about the implemented changes were recorded after we resolved the deployment failures.",
+        );
         let input = bootstrap_input(root.to_str().unwrap(), "", vec![]);
         let output = handle_bootstrap(&input, &root).unwrap();
         let files = output.get("bootstrapFiles").unwrap().as_array().unwrap();

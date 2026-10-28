@@ -142,11 +142,11 @@
           <section class="view" id="view-boards" aria-label="Boards" hidden>
             <div class="boards-layout">
               <section class="panel boards-sidebar">
-                <div class="panel__head"><div><p class="eyebrow">Agent-authored state</p><h2>Project boards</h2></div><span id="boards-count" class="panel__note"></span></div>
+                <div class="panel__head"><div class="list-rail__title"><p class="eyebrow">Agent-authored state</p><h2>Project boards</h2></div><span id="boards-count" class="panel__note"></span><button type="button" class="list-rail__toggle" data-rail-toggle="boards" data-rail-noun="board list" aria-controls="boards-list" aria-expanded="true" aria-label="Collapse board list" title="Collapse board list"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" /></svg></button></div>
                 <p class="muted boards-intro">Board types and links are agent-authored. Membrick displays them without inferring task status.</p>
                 <div id="boards-list" class="boards-list" aria-live="polite"><div class="empty-state">Open Boards to load project work.</div></div>
               </section>
-              <section class="panel boards-detail" id="board-detail" aria-live="polite">
+              <section class="boards-detail" id="board-detail" aria-live="polite">
                 <div class="empty-state">Choose a project or board to see its posts and links.</div>
               </section>
             </div>
@@ -155,7 +155,7 @@
           <section class="view" id="view-flows" aria-label="Flows" hidden>
             <div class="flows-layout">
               <section class="panel flows-sidebar">
-                <div class="panel__head"><div><p class="eyebrow">Workflow runs</p><h2>Flows</h2></div><span id="flows-count" class="panel__note"></span></div>
+                <div class="panel__head"><div class="list-rail__title"><p class="eyebrow">Workflow runs</p><h2>Flows</h2></div><span id="flows-count" class="panel__note"></span><button type="button" class="list-rail__toggle" data-rail-toggle="flows" data-rail-noun="flow list" aria-controls="flows-list" aria-expanded="true" aria-label="Collapse flow list" title="Collapse flow list"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" /></svg></button></div>
                 <p class="muted flows-intro">Flow state and history recorded by Membrick. Provider telemetry remains in its own views.</p>
                 <div id="flows-list" class="flows-list" aria-live="polite"><div class="empty-state">Open Flows to load workflow runs.</div></div>
               </section>

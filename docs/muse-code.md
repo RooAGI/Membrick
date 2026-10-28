@@ -86,6 +86,9 @@ the other agent integrations:
 | Tool | Purpose |
 |---|---|
 | `search` | Query project memory; returns ranked hits with source, score, `semantic_status`, and `superseded_by` |
+| `add_memory` | Add a memory owned by the MCP integration. |
+| `get_memory` | Read one MCP-owned memory by ID. |
+| `delete_memory` | Permanently delete one MCP-owned memory. |
 | `review_search` | Page through unreviewed MCP searches or retrieve one exact search by `search_id` |
 | `search_feedback` | Record an overall search assessment and one relevance judgment per returned document; optionally propose grounded query-only rule additions |
 | `enrich_doc` | Enrich one hash-verified source document through MemoryService |
@@ -95,6 +98,7 @@ the other agent integrations:
 | `enable_membrick` | Enable memory retrieval/capture and recording by default |
 | `disable_membrick` | Disable Membrick memory behavior without changing recording |
 | `membrick_status` | Return `Membrick:ON/OFF` and `Record:ON/OFF` |
+| `update_membrick` | Install an available Membrick update after the host approves it. |
 
 Inside Muse Code, call `record_session` with `start`, `stop`, or `status`:
 

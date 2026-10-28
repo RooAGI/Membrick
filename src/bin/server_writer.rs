@@ -59,6 +59,7 @@ pub(super) struct CaptureAudit {
 
 enum Command {
     Add(Vec<AddRequest>, bool, Reply),
+    AddWithMetadata(Vec<crate::memory_api::AddRequestContext>, bool, Reply),
     Upsert(Vec<crate::SourceDocument>, Option<CaptureAudit>, Reply),
     ReplaceGroup(String, String, Vec<crate::SourceDocument>, Reply),
     ReplaceWorkspace(Vec<crate::SourceDocument>, Reply),
@@ -81,6 +82,7 @@ impl WriterSender {
 
 enum BarrierWork {
     Add(MemoryStore, Vec<AddRequest>),
+    AddWithMetadata(MemoryStore, Vec<crate::memory_api::AddRequestContext>),
     None,
 }
 struct BarrierReply {
@@ -103,6 +105,15 @@ impl BarrierReply {
             BarrierWork::Add(target, requests) => owner
                 .memory_store(target)
                 .completed_add_responses(&requests)
+                .and_then(|responses| Ok(serde_json::to_value(responses)?)),
+            BarrierWork::AddWithMetadata(target, requests) => owner
+                .memory_store(target)
+                .completed_add_responses_with_metadata(
+                    &requests
+                        .into_iter()
+                        .map(|context| context.request)
+                        .collect::<Vec<_>>(),
+                )
                 .and_then(|responses| Ok(serde_json::to_value(responses)?)),
             BarrierWork::None => Ok(Value::Null),
         };
@@ -260,6 +271,55 @@ fn run_writer(
                                 target,
                                 revision,
                                 BarrierWork::Add(target, requests),
+                                reply,
+                            )),
+                            Ok((value, _)) => {
+                                let _ = reply.send(Ok(value));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    }
+                    Command::AddWithMetadata(requests, wait, reply) => {
+                        let result = (|| -> anyhow::Result<(Value, u64)> {
+                            anyhow::ensure!(
+                                !wait || barriers.len() < QUEUE_CAPACITY,
+                                PendingWriteLimit
+                            );
+                            let mut owner = service
+                                .write()
+                                .map_err(|_| anyhow::anyhow!("memory writer poisoned"))?;
+                            let pending: usize = targets
+                                .iter()
+                                .map(|&t| owner.memory_store(t).pending_document_count())
+                                .sum();
+                            anyhow::ensure!(
+                                pending
+                                    + requests
+                                        .iter()
+                                        .map(|r| r.request.request.messages.len())
+                                        .sum::<usize>()
+                                    <= MAX_PENDING_DOCUMENTS,
+                                PendingWriteLimit
+                            );
+                            let store = owner.memory_store_mut(target);
+                            let responses = store.stage_add_batch_with_context(requests.clone())?;
+                            if store.pending_document_count() > 0
+                                && schedules[slot].first_pending.is_none()
+                            {
+                                schedules[slot].first_pending = Some(Instant::now());
+                            }
+                            Ok((
+                                serde_json::to_value(responses)?,
+                                store.publication_revisions().0,
+                            ))
+                        })();
+                        match result {
+                            Ok((_, revision)) if wait => barriers.push(BarrierReply::for_store(
+                                target,
+                                revision,
+                                BarrierWork::AddWithMetadata(target, requests),
                                 reply,
                             )),
                             Ok((value, _)) => {
@@ -730,6 +790,10 @@ impl StagedWriter {
     fn status(error: anyhow::Error) -> StatusCode {
         if error.is::<PendingWriteLimit>() {
             StatusCode::TOO_MANY_REQUESTS
+        } else if error.is::<crate::memory_api::RequestFingerprintConflict>() {
+            // Reusing an id with a different payload is a definitive client
+            // conflict, not a transient staged-writer failure.
+            StatusCode::CONFLICT
         } else {
             tracing::error!("staged mutation failed: {error:#}");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -742,6 +806,26 @@ impl StagedWriter {
     ) -> Result<Value, StatusCode> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Add(requests, wait, reply))?;
+        receive
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map_err(Self::status)
+    }
+
+    pub(super) async fn add_with_metadata(
+        &self,
+        request: crate::memory_api::AddRequestContext,
+        wait: bool,
+    ) -> Result<Value, StatusCode> {
+        self.add_with_metadata_batch(vec![request], wait).await
+    }
+    pub(super) async fn add_with_metadata_batch(
+        &self,
+        requests: Vec<crate::memory_api::AddRequestContext>,
+        wait: bool,
+    ) -> Result<Value, StatusCode> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::AddWithMetadata(requests, wait, reply))?;
         receive
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
@@ -855,6 +939,21 @@ fn publish_view(published: &RwLock<Arc<MemoryService>>, view: MemoryService) -> 
 mod tests {
     use super::*;
     use crate::memory_api::Message;
+
+    #[test]
+    fn fingerprint_conflicts_are_rejected_without_text_matching() {
+        assert_eq!(
+            StagedWriter::status(crate::memory_api::RequestFingerprintConflict.into()),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            StagedWriter::status(anyhow::anyhow!(
+                "internal error mentioning request_id was already used with different content"
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     fn request(i: usize) -> AddRequest {
         AddRequest {
             request_id: format!("r{i}"),

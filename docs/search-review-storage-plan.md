@@ -17,8 +17,7 @@ in-memory map loses lookup acceleration only. Rebuilding costs startup I/O and
 CPU; keeping all search locations costs memory proportional to search count.
 Measure those costs before considering persistent indexing.
 
-This extends the [document enrichment plan](document-enrichment-plan.md) and
-[telemetry architecture](telemetry.md). `MemoryService` owns operational access.
+This complements the [telemetry architecture](telemetry.md). `MemoryService` owns operational access.
 The offline dashboard remains a derived consumer of saved history and feedback.
 
 ## Validation of the telemetry assumption

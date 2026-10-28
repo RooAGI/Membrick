@@ -54,9 +54,18 @@ jobs:
         # TestRemoteLifecycle skips when target/debug/server is missing;
         # without this step CI would never exercise remote mode.
         run: cargo build --bin server
+      - name: Build and stage the bundled resident CLI
+        run: |
+          cargo build --bin membrick --features agent-integrations
+          cp target/debug/membrick .venv/bin/membrick
+          chmod 755 .venv/bin/membrick
       - name: Run the Python suite
         # Scope to the binding tests: test_docs_site.py needs a prior
         # `mkdocs build` and is owned by the docs workflow.
         run: python -m unittest tests.python.test_memory tests.python.test_behood_query -v
+      - name: Test Python resident startup and idle restart without PATH CLI
+        # The SDK resolves the staged binary through Python's scripts path.
+        # PATH intentionally excludes the venv and any global Membrick install.
+        run: env PATH=/usr/bin:/bin "$PWD/.venv/bin/python" -m unittest tests.python.test_memory_resident_idle -v
       - name: Assert package version is self-consistent
         run: python -c "import membrick, importlib.metadata as m; v=membrick.version(); assert v == m.version('membrick'), (v, m.version('membrick')); print('membrick', v)"

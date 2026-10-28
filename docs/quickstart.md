@@ -4,77 +4,172 @@ Download Membrick, save a few things you want your assistant to remember, and
 ask questions in plain language. You do not need to build the project or learn
 special memory syntax.
 
+## Choose a path
+
+Pick a starting point. Each path shows you what Membrick looks like in use and
+links to the setup details below.
+
+<div class="grid cards quickstart-paths" markdown>
+
+-   **Installation and update**
+
+    ![Membrick installation commands shown in a terminal window](assets/quickstart-install.svg){ .quickstart-illustration }
+
+    [Installation and update steps](#1-download-or-update-membrick)
+
+    Install with Python or npm, or use the Rust crate or download a release
+    from GitHub.
+
+-   **Add your first memory**
+
+    ![Membrick dashboard index view showing the memory index and segment layout](assets/membrick-dashboard-index.jpg){ .quickstart-illustration }
+
+    [Add a memory](#2-add-your-first-memory) · [View the dashboard](observability.md)
+
+    Add memory from files, your agent, or an application. Inspect what Membrick
+    has indexed in the dashboard.
+
+-   **Connect agents**
+
+    ![Supported agent integrations: Codex, Claude Code, Gemini CLI, Antigravity CLI, OpenClaw, Hermes, Muse Code, and RooAGI AgentFlow](assets/quickstart-agents.svg){ .quickstart-illustration }
+
+    Connect one of the eight supported agents to the same project memory.
+
+    [Choose your agent](connect-agent.md)
+
+-   **Hosting Membrick**
+
+    ![Membrick hosting options: local server, Docker container, and HTTP API](assets/quickstart-hosting.svg){ .quickstart-illustration }
+
+    Run Membrick locally, package it with Docker, or connect an application
+    through the HTTP API.
+
+    [Local server](server.md) · [Docker](docker.md) · [API reference](api/index.md)
+
+</div>
+
 ## 1. Download or Update Membrick
 
 ### Install Membrick
 
-#### macOS or Linux: official installer
+#### Ask Codex or Claude Code to install it
 
-The installer downloads the release for your computer and verifies its
-SHA-256 checksum:
+Paste this prompt into Codex or Claude Code while the project you want to
+connect is open. The agent will install Membrick, configure the current project,
+and verify the connection using the official installer. Approve its terminal
+commands when prompted.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh
+<div class="install-prompt-scroll" markdown>
+
+```text
+Install Membrick for this project.
+
+1. Identify whether you are running in Codex or Claude Code, and detect the
+   operating system. Confirm the current project root. If you cannot identify
+   the agent or project root, ask me before changing any configuration.
+2. If the `membrick` command is already installed, run `membrick install`
+   for the identified agent with the current project as its path, then run
+   `membrick verify` for that agent and project. Do not reinstall the CLI.
+3. Otherwise, use Membrick's official installer for this operating system,
+   passing the identified agent and current project so installation and setup
+   happen together:
+   - macOS or Linux: download and run
+     `curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent <agent> --project .`,
+     replacing `<agent>` with `codex` or `claude`.
+   - Windows PowerShell: download the official script to a temporary file,
+     run it with `-Agent <agent> -Project .`, then remove the temporary file.
+     Use `Invoke-WebRequest` to download it from
+     https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.ps1.
+4. Report the installed version and whether Membrick verification succeeded.
+   If installation or verification fails, stop and explain the error. If the
+   agent needs a restart to load the integration, tell me.
+
+Use only the official Membrick installer above. Do not change unrelated agent
+settings or project files.
 ```
 
-#### Windows: standalone executable
+</div>
 
-Download `membrick-windows-x86_64.exe` from the [Membrick releases
-page](https://github.com/RooAGI/Membrick/releases/latest). Run it from the
-download folder in PowerShell. To check the version, run:
+#### Install manually
 
-```powershell
-.\membrick-windows-x86_64.exe --version
-```
+Choose one of these four CLI installation methods:
 
-#### npm
-
-```bash
-npm install --global membrick
-```
-
-For a Node.js project, install it locally with `npm install membrick`.
-
-#### Python
-
-For an isolated CLI installation, use `pipx`:
+#### Python CLI (PyPI)
 
 ```bash
 pipx install membrick
 ```
 
-To add the package to an active Python environment, use
-`python -m pip install membrick` instead. The package also provides the Python
-memory API.
+#### npm CLI
 
-#### Rust and Cargo
+```bash
+npm install --global membrick
+```
+
+#### Rust CLI (Cargo)
 
 ```bash
 cargo install membrick --locked
 ```
 
-The npm package also provides the Node.js memory API.
+#### GitHub release
+
+On macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh
+```
+
+On Windows, run this in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.ps1 | iex
+```
+
+The installers download and verify the release binary. You can also download
+the [latest release directly](https://github.com/RooAGI/Membrick/releases/latest).
 
 ### Update Membrick
 
-Use the update command that matches how you installed Membrick. You can also
-approve the `update_membrick` action in your connected agent, if it is
-available.
+Use the command for the method you installed with:
 
-| Installed with | Update command |
-|---|---|
-| Official installer (macOS or Linux) | Rerun the official installer command above. |
-| Standalone Windows executable | Download the latest `.exe` from the [releases page](https://github.com/RooAGI/Membrick/releases/latest) and replace the old executable. |
-| npm global | `npm update -g membrick` |
-| npm in a project | `npm update membrick` in that project |
-| pipx | `pipx upgrade membrick` |
-| pip | `python -m pip install --upgrade membrick` |
-| Cargo | `cargo install membrick --locked --force` |
+#### Python CLI (PyPI)
 
-Installations made with the official installer check for updates once per day
-when you run Membrick interactively and ask before downloading and replacing
-the executable. Add `--no-update-check` to skip the check for one invocation.
-MCP and hook processes do not check for updates automatically.
+```bash
+pipx upgrade membrick
+```
+
+#### npm CLI
+
+```bash
+npm update -g membrick
+```
+
+#### Rust CLI (Cargo)
+
+```bash
+cargo install membrick --locked --force
+```
+
+#### GitHub release
+
+Rerun the platform installer to update Membrick. On macOS or Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh
+```
+
+On Windows, run this in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.ps1 | iex
+```
+
+If you installed the Windows executable directly, replace it with the latest
+version from the [releases page](https://github.com/RooAGI/Membrick/releases/latest).
+
+You can also approve the `update_membrick` action in your connected agent, if
+it is available.
 
 After installation or update, open a new terminal and check the installed
 version. On Windows, use the standalone executable command shown above.
@@ -88,91 +183,339 @@ you use. This reconnects its MCP server to the updated Membrick. For details
 about update notices and approval, see
 [Update notifications](update-notifications.md).
 
-## 2. Migrate from Lint-AI
+## 2. Add your first memory
 
-If you already use Lint-AI in a project, this command installs Membrick and
-switches the selected agent's connection while preserving unrelated settings.
-Run it from the project directory. For example, to migrate Codex:
+Choose how you want to add a memory. With a connected agent, you can ask it to
+remember something in the conversation. For direct use, pick the CLI, an SDK,
+or the HTTP API.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/migrate-lint-ai.sh | sh -s -- --agent codex --project .
-```
+=== "Connected AI agent"
 
-Replace `codex` with `claude`, `gemini`, or `agy` to migrate another supported
-agent. The migration preserves existing project data under `.membrick`. When
-both `.lint-ai` and `.membrick` exist, non-conflicting files are merged and
-conflicting legacy files are kept in `.membrick/migration-archive`. The
-project-root `.lint-ai` directory is removed after migration. The old
-`lint-ai` executable remains installed; remove it with its package manager
-after confirming Membrick works.
+    Ask your connected agent to remember something, for example:
 
-Fully quit and reopen the agent. Check its MCP list for `membrick`, then call
-a Membrick tool such as `membrick_status` to confirm the connection works.
+    > Remember that I prefer concise answers with a short summary first.
 
-## 3. Add something to remember
+    The agent saves it through Membrick. See [agent setup](connect-agent.md) if
+    Membrick is not connected yet.
 
-Create a folder for your memories. Save each thing you want to remember in a
-plain text or Markdown file. Write naturally; Membrick searches the words and
-ideas in the file.
+=== "Python"
 
-```bash
-mkdir -p ~/my-assistant-memory
-cat > ~/my-assistant-memory/preferences.md <<'EOF'
-I prefer concise answers with a short summary first.
-When explaining code, include a small example.
-EOF
-```
+    Install the package with `pip install membrick`. Use `Memory.init(...)` to
+    initialize project state explicitly. `Memory(path=...)` connects to an
+    existing project without creating files.
 
-You can add another memory by creating another file or editing an existing one.
-These files stay on your computer unless you choose to connect them to another
-service.
+    ```python
+    from membrick import Memory
 
-## 4. Ask a question
+    memory = Memory.init(path=".")
+    receipt = memory.add(
+        [{"role": "user", "content": "I prefer concise answers with a short summary first."}],
+        user_id="local-user",
+    )
+    hits = memory.search("How do I prefer answers?", user_id="local-user")
+    ```
 
-Ask Membrick a question about the memories in that folder:
+=== "Node.js"
 
-```bash
-membrick query "How do I prefer answers to be written?" ~/my-assistant-memory
-```
+    Install the package with `npm install membrick`. Use `Memory.init(...)` to
+    initialize project state explicitly. `new Memory({ path })` connects to an
+    existing project without creating files.
 
-To print a short answer context that you can paste into an AI assistant, use
-the `context` command:
+    ```js
+    import { Memory } from 'membrick'
 
-```bash
-membrick context "How do I prefer answers to be written?" ~/my-assistant-memory
-```
+    const memory = Memory.init({ path: process.cwd() })
+    const receipt = await memory.add(
+      [{ role: 'user', content: 'I prefer concise answers with a short summary first.' }],
+      'local-user',
+    )
+    const hits = await memory.search('How do I prefer answers?', 'local-user')
+    ```
 
-Ask a new question whenever you want to look something up. To show more
-matches, add `--count 10`.
+=== "Rust"
+
+    Add the crate with `cargo add membrick`. Call `Memory::init(path)` to
+    initialize a new project, or `Memory::new(path)` to connect to an existing
+    one:
+
+    ```rust
+    use membrick::{AddOptions, Memory, Message, SearchOptions};
+
+    let memory = Memory::init(".")?;
+    let receipt = memory.add(
+        vec![Message {
+            role: "user".into(),
+            content: "I prefer concise answers with a short summary first.".into(),
+            timestamp: None,
+            expires_at_ms: None,
+            supersedes_id: None,
+        }],
+        "local-user",
+        AddOptions::default(),
+    )?;
+    let hits = memory.search("How do I prefer answers?", "local-user", SearchOptions::default())?;
+    ```
+
+=== "HTTP API"
+
+    Start the [local HTTP server](server.md), then send an add request:
+
+    ```bash
+    curl -X POST 'http://127.0.0.1:8080/v1/memories?wait_for_visibility=true' \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "request_id": "quickstart-001",
+        "user_id": "local-user",
+        "session_id": "quickstart",
+        "messages": [
+          {"role": "user", "content": "I prefer concise answers with a short summary first."}
+        ]
+      }'
+    ```
+
+    If the server requires authentication, also send an `Authorization: Bearer`
+    header. See the [full Add API reference](api/add.md) for request fields,
+    retries, and responses.
+
+=== "CLI notes"
+
+    Save personal notes as plain text or Markdown files. Write naturally;
+    Membrick searches the words and ideas in each file.
+
+    ```bash
+    mkdir -p ~/my-assistant-memory
+    cat > ~/my-assistant-memory/preferences.md <<'EOF'
+    I prefer concise answers with a short summary first.
+    When explaining code, include a small example.
+    EOF
+    ```
+
+    You can find these notes with `membrick query`:
+
+    ```bash
+    membrick query "How do I prefer answers to be written?" ~/my-assistant-memory
+    ```
+
+The SDK and HTTP API generate a `request_id` when you omit one. If your
+application must recover from an uncertain result, provide a durable ID and
+reuse it only when retrying the same request. Project-mode SDK clients connect
+to the local resident, which owns the data under
+`.membrick/memory`; use `base_url` to connect to an HTTP service.
+
+## 3. Search your memories
+
+Search the memory you added above using the same `user_id`. Choose the interface
+you are using:
+
+=== "Connected AI agent"
+
+    Ask your connected agent a question, for example:
+
+    > How do I prefer answers to be written?
+
+    The agent searches your Membrick memories and uses the relevant results to
+    answer. See [agent setup](connect-agent.md) if Membrick is not connected yet.
+
+=== "Python"
+
+    Continue with the `memory` client from the previous step:
+
+    ```python
+    hits = memory.search(
+        "How do I prefer answers?",
+        user_id="local-user",
+        top_k=5,
+    )
+    for hit in hits:
+        print(hit["content"])
+    ```
+
+=== "Node.js"
+
+    Continue with the `memory` client from the previous step:
+
+    ```js
+    const hits = await memory.search(
+      'How do I prefer answers?',
+      'local-user',
+      { topK: 5 },
+    )
+    for (const hit of hits) {
+      console.log(hit.content)
+    }
+    ```
+
+=== "Rust"
+
+    Continue with the `memory` client from the previous step:
+
+    ```rust
+    use membrick::SearchOptions;
+
+    let hits = memory.search(
+        "How do I prefer answers?",
+        "local-user",
+        SearchOptions {
+            top_k: 5,
+            ..Default::default()
+        },
+    )?;
+    for hit in hits {
+        println!("{}", hit.content);
+    }
+    ```
+
+=== "HTTP API"
+
+    Search the same owner scope through the local server:
+
+    ```bash
+    curl -X POST 'http://127.0.0.1:8080/v1/memories/search' \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "query": "How do I prefer answers?",
+        "user_id": "local-user",
+        "top_k": 5
+      }'
+    ```
+
+    If the server requires authentication, also send an `Authorization: Bearer`
+    header. The response contains matching records in its `data` array. See the
+    [Search API reference](api/search.md) for filters and session context.
+
+=== "CLI notes"
+
+    For the Markdown notes created in the previous step, query the folder:
+
+    ```bash
+    membrick query "How do I prefer answers to be written?" ~/my-assistant-memory
+    ```
+
+    To print a short answer context that you can paste into an AI assistant, use
+    the `context` command:
+
+    ```bash
+    membrick context "How do I prefer answers to be written?" ~/my-assistant-memory
+    ```
+
+    Ask a new question whenever you want to look something up. To show more
+    matches, add `--count 10`.
 
 To see which indexes already exist in the current project, run
 `membrick status .`. This only inspects existing index stores; it does not scan
 project files.
 
-## 5. Change or forget a memory
+## 4. Change or forget a memory
 
-Edit a file to change what it says. Run your question again to search the
-updated memory. To forget a memory, remove its file:
+Use a memory ID from the search results and the same `user_id` that owns it.
+Choose the interface you are using:
 
-```bash
-rm ~/my-assistant-memory/preferences.md
-```
+=== "Connected AI agent"
 
-You can also keep a memory by moving its file outside the memory folder. Each
-file is one piece of information, so it is easy to update or remove just that
-memory.
+    Tell your agent what changed or what to forget, for example:
 
-## Use Membrick inside an AI tool
+    > I no longer prefer concise answers. Forget that preference.
 
-Membrick connects to Codex, Claude Code, Gemini CLI, Antigravity CLI, OpenClaw,
-Hermes, Muse Code, and RooAGI AgentFlow. Choose your agent in the
-[agent setup guide](connect-agent.md) for the right installation steps.
-Already using Lint-AI? See [Migrate from Lint-AI](#2-migrate-from-lint-ai)
-above to switch your agent configuration and project data to Membrick.
+    The agent can update or delete the matching memory through Membrick. See
+    [agent setup](connect-agent.md) if Membrick is not connected yet.
 
-## More ways to use Membrick
+=== "Python"
 
-The command line is the simplest way to try personal memory. Developers can
-connect applications through the [HTTP API](server.md), [MCP](mcp.md),
-[Python](python-migration-0.3.0.md), [Node.js](node.md), or
-[Rust](memory-service-api.md) interfaces.
+    Continue with the `memory` client and `hits` from the search step:
+
+    ```python
+    memory_id = hits[0]["id"]
+
+    updated = memory.update(
+        memory_id,
+        "local-user",
+        "I prefer detailed answers with examples.",
+        role="user",
+    )
+
+    deleted = memory.delete(memory_id, "local-user")
+    ```
+
+    Updating keeps the memory ID. Delete permanently removes the memory.
+
+=== "Node.js"
+
+    Continue with the `memory` client and `hits` from the search step:
+
+    ```js
+    const memoryId = hits[0].id
+
+    const updated = await memory.update(
+      memoryId,
+      'local-user',
+      'I prefer detailed answers with examples.',
+      { role: 'user' },
+    )
+
+    const deleted = await memory.delete(memoryId, 'local-user')
+    ```
+
+    Updating keeps the memory ID. Delete permanently removes the memory.
+
+=== "Rust"
+
+    Continue with the `memory` client and `hits` from the search step:
+
+    ```rust
+    use membrick::UpdateOptions;
+
+    let memory_id = &hits[0].id;
+    let updated = memory.update(
+        memory_id,
+        "local-user",
+        "I prefer detailed answers with examples.",
+        UpdateOptions {
+            role: Some("user".into()),
+            ..Default::default()
+        },
+    )?;
+
+    let deleted = memory.delete(memory_id, "local-user")?;
+    ```
+
+    Updating keeps the memory ID. Delete permanently removes the memory.
+
+=== "HTTP API"
+
+    Set `MEMORY_ID` to the `id` from the search response, then update it:
+
+    ```bash
+    export MEMORY_ID='<memory-id-from-search>'
+
+    curl -X PATCH "http://127.0.0.1:8080/v1/memories/$MEMORY_ID" \
+      -H 'Content-Type: application/json' \
+      -d '{
+        "user_id": "local-user",
+        "content": "I prefer detailed answers with examples.",
+        "role": "user"
+      }'
+    ```
+
+    To forget it, send a delete request:
+
+    ```bash
+    curl -X DELETE "http://127.0.0.1:8080/v1/memories/$MEMORY_ID?user_id=local-user"
+    ```
+
+    Add an `Authorization: Bearer` header to both requests if the server
+    requires authentication. See the [Update](api/update.md) and
+    [Delete](api/delete.md) references for details.
+
+=== "CLI notes"
+
+    For file-based notes, edit the file to change its contents, then query the
+    folder again. Remove a note to forget it:
+
+    ```bash
+    $EDITOR ~/my-assistant-memory/preferences.md
+    membrick query "How do I prefer answers to be written?" ~/my-assistant-memory
+    rm ~/my-assistant-memory/preferences.md
+    ```
+
+    You can also move the file outside `~/my-assistant-memory` to keep it
+    without including it in searches of that folder.

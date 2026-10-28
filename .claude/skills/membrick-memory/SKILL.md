@@ -3,6 +3,8 @@ name: membrick-memory
 description: Use the Membrick MCP server as the first source for project memory, prior decisions, and earlier work before inspecting the repository.
 ---
 
+<!-- membrick-managed-skill -->
+
 # Membrick Memory
 
 ## MCP-first memory policy
@@ -54,8 +56,8 @@ persistent status line. This is informational only; use the MCP control tools
 to change either state. Preserve any user-defined Claude status line.
 
 Replay is a separate CLI operation, not an automatic MCP action. Use
-`membrick --replay-session <session-id> --session-provider claude
---replay-enable-membrick` when the user explicitly asks to rerun a recorded
+`membrick session replay <session-id> --provider claude
+--enable-membrick` when the user explicitly asks to rerun a recorded
 prompt with Claude. Replay always records its output and creates a new session
 ID; it does not modify the baseline archive.
 

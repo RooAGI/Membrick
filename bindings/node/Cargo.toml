@@ -1,6 +1,6 @@
 [package]
 name = "membrick-node"
-version = "0.7.3"
+version = "0.8.0"
 edition = "2021"
 publish = false
 
@@ -9,12 +9,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1"
-membrick = { path = "../.." }
+membrick = { path = "../..", default-features = false, features = ["heuristic-query-semantics"] }
 napi = { version = "3", default-features = false, features = ["napi8", "serde-json", "async"] }
 napi-derive = "3"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [build-dependencies]
 napi-build = "2.6"

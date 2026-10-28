@@ -1,9 +1,20 @@
 # Python binding migration guide: 0.2.x → 0.3.0
 
-`membrick` 0.3.0 cleans up the Python binding around the one supported
-surface: `MemoryService`. Most existing `Memory` calls keep working, but
-there are two intentional breaks. This guide covers what changed, what
-stayed compatible, and what the new knobs actually do.
+`membrick` 0.3.0 documents the earlier Python API around its embedded
+`MemoryService` wrapper. Current releases use `Memory` for resident and remote
+connections and do not expose an embedded-path binding. Use `Memory(path=".")`
+for this project's resident, `Memory(path=...)` for another project, or
+`Memory(base_url=...)` for a remote service. Use `Memory.init(path=...)` only
+when you intend to initialize project state. Omitting both `path` and `base_url`
+is a configuration error. Rust applications that deliberately embed Membrick can
+use `MemoryService` directly. The sections below describe 0.3.0 behavior for
+historical migration only.
+
+In project mode, Python looks for the resident CLI in this order:
+`resident_executable` explicitly supplied to `Memory`, the `membrick` executable
+installed in Python's scripts directory by the package, then `membrick` on
+`PATH`. If none is found, the SDK raises `UnavailableError` before dispatching
+the operation. It never tries to launch the Python interpreter as the resident.
 
 ## Breaking changes
 
@@ -35,8 +46,10 @@ the 0.2.x line.
 
 ## What stayed compatible
 
-- `Memory(path=...)` / `Memory()` — same as before; new options are
-  keyword-only additions at the end.
+- `Memory(path=...)` connects to an existing project. A no-argument
+  `Memory()` call now raises a configuration error instead of selecting the
+  current directory; use `Memory.init(path=...)` only when initialization is
+  intended.
 - `search(query, user_id, top_k)` — the original three positional arguments
   still work in the same order. `top_k` now defaults to `10`, so
   `search(query, user_id)` is valid.

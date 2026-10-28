@@ -1,13 +1,20 @@
 # MemoryService API boundary
 
-`MemoryService` is the sole public memory access API. Applications, MCP
-adapters, hooks, and HTTP handlers use its methods. The public Rust surface
-also includes its request, response, document, configuration, and inspection
-types. These data types do not provide independent storage access.
+`MemoryService` is Membrick's domain service API. Application SDK clients use
+`Memory` to connect to a project resident or remote server. Rust applications
+that deliberately embed Membrick can construct `MemoryService` directly.
+MCP adapters, hooks, and HTTP handlers use the service inside the server.
+Request, response, document, configuration, and inspection types are public;
+stores, indexes, snapshots, builders, and persistence modules remain internal.
 
 ## Public operations
 
 - Construct with `MemoryService::in_memory(options)` or `MemoryService::at_path(path, options)`.
+  For an installed project's `.membrick` store, `at_path` acquires the same
+  exclusive owner lock as the resident and retains it until the service is
+  dropped. It fails if the resident is running; connect through `Memory::new`
+  instead. A standalone embedded service can open the store when no resident
+  owns the project.
 - Use `add`, `add_batch`, `search`, `get`, `list`, `update`, `delete`, `supersede`, and `expire` for memories.
 - Use the service's `board_*` methods for boards.
 - For source documents, use `upsert` and `refresh`, then `search_with_filters`.

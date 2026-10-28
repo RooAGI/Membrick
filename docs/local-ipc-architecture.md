@@ -73,11 +73,17 @@ the user's home directory.
 The provider-launched MCP adapter requests resident startup when its stdio MCP
 process begins. That warm-up uses a short-lived kernel-locked lease in
 `.membrick/runtime/provider-leases/`. Hooks and other one-shot clients hold
-leases while a request is in flight. A Codex adapter also holds a lease while
-it has one or more bound active sessions; `SessionEnd` releases the lease when
-the adapter's final session ends. Other provider adapters do not hold a lease
-for their full process lifetime. The resident is shared by Claude, Codex, and
-other providers using the same project. After all request and session leases
+leases while a request is in flight. Every provider adapter (Claude, Codex,
+Gemini CLI, AGY, Hermes, OpenClaw and Muse) also holds a keepalive lease while
+it is in use, and releases it after five minutes with no tool call or hook it
+can attribute to its sessions. Hooks mark activity under
+`.membrick/runtime/provider-adapters/activity/`, once for their session and
+once for their provider. An adapter that has seen session IDs (Codex threads)
+follows only those sessions. An adapter that has not seen any follows every
+hook from its provider in the project. Hosts can keep adapters and threads
+open long after the user leaves without sending an end event, so no adapter
+holds a lease for its whole process lifetime. The resident is shared by every
+provider using the same project. After all request and keepalive leases
 are released, the resident waits for `resident_idle_timeout_seconds` (60
 seconds by default, clamped to 5–3600) before flushing its writer and shutting
 down. A later provider or hook request starts a fresh resident automatically.
@@ -120,7 +126,11 @@ This requires the updated, trusted Codex hooks. `SessionStart` can run before
 MCP initialization, so `UserPromptSubmit` retries binding. Clients without a
 session binding retain the usual stdin-EOF lifecycle; Membrick cannot infer
 their owning terminal. An abrupt disconnect that does not emit `SessionEnd`
-still relies on the host closing the MCP connection. See the
+still relies on the host closing the MCP connection. Such an adapter process
+can stay alive, but it stops keeping the resident warm once its sessions go
+idle. The Codex CLI ties its adapters to the terminal only when its managed
+app-server daemon is off (`codex features disable daemon_auto_start`); the
+Codex app keeps that daemon, and its adapters, running by design. See the
 [Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
 Codex emits this event.
 
@@ -214,7 +224,7 @@ standalone HTTP mode remains available for applications and custom clients. A
 workspace store has one active writer owner across both modes; starting a second
 server against that project fails before it opens the store. See the
 [HTTP server guide](server.md) for network configuration and the
-[MCP interface guide](mcp.md) for provider tools.
+[agent connection guide](connect-agent.md#mcp-tools) for provider tools.
 
 Some integrations, including plugins configured independently from the
 bundled Rust adapters, may still call HTTP endpoints. This does not change the

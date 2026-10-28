@@ -51,7 +51,7 @@ pub(crate) fn unregister(root: &Path, provider: &str) -> Result<()> {
     unregister_at(&registry_path()?, root, provider)
 }
 
-fn register_at(path: &Path, root: &Path, provider: &str) -> Result<()> {
+pub(crate) fn register_at(path: &Path, root: &Path, provider: &str) -> Result<()> {
     let root = canonical_root(root)?;
     update_at(path, |registry| {
         registry
@@ -62,13 +62,20 @@ fn register_at(path: &Path, root: &Path, provider: &str) -> Result<()> {
     })
 }
 
-fn unregister_at(path: &Path, root: &Path, provider: &str) -> Result<()> {
+pub(crate) fn unregister_at(path: &Path, root: &Path, provider: &str) -> Result<()> {
     let root = canonical_root(root)?;
+    unregister_stored_at(path, &root, provider)
+}
+
+/// Remove `provider` from a registration keyed by `stored_root`, the canonical
+/// path string recorded at install. Unlike `unregister_at`, the folder need not
+/// exist any more.
+pub(crate) fn unregister_stored_at(path: &Path, stored_root: &str, provider: &str) -> Result<()> {
     update_at(path, |registry| {
-        if let Some(providers) = registry.projects.get_mut(&root) {
+        if let Some(providers) = registry.projects.get_mut(stored_root) {
             providers.remove(provider);
             if providers.is_empty() {
-                registry.projects.remove(&root);
+                registry.projects.remove(stored_root);
             }
         }
     })
@@ -91,7 +98,7 @@ pub(crate) fn status(root: &Path, provider: &str) -> Result<ProjectStatus> {
     status_at(&registry_path()?, root, provider)
 }
 
-fn status_at(path: &Path, root: &Path, provider: &str) -> Result<ProjectStatus> {
+pub(crate) fn status_at(path: &Path, root: &Path, provider: &str) -> Result<ProjectStatus> {
     let canonical = canonical_root(root)?;
     let registry = read_at(path)?;
     let providers = registry
@@ -113,7 +120,7 @@ fn status_at(path: &Path, root: &Path, provider: &str) -> Result<ProjectStatus> 
     })
 }
 
-fn list_at(path: &Path) -> Result<Vec<InstalledProject>> {
+pub(crate) fn list_at(path: &Path) -> Result<Vec<InstalledProject>> {
     let registry = read_at(path)?;
     registry
         .projects

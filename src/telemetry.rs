@@ -21,7 +21,7 @@ const MAX_BUCKETS: usize = 120;
 const QUERY_EVENT_QUEUE_CAPACITY: usize = 1_024;
 const LATENCY_BOUNDARIES_MS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1_000, 5_000, 30_000];
 const PROVIDER_TELEMETRY_DIR: &str = "provider-telemetry";
-const MAX_PROVIDER_TELEMETRY_EVENTS: usize = 500;
+pub const MAX_PROVIDER_TELEMETRY_EVENTS: usize = 500;
 const QUERY_TELEMETRY_FILE: &str = "query-telemetry.json";
 const MCP_CALL_HISTORY_FILE: &str = "mcp-call-history.jsonl";
 const MAX_MCP_CALL_HISTORY_RECORD_BYTES: usize = 16 * 1024 * 1024;
@@ -296,6 +296,283 @@ pub struct ProviderLifecycleStatus {
     pub capture_events: u64,
     #[serde(default)]
     pub events: Vec<ProviderLifecycleEvent>,
+    /// Cumulative counters updated on every recorded event. Unlike `events`,
+    /// they are not limited to the retained window, so busy providers whose
+    /// window is filled by retrieval and tool bursts still report prompts,
+    /// stops and token usage. Ledgers written before these counters existed
+    /// load with zeroed counters and `since_ms == 0`.
+    #[serde(default)]
+    pub counters: ProviderLifecycleCounters,
+    /// The newest prompt, stop, usage and subagent events, kept apart from
+    /// `events` so retrieval and tool bursts cannot evict them.
+    #[serde(default)]
+    pub milestone_events: Vec<ProviderLifecycleEvent>,
+}
+
+const MAX_PROVIDER_MILESTONE_EVENTS: usize = 50;
+const MAX_OPEN_PROMPT_SESSIONS: usize = 256;
+const MAX_OPEN_SUBAGENTS: usize = 256;
+/// Upper bounds of the prompt-to-stop duration histogram buckets. The last
+/// bucket (index `len()`) collects everything slower.
+pub const CYCLE_DURATION_BOUNDARIES_MS: [u64; 14] = [
+    1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 60_000, 120_000, 300_000, 600_000, 1_200_000,
+    1_800_000, 3_600_000, 7_200_000,
+];
+
+/// Cumulative per-provider counters. Every field defaults so older ledgers
+/// keep loading.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderLifecycleCounters {
+    /// When counting started for this ledger (first event recorded by a
+    /// build that has counters), in Unix milliseconds. Zero means never.
+    pub since_ms: u64,
+    /// Prompt submissions (`UserPromptSubmit`, `BeforeAgent`).
+    pub prompts: u64,
+    /// Turn stops (`Stop`, `AfterAgent`).
+    pub stops: u64,
+    /// Tool invocations (`PreToolUse`, `BeforeTool`).
+    pub tool_calls: u64,
+    /// Tool results (`PostToolUse`, `AfterTool`).
+    pub tool_results: u64,
+    /// Failed tool results (`PostToolUseFailure`).
+    pub tool_failures: u64,
+    pub subagent_starts: u64,
+    pub subagent_stops: u64,
+    /// Events that carried any token usage.
+    pub usage_events: u64,
+    /// Uncached input tokens. Disjoint from the two cache counters.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    /// Sum of provider-reported `total_tokens`, which excludes cache tokens.
+    pub reported_total_tokens: u64,
+    /// Prompts followed by a stop in the same session.
+    pub cycles_completed: u64,
+    pub cycle_duration_sum_ms: u64,
+    pub cycle_duration_max_ms: u64,
+    /// Histogram over `CYCLE_DURATION_BOUNDARIES_MS` plus one overflow bucket.
+    pub cycle_duration_buckets: Vec<u64>,
+    /// Open prompt start time by opaque session key, bounded to
+    /// `MAX_OPEN_PROMPT_SESSIONS` entries.
+    pub open_prompts: std::collections::BTreeMap<String, u64>,
+    /// Subagents started with no stop yet, by agent id, bounded to
+    /// `MAX_OPEN_SUBAGENTS` entries. Starts without an agent id are not kept.
+    pub open_subagents: std::collections::BTreeMap<String, OpenSubagent>,
+    /// Open subagents replaced by a later start of the same agent id, which
+    /// happens when a run dies (for example on an API error) and is resumed.
+    pub subagent_interrupted: u64,
+    /// Open subagents whose session ended before they sent a stop.
+    pub subagent_ended_without_stop: u64,
+    /// Agent ids that SessionEnd closed, with the time it did, bounded to
+    /// `MAX_OPEN_SUBAGENTS`. A stop that arrives later moves its run from
+    /// ended-without-stop to stopped, so no run is counted twice.
+    pub ended_subagents: std::collections::BTreeMap<String, u64>,
+}
+
+/// A subagent run that has started and not stopped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenSubagent {
+    pub started_ms: u64,
+    /// Latest event carrying this agent id, so readers can tell a quiet run.
+    pub last_seen_ms: u64,
+    pub session_key: String,
+}
+
+impl ProviderLifecycleCounters {
+    /// Estimated prompt-to-stop duration quantile, as the upper bound of the
+    /// histogram bucket that holds it. `None` when no cycle completed.
+    pub fn cycle_duration_quantile_ms(&self, quantile: f64) -> Option<u64> {
+        let total = self.cycle_duration_buckets.iter().sum::<u64>();
+        if total == 0 {
+            return None;
+        }
+        let target = ((total as f64 * quantile).ceil() as u64).max(1);
+        let mut seen = 0_u64;
+        for (index, count) in self.cycle_duration_buckets.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= target {
+                return Some(
+                    CYCLE_DURATION_BOUNDARIES_MS
+                        .get(index)
+                        .copied()
+                        .unwrap_or(self.cycle_duration_max_ms),
+                );
+            }
+        }
+        None
+    }
+
+    fn record(&mut self, event: &ProviderLifecycleEvent) {
+        if self.since_ms == 0 {
+            self.since_ms = event.timestamp_ms;
+        }
+        match event.event.as_str() {
+            "UserPromptSubmit" | "BeforeAgent" => {
+                self.prompts = self.prompts.saturating_add(1);
+                self.open_prompts
+                    .insert(event.session_key.clone(), event.timestamp_ms);
+                while self.open_prompts.len() > MAX_OPEN_PROMPT_SESSIONS {
+                    let oldest = self
+                        .open_prompts
+                        .iter()
+                        .min_by_key(|(_, started)| **started)
+                        .map(|(key, _)| key.clone());
+                    match oldest {
+                        Some(key) => self.open_prompts.remove(&key),
+                        None => break,
+                    };
+                }
+            }
+            "Stop" | "AfterAgent" => {
+                self.stops = self.stops.saturating_add(1);
+                self.close_cycle(event);
+            }
+            // A session that ends without a stop abandoned its turn: drop the
+            // open prompt without counting a completed cycle.
+            "SessionEnd" => {
+                self.open_prompts.remove(&event.session_key);
+                let ended = self
+                    .open_subagents
+                    .iter()
+                    .filter(|(_, open)| open.session_key == event.session_key)
+                    .map(|(agent_id, _)| agent_id.clone())
+                    .collect::<Vec<_>>();
+                for agent_id in ended {
+                    self.open_subagents.remove(&agent_id);
+                    self.ended_subagents.insert(agent_id, event.timestamp_ms);
+                    self.subagent_ended_without_stop =
+                        self.subagent_ended_without_stop.saturating_add(1);
+                }
+                while self.ended_subagents.len() > MAX_OPEN_SUBAGENTS {
+                    let oldest = self
+                        .ended_subagents
+                        .iter()
+                        .min_by_key(|(_, ended)| **ended)
+                        .map(|(key, _)| key.clone());
+                    match oldest {
+                        Some(key) => self.ended_subagents.remove(&key),
+                        None => break,
+                    };
+                }
+            }
+            "PreToolUse" | "BeforeTool" => self.tool_calls = self.tool_calls.saturating_add(1),
+            "PostToolUse" | "AfterTool" => self.tool_results = self.tool_results.saturating_add(1),
+            "PostToolUseFailure" => {
+                self.tool_results = self.tool_results.saturating_add(1);
+                self.tool_failures = self.tool_failures.saturating_add(1);
+            }
+            "SubagentStart" => {
+                self.subagent_starts = self.subagent_starts.saturating_add(1);
+                self.open_subagent(event);
+            }
+            "SubagentStop" => {
+                self.subagent_stops = self.subagent_stops.saturating_add(1);
+                if let Some(agent_id) = &event.agent_id {
+                    if self.open_subagents.remove(agent_id).is_none()
+                        && self.ended_subagents.remove(agent_id).is_some()
+                    {
+                        self.subagent_ended_without_stop =
+                            self.subagent_ended_without_stop.saturating_sub(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(open) = event
+            .agent_id
+            .as_ref()
+            .and_then(|agent_id| self.open_subagents.get_mut(agent_id))
+        {
+            open.last_seen_ms = open.last_seen_ms.max(event.timestamp_ms);
+        }
+        let usage = [
+            event.input_tokens,
+            event.output_tokens,
+            event.total_tokens,
+            event.cache_creation_input_tokens,
+            event.cache_read_input_tokens,
+        ];
+        if usage.iter().any(Option::is_some) {
+            self.usage_events = self.usage_events.saturating_add(1);
+            let add = |total: &mut u64, value: Option<u64>| {
+                *total = total.saturating_add(value.unwrap_or(0));
+            };
+            add(&mut self.input_tokens, event.input_tokens);
+            add(&mut self.output_tokens, event.output_tokens);
+            add(&mut self.reported_total_tokens, event.total_tokens);
+            add(
+                &mut self.cache_creation_input_tokens,
+                event.cache_creation_input_tokens,
+            );
+            add(
+                &mut self.cache_read_input_tokens,
+                event.cache_read_input_tokens,
+            );
+        }
+    }
+
+    fn open_subagent(&mut self, event: &ProviderLifecycleEvent) {
+        let Some(agent_id) = event.agent_id.clone() else {
+            return;
+        };
+        let open = OpenSubagent {
+            started_ms: event.timestamp_ms,
+            last_seen_ms: event.timestamp_ms,
+            session_key: event.session_key.clone(),
+        };
+        self.ended_subagents.remove(&agent_id);
+        if self.open_subagents.insert(agent_id, open).is_some() {
+            self.subagent_interrupted = self.subagent_interrupted.saturating_add(1);
+        }
+        while self.open_subagents.len() > MAX_OPEN_SUBAGENTS {
+            let oldest = self
+                .open_subagents
+                .iter()
+                .min_by_key(|(_, open)| open.last_seen_ms)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => self.open_subagents.remove(&key),
+                None => break,
+            };
+        }
+    }
+
+    fn close_cycle(&mut self, event: &ProviderLifecycleEvent) {
+        let Some(started) = self.open_prompts.remove(&event.session_key) else {
+            return;
+        };
+        let duration = event.timestamp_ms.saturating_sub(started);
+        self.cycles_completed = self.cycles_completed.saturating_add(1);
+        self.cycle_duration_sum_ms = self.cycle_duration_sum_ms.saturating_add(duration);
+        self.cycle_duration_max_ms = self.cycle_duration_max_ms.max(duration);
+        let buckets = CYCLE_DURATION_BOUNDARIES_MS.len() + 1;
+        if self.cycle_duration_buckets.len() != buckets {
+            self.cycle_duration_buckets.resize(buckets, 0);
+        }
+        let index = CYCLE_DURATION_BOUNDARIES_MS
+            .iter()
+            .position(|bound| duration <= *bound)
+            .unwrap_or(CYCLE_DURATION_BOUNDARIES_MS.len());
+        self.cycle_duration_buckets[index] = self.cycle_duration_buckets[index].saturating_add(1);
+    }
+}
+
+fn is_milestone_event(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "UserPromptSubmit"
+            | "BeforeAgent"
+            | "Stop"
+            | "AfterAgent"
+            | "TurnUsage"
+            | "SubagentStart"
+            | "SubagentStop"
+            | "SessionStart"
+            | "SessionEnd"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,7 +699,7 @@ pub fn record_provider_lifecycle_event(
         "capture" => status.capture_events = status.capture_events.saturating_add(1),
         _ => {}
     }
-    status.events.push(ProviderLifecycleEvent {
+    let event = ProviderLifecycleEvent {
         event_id: format!("{}-{}", status.last_seen_ms, status.events_total),
         provider: provider.to_string(),
         session_key: opaque_session_key(session_id),
@@ -446,7 +723,16 @@ pub fn record_provider_lifecycle_event(
         retrieval_latency_ms,
         retrieved_memory_count,
         retrieved_memory_details,
-    });
+    };
+    status.counters.record(&event);
+    if is_milestone_event(event_name) {
+        status.milestone_events.push(event.clone());
+        if status.milestone_events.len() > MAX_PROVIDER_MILESTONE_EVENTS {
+            let keep_from = status.milestone_events.len() - MAX_PROVIDER_MILESTONE_EVENTS;
+            status.milestone_events.drain(..keep_from);
+        }
+    }
+    status.events.push(event);
     if status.events.len() > MAX_PROVIDER_TELEMETRY_EVENTS {
         let keep_from = status.events.len() - MAX_PROVIDER_TELEMETRY_EVENTS;
         status.events.drain(..keep_from);
@@ -1389,5 +1675,203 @@ mod tests {
             .unwrap()
             .contains("private-session-id"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_counters_survive_event_window_eviction() {
+        let root = test_directory().join(format!("provider-counters-{}", now_ms()));
+        let record = |session: &str, event: &str, payload: serde_json::Value| {
+            record_provider_lifecycle_event(&root, "codex", session, event, &payload).unwrap();
+        };
+        record(
+            "session-a",
+            "UserPromptSubmit",
+            serde_json::json!({"prompt": "build it"}),
+        );
+        record(
+            "session-a",
+            "PreToolUse",
+            serde_json::json!({"tool_name": "shell", "tool_input": {"cmd": "ls"}}),
+        );
+        record(
+            "session-a",
+            "PostToolUse",
+            serde_json::json!({"tool_name": "shell", "tool_response": "ok"}),
+        );
+        record(
+            "session-a",
+            "SubagentStart",
+            serde_json::json!({"agent_id": "a1", "agent_type": "explorer"}),
+        );
+        record(
+            "session-a",
+            "SubagentStop",
+            serde_json::json!({"agent_id": "a1", "agent_type": "explorer"}),
+        );
+        record(
+            "session-a",
+            "TurnUsage",
+            serde_json::json!({"usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 30,
+                "cache_read_input_tokens": 400,
+                "total_tokens": 120
+            }}),
+        );
+        record(
+            "session-a",
+            "Stop",
+            serde_json::json!({"final_response": "done"}),
+        );
+        // A stop with no open prompt counts as a stop but not as a cycle.
+        record("session-b", "Stop", serde_json::json!({}));
+        for index in 0..600 {
+            record(
+                "session-a",
+                "MemoryRetrieved",
+                serde_json::json!({"query": format!("q{index}"), "retrieved_memory_count": 1}),
+            );
+        }
+
+        let status = provider_lifecycle_status(&root, "codex").unwrap().unwrap();
+        assert_eq!(status.events.len(), MAX_PROVIDER_TELEMETRY_EVENTS);
+        assert!(status
+            .events
+            .iter()
+            .all(|event| event.event == "MemoryRetrieved"));
+        let counters = &status.counters;
+        assert!(counters.since_ms > 0);
+        assert_eq!(counters.prompts, 1);
+        assert_eq!(counters.stops, 2);
+        assert_eq!(counters.tool_calls, 1);
+        assert_eq!(counters.tool_results, 1);
+        assert_eq!(counters.subagent_starts, 1);
+        assert_eq!(counters.subagent_stops, 1);
+        assert_eq!(counters.usage_events, 1);
+        assert_eq!(counters.input_tokens, 100);
+        assert_eq!(counters.output_tokens, 20);
+        assert_eq!(counters.cache_creation_input_tokens, 30);
+        assert_eq!(counters.cache_read_input_tokens, 400);
+        assert_eq!(counters.reported_total_tokens, 120);
+        assert_eq!(counters.cycles_completed, 1);
+        assert_eq!(
+            counters.cycle_duration_buckets.iter().sum::<u64>(),
+            counters.cycles_completed
+        );
+        assert!(counters.cycle_duration_quantile_ms(0.5).is_some());
+        assert!(counters.open_prompts.is_empty());
+        let milestones = status
+            .milestone_events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            milestones,
+            [
+                "UserPromptSubmit",
+                "SubagentStart",
+                "SubagentStop",
+                "TurnUsage",
+                "Stop",
+                "Stop"
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_end_drops_an_open_prompt_without_counting_a_cycle() {
+        let root = test_directory().join(format!("provider-session-end-{}", now_ms()));
+        let record = |session: &str, event: &str| {
+            record_provider_lifecycle_event(&root, "codex", session, event, &serde_json::json!({}))
+                .unwrap();
+        };
+        record("session-a", "UserPromptSubmit");
+        record("session-a", "SessionEnd");
+        // A stop after the session ended has no open prompt to close.
+        record("session-a", "Stop");
+
+        let status = provider_lifecycle_status(&root, "codex").unwrap().unwrap();
+        let counters = &status.counters;
+        assert_eq!(counters.prompts, 1);
+        assert_eq!(counters.stops, 1);
+        assert_eq!(counters.cycles_completed, 0);
+        assert_eq!(counters.cycle_duration_sum_ms, 0);
+        assert_eq!(counters.cycle_duration_buckets.iter().sum::<u64>(), 0);
+        assert!(counters.cycle_duration_quantile_ms(0.5).is_none());
+        assert!(counters.open_prompts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subagent_counters_track_open_interrupted_and_ended_runs() {
+        let root = test_directory().join(format!("provider-subagents-{}", now_ms()));
+        let record = |session: &str, event: &str, agent: &str| {
+            record_provider_lifecycle_event(
+                &root,
+                "claude",
+                session,
+                event,
+                &serde_json::json!({"agent_id": agent}),
+            )
+            .unwrap();
+        };
+        // A run killed by an API error and resumed sends two starts, one stop.
+        record("session-a", "SubagentStart", "resumed");
+        record("session-a", "SubagentStart", "resumed");
+        record("session-a", "SubagentStop", "resumed");
+        // A run whose session ends without a stop.
+        record("session-b", "SubagentStart", "orphan");
+        record("session-b", "PreToolUse", "orphan");
+        record("session-b", "SessionEnd", "");
+        // A run still going in another session.
+        record("session-c", "SubagentStart", "live");
+        record("session-c", "PostToolUse", "live");
+        // A stop that lands just after its session ended counts once, as a stop.
+        record("session-d", "SubagentStart", "late");
+        record("session-d", "SessionEnd", "");
+        record("session-d", "SubagentStop", "late");
+
+        let status = provider_lifecycle_status(&root, "claude").unwrap().unwrap();
+        let counters = &status.counters;
+        assert_eq!(counters.subagent_starts, 5);
+        assert_eq!(counters.subagent_stops, 2);
+        assert_eq!(counters.subagent_interrupted, 1);
+        assert_eq!(counters.subagent_ended_without_stop, 1);
+        assert_eq!(counters.open_subagents.keys().collect::<Vec<_>>(), ["live"]);
+        let live = &counters.open_subagents["live"];
+        assert!(live.last_seen_ms >= live.started_ms);
+        assert_eq!(
+            counters.subagent_starts,
+            counters.subagent_stops
+                + counters.subagent_interrupted
+                + counters.subagent_ended_without_stop
+                + counters.open_subagents.len() as u64
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_ledger_without_counters_still_loads() {
+        let legacy = serde_json::json!({
+            "schema_version": 1,
+            "provider": "codex",
+            "last_event": "Stop",
+            "last_seen_ms": 10,
+            "events_total": 3,
+            "sessions_started": 1,
+            "sessions_ended": 0,
+            "sessions_active": 1,
+            "retrieval_events": 1,
+            "capture_events": 1,
+            "events": []
+        });
+        let status: ProviderLifecycleStatus = serde_json::from_value(legacy).unwrap();
+        assert_eq!(status.events_total, 3);
+        assert_eq!(status.counters.since_ms, 0);
+        assert_eq!(status.counters.prompts, 0);
+        assert!(status.milestone_events.is_empty());
+        assert_eq!(status.counters.cycle_duration_quantile_ms(0.5), None);
     }
 }

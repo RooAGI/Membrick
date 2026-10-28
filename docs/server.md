@@ -1,11 +1,14 @@
 # Membrick server
 
-`server` exposes a versioned memory API backed by `MemoryService`. The storage
-engine is an implementation detail of that service; clients should use the
-memory endpoints rather than depend on `IndexStore`. It is a standalone HTTP interface for any application;
-`POST /add/batch` accepts up to 128 normal add requests and stages them as one
-durable transaction. Accumulated changes are published on the configured
-schedule. Each request still enforces the 1,024-message limit.
+`server` exposes a JSON-over-HTTP memory API backed by `MemoryService`. The
+storage engine is an implementation detail; clients should use the memory
+endpoints rather than depend on `IndexStore`. It is a standalone HTTP interface
+for applications and services. `POST /add/batch` accepts up to 128 add
+requests and stages them as one durable transaction. Each request still
+enforces the 1,024-message limit.
+
+See the [Memory API reference](api/index.md) for endpoint schemas, examples,
+and per-operation behavior.
 
 Identity is an API concern: `MemoryService` translates `user_id` into a generic
 document filter, while `IndexStore` and segmented indexing remain unaware of
@@ -32,9 +35,10 @@ Use an explicit index directory for a persistent evaluation instance:
 cargo run --release --bin server -- --settings .membrick/server.toml
 ```
 
-The server reads `.membrick/server.toml` from its project root by default. Use
-`--settings PATH` to select another TOML file. Command-line flags override
-values from the file. For example:
+The server reads `.membrick/server.toml` under the current directory by
+default. Set `project_root` to select a workspace root, or use `--settings PATH`
+to select a settings file directly. Command-line flags override values from
+the file. For example:
 
 ```toml
 bind = "127.0.0.1:8080"
@@ -161,12 +165,13 @@ latency harness above measures its route separately. Reports:
 [query](https://github.com/RooAGI/Membrick/blob/main/comparison/results/throughput-query-refactor-2026-10-11.json),
 [writes](https://github.com/RooAGI/Membrick/blob/main/comparison/results/throughput-write-only-refactor-2026-10-11.json).
 
-By default the server binds only to localhost, such as `127.0.0.1:8080` or
-`[::1]:8080`. To bind a container or another network interface, explicitly pass
+By default the server binds to loopback, such as `127.0.0.1:8080` or
+`[::1]:8080`. To bind another network interface, explicitly pass
 `--allow-non-loopback` and configure `server_token` or `jwt_secret` in the
-server settings file. This option
-cannot be combined with `--allow-unauthenticated`. Keep the host port private
-or place remote access behind an authenticated, encrypted proxy. See
+server settings file. This option cannot be combined with
+`--allow-unauthenticated`. The listener uses plain HTTP, so keep it on a
+trusted network or place remote access behind an authenticated, encrypted
+proxy. See
 [Run Membrick with Docker](docker.md) for a localhost-only Compose setup.
 
 For a single-tenant deployment, also set `--tenant-id TENANT` or the
@@ -175,8 +180,8 @@ tenant are rejected; this prevents a bearer token from being used to select
 another tenant by changing the request body.
 
 For dashboard startup and use, see the [Observability guide](observability.md).
-The server intentionally speaks plain HTTP because it is restricted to
-localhost. Do not forward the port through a public or network-facing proxy.
+The listener uses plain HTTP. Do not expose it directly to the public internet;
+use a TLS-terminating proxy or secure tunnel for remote access.
 
 Primary adds are admitted to a bounded queue and processed by one writer.
 Adds arriving during refresh wait; a full queue returns `429`. Synchronous
@@ -188,29 +193,17 @@ with a non-empty `sub` claim and a valid `exp` claim; that subject is treated
 as the authenticated `user_id` and must match the request scope. The JWT secret
 takes precedence over the shared `server_token` mode.
 
-The server exposes `GET /health`, the legacy mutation/search routes, and the
-versioned memory routes:
+The server exposes memory, provider, operations, and telemetry routes. See the
+[HTTP API overview](api/http-overview.md) for the current route inventory,
+authentication requirements, shared limits, and status codes. Endpoint schemas
+and behavior are documented in the linked route references. The server may
+also expose board and flow endpoints when those extensions are enabled.
 
-* `GET /v1/memories` lists memories with `user_id`, optional `session_id`,
-  `limit`, and cursor parameters.
-* `POST /v1/memories` adds memories.
-* `GET /v1/memories/:memory_id` retrieves one memory.
-* `PATCH /v1/memories/:memory_id` updates one memory.
-* `DELETE /v1/memories/:memory_id` deletes one memory.
-* `POST /v1/memories/search` searches memories.
-* `POST /v1/memories/refresh` publishes and checkpoints pending changes; `/flush` is an alias.
-
-The legacy routes are `POST /add`, `POST /add/batch`, `POST /search`,
-`POST /delete`, `POST /supersede`, and `POST /expire`; they remain for
-backward compatibility.
-
-Provider integrations use `POST /provider-memory/add/batch` and
-`POST /provider-memory/search` for shared captured memories. The resident
-`MemoryService` opens its workspace and captured-memory backing stores once
-per canonical project root. Both stores are private to that owner; providers
-never hold writable indexes. The batch-add endpoint has no workspace field and
-targets the primary workspace. Provider search may specify a workspace;
-requests without one use the primary `project_root`.
+Provider-memory routes use a resident `MemoryService` owner for each canonical
+project root. Providers do not open writable indexes themselves. The legacy
+`/provider-memory/add/batch` route has no workspace field and targets the
+primary workspace; use workspace-aware MCP or hook routes for additional
+project roots.
 
 ### Resident `MemoryService` ownership
 
@@ -382,14 +375,13 @@ level = "debug"
 Accepted levels are `off`, `error`, `warn`, `info`, `debug` and `trace`.
 Background roles default to `info`. Interactive commands default to `warn`.
 
-Hermes and OpenClaw plugins can share one HTTP server process. OpenClaw hook payloads with a
-workspace directory are routed to that workspace's runtime. Hermes currently
-uses the legacy `/provider-memory/add/batch` endpoint, which writes to the
-primary workspace; its `/provider-memory/search` request can include an
-optional `workspace` field. Configure their HTTP connection in each provider's
-plugin configuration file. The server uses plain HTTP. Keep it on loopback for
-local agent setups; for remote agents, use a separately secured tunnel or
-proxy.
+Hermes and OpenClaw plugins can share one HTTP server process. OpenClaw hook
+payloads with a workspace directory are routed to that workspace's runtime.
+Hermes currently uses the legacy `/provider-memory/add/batch` endpoint, which
+writes to the primary workspace; its `/provider-memory/search` request can
+include an optional `workspace` field. Configure their HTTP connection in each
+provider's plugin configuration file. For remote agents, use a separately
+secured tunnel or proxy.
 
 ## Dashboard and observability
 

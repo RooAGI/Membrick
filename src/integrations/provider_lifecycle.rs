@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A provider-issued instance identity, distinct from its resumable conversation ID.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,7 +127,228 @@ pub(crate) fn end_session(root: &Path, session: &SessionToken) -> Result<()> {
             fs::write(path, serde_json::to_vec(&owners)?)?;
         }
     }
+    let _ = fs::remove_file(activity_path(
+        root,
+        &session.provider,
+        Some(&session.session),
+    ));
     Ok(())
+}
+
+/// How long an adapter keeps the resident warm after the last tool call or
+/// hook it can attribute to its sessions.
+pub(crate) const KEEPALIVE_IDLE: Duration = Duration::from_secs(5 * 60);
+const KEEPALIVE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Keeps the project resident warm while a provider adapter is in use.
+///
+/// Hosts can keep an adapter process and its threads open long after the user
+/// leaves, and may never send an end event. A lifetime lease would then pin the
+/// resident forever, so the lease lasts only while the adapter's sessions show
+/// tool calls or hooks within [`KEEPALIVE_IDLE`]. An adapter that has not seen
+/// a session ID counts every hook from its provider in the project. Once the
+/// lease is released, the resident's own idle timeout applies.
+pub(crate) struct ResidentKeepalive {
+    shared: Arc<KeepaliveShared>,
+}
+
+struct KeepaliveShared {
+    root: PathBuf,
+    provider: &'static str,
+    state: Mutex<KeepaliveState>,
+}
+
+struct KeepaliveState {
+    lease: Option<crate::local_ipc::ProviderSessionLease>,
+    sessions: BTreeSet<String>,
+    last_tool_call: SystemTime,
+    checked_at: Instant,
+    ended: bool,
+}
+
+impl ResidentKeepalive {
+    /// A keepalive that a background thread checks every few seconds.
+    pub(crate) fn start(root: &Path, provider: &'static str) -> Self {
+        let keepalive = Self::new(root, provider);
+        let shared = Arc::downgrade(&keepalive.shared);
+        let spawned = std::thread::Builder::new()
+            .name("membrick-resident-keepalive".into())
+            .spawn(move || loop {
+                std::thread::sleep(KEEPALIVE_CHECK_INTERVAL);
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                shared.refresh();
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(
+                "could not start resident keepalive; lease follows tool calls only: {error}"
+            );
+        }
+        keepalive
+    }
+
+    pub(crate) fn new(root: &Path, provider: &'static str) -> Self {
+        Self {
+            shared: Arc::new(KeepaliveShared {
+                root: root.to_path_buf(),
+                provider,
+                state: Mutex::new(KeepaliveState {
+                    lease: None,
+                    sessions: BTreeSet::new(),
+                    last_tool_call: SystemTime::now(),
+                    checked_at: Instant::now(),
+                    ended: false,
+                }),
+            }),
+        }
+    }
+
+    /// Record a tool call, attributed to `session` when the host names one,
+    /// and hold the lease.
+    pub(crate) fn tool_call(&self, session: Option<&str>) {
+        let Ok(mut state) = self.shared.state.lock() else {
+            tracing::warn!("resident keepalive lock poisoned");
+            return;
+        };
+        if state.ended {
+            return;
+        }
+        if let Some(session) = session {
+            state.sessions.insert(session.to_owned());
+        }
+        state.last_tool_call = SystemTime::now();
+        self.shared.acquire(&mut state);
+    }
+
+    /// Release the lease for good: every session of this adapter has ended.
+    pub(crate) fn end(&self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.ended = true;
+            state.lease = None;
+        }
+    }
+
+    /// Release or renew the lease now if a check is due.
+    pub(crate) fn refresh(&self) {
+        self.shared.refresh();
+    }
+
+    #[cfg(test)]
+    fn holds_lease(&self) -> bool {
+        self.shared.state.lock().unwrap().lease.is_some()
+    }
+
+    #[cfg(test)]
+    fn backdate(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.last_tool_call = SystemTime::now() - KEEPALIVE_IDLE * 2;
+        state.checked_at = Instant::now() - KEEPALIVE_CHECK_INTERVAL * 2;
+    }
+}
+
+impl KeepaliveShared {
+    fn acquire(&self, state: &mut KeepaliveState) {
+        if state.lease.is_some() {
+            return;
+        }
+        let lease = format!("{}-session", self.provider);
+        match crate::local_ipc::acquire_provider_session_lease(&self.root, &lease) {
+            Ok(lease) => state.lease = Some(lease),
+            Err(error) => tracing::warn!(
+                provider = self.provider,
+                "could not hold resident lease: {error:#}"
+            ),
+        }
+    }
+
+    fn refresh(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.ended || state.checked_at.elapsed() < KEEPALIVE_CHECK_INTERVAL {
+            return;
+        }
+        state.checked_at = Instant::now();
+        let hooks = if state.sessions.is_empty() {
+            last_activity(&self.root, self.provider, None)
+        } else {
+            state
+                .sessions
+                .iter()
+                .filter_map(|session| last_activity(&self.root, self.provider, Some(session)))
+                .max()
+        };
+        let latest = hooks.map_or(state.last_tool_call, |hook| hook.max(state.last_tool_call));
+        let active = latest.elapsed().map_or(true, |idle| idle < KEEPALIVE_IDLE);
+        if !active && state.lease.is_some() {
+            tracing::info!(
+                provider = self.provider,
+                idle_seconds = KEEPALIVE_IDLE.as_secs(),
+                "provider sessions idle; releasing resident lease"
+            );
+            state.lease = None;
+        } else if active {
+            self.acquire(&mut state);
+        }
+    }
+}
+
+/// Record that a provider session is active now. Hooks run in their own
+/// processes, so adapters read these records to see hook activity. Each hook
+/// marks both its session and its provider. A failure only warns: a hook must
+/// never fail because its activity could not be recorded.
+pub(crate) fn note_activity(root: &Path, provider: &str, session: Option<&str>) {
+    let now = SystemTime::now();
+    let session = session.filter(|session| !session.trim().is_empty());
+    let record = |path: PathBuf| -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?
+            .set_modified(now)?;
+        Ok(())
+    };
+    for path in [
+        Some(activity_path(root, provider, None)),
+        session.map(|session| activity_path(root, provider, Some(session))),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(error) = record(path) {
+            tracing::warn!(provider, "could not record provider activity: {error:#}");
+        }
+    }
+}
+
+fn last_activity(root: &Path, provider: &str, session: Option<&str>) -> Option<SystemTime> {
+    fs::metadata(activity_path(root, provider, session))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+/// The activity record for one session, or for the whole provider.
+fn activity_path(root: &Path, provider: &str, session: Option<&str>) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(provider.as_bytes());
+    hash.update([0]);
+    if let Some(session) = session {
+        hash.update(session.as_bytes());
+    }
+    let name: String = hash.finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let kind = if session.is_some() { "s" } else { "p" };
+    directory(root)
+        .join("activity")
+        .join(format!("{kind}-{name}"))
 }
 
 fn directory(root: &Path) -> PathBuf {
@@ -194,6 +417,57 @@ mod tests {
         end_session(&root, &other).unwrap();
         assert!(provider.stopped());
         drop((ended, resumed, shared, provider));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn idle_keepalive_releases_lease_and_hook_activity_renews_it() {
+        let root = std::env::temp_dir().join(format!("mb-keepalive-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bound = ResidentKeepalive::new(&root, "codex");
+        bound.tool_call(Some("thread"));
+        let unbound = ResidentKeepalive::new(&root, "claude");
+        unbound.tool_call(None);
+        assert!(bound.holds_lease() && unbound.holds_lease());
+
+        for keepalive in [&bound, &unbound] {
+            keepalive.backdate();
+            keepalive.refresh();
+            assert!(
+                !keepalive.holds_lease(),
+                "idle adapter must not pin the resident"
+            );
+        }
+
+        // Another thread of the same provider does not keep a bound adapter warm.
+        note_activity(&root, "codex", Some("other-thread"));
+        bound.backdate();
+        bound.refresh();
+        assert!(!bound.holds_lease());
+        note_activity(&root, "codex", Some("thread"));
+        bound.backdate();
+        bound.refresh();
+        assert!(bound.holds_lease(), "hook activity must renew the lease");
+
+        // An unbound adapter follows any hook from its own provider only.
+        note_activity(&root, "codex", None);
+        unbound.backdate();
+        unbound.refresh();
+        assert!(!unbound.holds_lease());
+        note_activity(&root, "claude", Some("session"));
+        unbound.backdate();
+        unbound.refresh();
+        assert!(unbound.holds_lease());
+
+        bound.end();
+        bound.tool_call(Some("thread"));
+        assert!(
+            !bound.holds_lease(),
+            "an ended adapter must not take a new lease"
+        );
+        drop((bound, unbound));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1,11 +1,11 @@
 # Membrick for Node.js
 
-`membrick` is the Node.js binding for the same Rust `MemoryService` used
-by the Rust and Python APIs. It has the same two backend modes as Python:
+`membrick` includes a Node.js binding for the shared Rust `Memory`. Use
+`Memory` for project and remote connections:
 
-- Local: `path` selects a persistent store; without it the service is in memory.
-- Remote: `base_url` connects to the existing HTTP server, with optional
-  `api_key` bearer authentication.
+- `Memory({ path })` connects to an existing project's resident; `baseUrl`
+  selects a remote HTTP server. The constructor requires one of these options
+  and never defaults to the current working directory.
 
 ## Install
 
@@ -13,7 +13,7 @@ by the Rust and Python APIs. It has the same two backend modes as Python:
 npm install membrick
 ```
 
-This installs both the Node.js `MemoryService` binding and the `membrick` CLI
+This installs the Node.js `Memory` binding and the `membrick` CLI
 on supported platforms. For example:
 
 ```sh
@@ -32,17 +32,24 @@ The package is published from the matching `v<version>` Git tag after all
 platform builds succeed. The repository needs an `NPM_TOKEN` Actions secret
 with permission to publish `membrick` and its `@rooagi` platform packages.
 
-## Local service
+## Unified client
 
 ```js
-const { Memory } = require('membrick')
+import { Memory } from 'membrick'
 
-const memory = new Memory({ path: './.membrick/memory' })
-await memory.add('write-1', 'alice', 'session-1', [
-  { role: 'user', content: 'The launch is on Friday.' },
-])
-const hits = await memory.search('When is the launch?', 'alice', 5)
+const memory = new Memory({ path: process.cwd() }) // resident for this project
+const receipt = await memory.add(
+  [{ role: 'user', content: 'I prefer oat milk.' }],
+  'alice',
+)
+const hits = await memory.search('What are Alice’s preferences?', 'alice')
 ```
+
+Set `path` to select a project's resident, or `baseUrl` and optional
+`apiKey` for a remote server. Call `Memory.init({ path })` only when the
+application intends to initialize missing project state. `requestId` may be provided to `add` when an
+application persists idempotency keys across retries. Use
+`memory.session(userId, sessionId)` to pin identities across calls.
 
 ## Remote service
 
@@ -54,15 +61,6 @@ const memory = new Memory({
 const hits = await memory.search('When is the launch?', 'alice')
 ```
 
-The remote mode talks to the same `/v1/memories` endpoints as Python. Use it
-when another process already owns the workspace. Local mode is intended for an
-application that owns its store; do not open the same persistent workspace in
-multiple writer processes.
-
-The public methods are `add`, `addBatch`, `search`, `get`, `list`, `update`,
-`delete`, and `refresh`. Method arguments follow the Python `Memory` binding;
-message fields and `addBatch` request objects retain the snake_case JSON
-contract used by Python and the HTTP API.
 
 ## Build from source
 

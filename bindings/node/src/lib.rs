@@ -1,12 +1,12 @@
-use std::{path::Path, sync::Mutex, time::Duration};
+use std::time::Duration;
 
 use membrick::{
-    AddRequest, GetRequest, ListRequest, MemoryService, PipelineOptions, SearchRequest,
-    Tier1NerProvider, UpdateRequest,
+    AddOptions as CoreAddOptions, GetOptions, ListOptions as CoreListOptions,
+    MemoryOptions as CoreMemoryOptions, SearchOptions as CoreSearchOptions,
+    UpdateOptions as CoreUpdateOptions,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use reqwest::{blocking::Client, Method, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
@@ -15,18 +15,45 @@ pub struct MemoryOptions {
     pub path: Option<String>,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
-    pub ner_provider: Option<String>,
-    pub spacy_model: Option<String>,
+    pub request_timeout_ms: Option<u32>,
+    pub resident_executable: Option<String>,
 }
 
-enum Backend {
-    Local(MemoryService),
-    Remote(RemoteMemoryClient),
+#[napi(object)]
+pub struct AddOptions {
+    pub request_id: Option<String>,
+    pub session_id: Option<String>,
+    pub wait_for_visibility: Option<bool>,
 }
 
-#[napi]
+#[napi(object)]
+pub struct SearchOptions {
+    pub top_k: Option<u32>,
+    pub session_id: Option<String>,
+    pub filters: Option<Value>,
+    pub scope: Option<String>,
+    pub reference_date: Option<String>,
+    pub options: Option<Vec<String>>,
+}
+
+#[napi(object)]
+pub struct ListOptions {
+    pub session_id: Option<String>,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    pub include_inactive: Option<bool>,
+}
+
+#[napi(object)]
+pub struct UpdateOptions {
+    pub role: Option<String>,
+    pub timestamp: Option<f64>,
+    pub expires_at_ms: Option<f64>,
+}
+
+#[napi(js_name = "Memory")]
 pub struct Memory {
-    backend: Mutex<Backend>,
+    inner: std::sync::Arc<membrick::Memory>,
 }
 
 #[napi]
@@ -37,134 +64,145 @@ impl Memory {
             path: None,
             base_url: None,
             api_key: None,
-            ner_provider: None,
-            spacy_model: None,
+            request_timeout_ms: None,
+            resident_executable: None,
         });
         if options.path.is_some() && options.base_url.is_some() {
-            return Err(Error::from_reason("path and base_url cannot both be set"));
+            return Err(Error::from_reason(
+                "[MEMBRICK_ERROR code=CONFIGURATION] path and baseUrl cannot both be set",
+            ));
         }
-
-        let backend = if let Some(base_url) = options.base_url {
-            Backend::Remote(RemoteMemoryClient::new(base_url, options.api_key)?)
-        } else {
-            let mut pipeline = PipelineOptions::default();
-            match options.ner_provider.as_deref().unwrap_or("heuristic") {
-                "heuristic" => pipeline.ner_provider = Tier1NerProvider::Heuristic,
-                "spacy" => pipeline.ner_provider = Tier1NerProvider::Spacy,
-                other => {
-                    return Err(Error::from_reason(format!(
-                        "ner_provider must be 'heuristic' or 'spacy' (got '{other}')"
-                    )))
-                }
-            }
-            if let Some(model) = options.spacy_model {
-                pipeline.spacy_model = model;
-            }
-            let service = match options.path {
+        let client = match options.base_url {
+            Some(base_url) => membrick::Memory::remote(
+                base_url,
+                CoreMemoryOptions {
+                    api_key: options.api_key,
+                    request_timeout: Duration::from_millis(
+                        options.request_timeout_ms.unwrap_or(30_000) as u64,
+                    ),
+                    resident_executable: options.resident_executable.map(std::path::PathBuf::from),
+                },
+            ),
+            None => match options.path {
+                None => return Err(Error::from_reason("[MEMBRICK_ERROR code=CONFIGURATION] provide path for a project connection or baseUrl for a remote connection")),
                 Some(path) => {
-                    MemoryService::at_path(Path::new(&path), pipeline).map_err(runtime_error)?
+                    membrick::Memory::with_options(path, CoreMemoryOptions {
+                        api_key: options.api_key,
+                        request_timeout: Duration::from_millis(
+                            options.request_timeout_ms.unwrap_or(30_000) as u64,
+                        ),
+                        resident_executable: options.resident_executable.map(std::path::PathBuf::from),
+                    })
                 }
-                None => MemoryService::in_memory(pipeline),
-            };
-            Backend::Local(service)
-        };
+            },
+        }
+        .map_err(memory_client_error)?;
         Ok(Self {
-            backend: Mutex::new(backend),
+            inner: std::sync::Arc::new(client),
         })
     }
 
-    /// Add one memory. Arguments mirror the Python Memory.add method.
+    #[napi(factory)]
+    pub fn init(options: MemoryOptions) -> Result<Self> {
+        let path = options.path.ok_or_else(|| {
+            Error::from_reason(
+                "[MEMBRICK_ERROR code=CONFIGURATION] Memory.init requires path",
+            )
+        })?;
+        if options.base_url.is_some() {
+            return Err(Error::from_reason(
+                "[MEMBRICK_ERROR code=CONFIGURATION] Memory.init cannot be used with baseUrl",
+            ));
+        }
+        let client = membrick::Memory::init_with_options(
+            path,
+            CoreMemoryOptions {
+                api_key: options.api_key,
+                request_timeout: Duration::from_millis(
+                    options.request_timeout_ms.unwrap_or(30_000) as u64,
+                ),
+                resident_executable: options.resident_executable.map(std::path::PathBuf::from),
+            },
+        )
+        .map_err(memory_client_error)?;
+        Ok(Self {
+            inner: std::sync::Arc::new(client),
+        })
+    }
+
     #[napi]
     pub async fn add(
         &self,
-        request_id: String,
-        user_id: String,
-        session_id: String,
         messages: Vec<Value>,
+        user_id: String,
+        options: Option<AddOptions>,
     ) -> Result<Value> {
+        let options = options.unwrap_or(AddOptions {
+            request_id: None,
+            session_id: None,
+            wait_for_visibility: None,
+        });
         let messages = messages
             .into_iter()
             .map(from_value)
-            .collect::<Result<Vec<_>>>()?;
-        let request = AddRequest {
-            request_id,
-            user_id,
-            session_id,
-            messages,
-        };
-        let mut backend = self.backend.lock().map_err(lock_error)?;
-        match &mut *backend {
-            Backend::Local(service) => to_value(service.add(request).map_err(runtime_error)?),
-            Backend::Remote(client) => client.add(&request),
-        }
+            .collect::<Result<Vec<membrick::Message>>>()?;
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            let receipt = client
+                .add(
+                    messages,
+                    &user_id,
+                    CoreAddOptions {
+                        request_id: options.request_id,
+                        session_id: options.session_id,
+                        wait_for_visibility: options.wait_for_visibility.unwrap_or(false),
+                    },
+                )
+                .map_err(memory_client_error)?;
+            to_value(receipt)
+        })
+        .await
     }
 
-    /// Add between 1 and 128 memories. Remote mode sends sequential requests,
-    /// matching Python's fallback because the HTTP API has no batch route.
-    #[napi]
-    pub async fn add_batch(&self, requests: Vec<Value>) -> Result<Vec<Value>> {
-        if requests.is_empty() || requests.len() > 128 {
-            return Err(Error::from_reason(
-                "requests must contain between 1 and 128 entries",
-            ));
-        }
-        let requests = requests
-            .into_iter()
-            .map(from_value::<AddRequest>)
-            .collect::<Result<Vec<_>>>()?;
-        let mut backend = self.backend.lock().map_err(lock_error)?;
-        match &mut *backend {
-            Backend::Local(service) => {
-                to_values(service.add_batch(requests).map_err(runtime_error)?)
-            }
-            Backend::Remote(client) => requests.iter().map(|r| client.add(r)).collect(),
-        }
-    }
-
-    /// Search memories for a user. Optional request fields are session_id,
-    /// scope, filters, and reference_date.
     #[napi]
     pub async fn search(
         &self,
         query: String,
         user_id: String,
-        top_k: Option<u32>,
-        session_id: Option<String>,
-        filters: Option<Value>,
-        scope: Option<String>,
+        options: Option<SearchOptions>,
     ) -> Result<Vec<Value>> {
-        let filters = match filters {
-            Some(Value::Null) | None => None,
-            Some(value) => Some(from_value::<std::collections::BTreeMap<String, String>>(
-                value,
-            )?),
-        };
-        let request = SearchRequest {
-            query,
-            options: None,
-            user_id,
-            top_k: top_k.unwrap_or(10) as usize,
-            session_id,
-            scope,
-            filters,
+        let options = options.unwrap_or(SearchOptions {
+            top_k: None,
+            session_id: None,
+            filters: None,
+            scope: None,
             reference_date: None,
-        };
-        let mut backend = self.backend.lock().map_err(lock_error)?;
-        match &mut *backend {
-            Backend::Local(service) => {
-                let response = service.search(request).map_err(runtime_error)?;
-                to_values(response.data)
-            }
-            Backend::Remote(client) => {
-                let response = client
-                    .request(Method::POST, "/v1/memories/search")
-                    .json(&request)
-                    .send()
-                    .map_err(runtime_error)?;
-                let parsed: membrick::SearchResponse = decode(response)?;
-                to_values(parsed.data)
-            }
-        }
+            options: None,
+        });
+        let filters = options
+            .filters
+            .filter(|value| !value.is_null())
+            .map(from_value::<std::collections::BTreeMap<String, String>>)
+            .transpose()?;
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            let results = client
+                .search(
+                    &query,
+                    &user_id,
+                    CoreSearchOptions {
+                        top_k: options.top_k.unwrap_or(10) as usize,
+                        session_id: options.session_id,
+                        filters,
+                        scope: options.scope,
+                        reference_date: options.reference_date,
+                        options: options.options,
+                    },
+                )
+                .map_err(memory_client_error)?;
+            to_values(results)
+        })
+        .await
     }
 
     #[napi]
@@ -174,41 +212,47 @@ impl Memory {
         user_id: String,
         include_inactive: Option<bool>,
     ) -> Result<Option<Value>> {
-        let request = GetRequest {
-            user_id,
-            memory_id,
-            include_inactive: include_inactive.unwrap_or(false),
-        };
-        let backend = self.backend.lock().map_err(lock_error)?;
-        let result = match &*backend {
-            Backend::Local(service) => service.get(request).map_err(runtime_error)?,
-            Backend::Remote(client) => client.get(&request)?,
-        };
-        result.map(to_value).transpose()
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            client
+                .get(
+                    &memory_id,
+                    &user_id,
+                    GetOptions {
+                        include_inactive: include_inactive.unwrap_or(false),
+                    },
+                )
+                .map_err(memory_client_error)?
+                .map(to_value)
+                .transpose()
+        })
+        .await
     }
 
     #[napi]
-    pub async fn list(
-        &self,
-        user_id: String,
-        session_id: Option<String>,
-        limit: Option<u32>,
-        cursor: Option<String>,
-        include_inactive: Option<bool>,
-    ) -> Result<Value> {
-        let request = ListRequest {
-            user_id,
-            session_id,
-            limit: limit.unwrap_or(100) as usize,
-            cursor,
-            include_inactive: include_inactive.unwrap_or(false),
-        };
-        let backend = self.backend.lock().map_err(lock_error)?;
-        let result = match &*backend {
-            Backend::Local(service) => service.list(request).map_err(runtime_error)?,
-            Backend::Remote(client) => client.list(&request)?,
-        };
-        to_value(result)
+    pub async fn list(&self, user_id: String, options: Option<ListOptions>) -> Result<Value> {
+        let options = options.unwrap_or(ListOptions {
+            session_id: None,
+            limit: None,
+            cursor: None,
+            include_inactive: None,
+        });
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            let result = client
+                .list(
+                    &user_id,
+                    CoreListOptions {
+                        session_id: options.session_id,
+                        limit: options.limit.unwrap_or(100) as usize,
+                        cursor: options.cursor,
+                        include_inactive: options.include_inactive.unwrap_or(false),
+                    },
+                )
+                .map_err(memory_client_error)?;
+            to_value(result)
+        })
+        .await
     }
 
     #[napi]
@@ -217,188 +261,177 @@ impl Memory {
         memory_id: String,
         user_id: String,
         content: String,
-        role: Option<String>,
-        timestamp: Option<f64>,
-        expires_at_ms: Option<f64>,
+        options: Option<UpdateOptions>,
     ) -> Result<Option<Value>> {
-        let timestamp = timestamp
-            .map(|value| safe_integer(value, "timestamp"))
+        let options = options.unwrap_or(UpdateOptions {
+            role: None,
+            timestamp: None,
+            expires_at_ms: None,
+        });
+        let timestamp = options
+            .timestamp
+            .map(|v| safe_integer(v, "timestamp"))
             .transpose()?;
-        let expires_at_ms = expires_at_ms
-            .map(|value| safe_integer(value, "expires_at_ms"))
+        let expires_at_ms = options
+            .expires_at_ms
+            .map(|v| safe_integer(v, "expires_at_ms"))
             .transpose()?
-            .map(|value| {
-                u64::try_from(value)
+            .map(|v| {
+                u64::try_from(v)
                     .map_err(|_| Error::from_reason("expires_at_ms must be non-negative"))
             })
             .transpose()?;
-        let request = UpdateRequest {
-            memory_id,
-            user_id,
-            content,
-            role,
-            timestamp,
-            expires_at_ms,
-        };
-        let mut backend = self.backend.lock().map_err(lock_error)?;
-        let result = match &mut *backend {
-            Backend::Local(service) => service.update(request).map_err(runtime_error)?,
-            Backend::Remote(client) => client.update(&request)?,
-        };
-        result.map(to_value).transpose()
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            client
+                .update(
+                    &memory_id,
+                    &user_id,
+                    &content,
+                    CoreUpdateOptions {
+                        role: options.role,
+                        timestamp,
+                        expires_at_ms,
+                    },
+                )
+                .map_err(memory_client_error)?
+                .map(to_value)
+                .transpose()
+        })
+        .await
     }
 
     #[napi]
-    pub async fn delete(&self, user_id: String, memory_id: String) -> Result<bool> {
-        let mut backend = self.backend.lock().map_err(lock_error)?;
-        match &mut *backend {
-            Backend::Local(service) => service.delete(&user_id, &memory_id).map_err(runtime_error),
-            Backend::Remote(client) => client.delete(&user_id, &memory_id),
-        }
+    pub async fn delete(&self, memory_id: String, user_id: String) -> Result<bool> {
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            client
+                .delete(&memory_id, &user_id)
+                .map_err(memory_client_error)
+        })
+        .await
     }
 
     #[napi]
     pub async fn refresh(&self) -> Result<()> {
-        let mut backend = self.backend.lock().map_err(lock_error)?;
-        match &mut *backend {
-            Backend::Local(service) => service.refresh().map_err(runtime_error),
-            Backend::Remote(client) => client.refresh(),
+        let client = self.inner.clone();
+        spawn_blocking(move || client.refresh().map_err(memory_client_error)).await
+    }
+
+    #[napi]
+    pub fn close(&self) {
+        self.inner.close();
+    }
+
+    #[napi]
+    pub fn session(&self, user_id: String, session_id: String) -> MemorySession {
+        MemorySession {
+            inner: std::sync::Arc::new((*self.inner).clone()),
+            user_id,
+            session_id,
         }
     }
 }
 
-struct RemoteMemoryClient {
-    client: Client,
-    base_url: String,
-    api_key: Option<String>,
+#[napi(object)]
+pub struct SessionSearchOptions {
+    pub top_k: Option<u32>,
+    pub filters: Option<Value>,
+    pub scope: Option<String>,
+    pub reference_date: Option<String>,
+    pub options: Option<Vec<String>>,
 }
 
-impl RemoteMemoryClient {
-    fn new(base_url: String, api_key: Option<String>) -> Result<Self> {
-        let base_url = base_url.trim_end_matches('/').to_owned();
-        if base_url.is_empty() {
-            return Err(Error::from_reason("base_url must not be empty"));
-        }
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(runtime_error)?;
-        Ok(Self {
-            client,
-            base_url,
-            api_key,
-        })
-    }
+#[napi]
+pub struct MemorySession {
+    inner: std::sync::Arc<membrick::Memory>,
+    user_id: String,
+    session_id: String,
+}
 
-    fn request(&self, method: Method, path: &str) -> reqwest::blocking::RequestBuilder {
-        let request = self
-            .client
-            .request(method, format!("{}{}", self.base_url, path));
-        match &self.api_key {
-            Some(key) => request.bearer_auth(key),
-            None => request,
-        }
+#[napi]
+impl MemorySession {
+    #[napi(getter)]
+    pub fn user_id(&self) -> String {
+        self.user_id.clone()
     }
-
-    fn add(&self, request: &AddRequest) -> Result<Value> {
-        let response = self
-            .request(Method::POST, "/v1/memories")
-            .json(request)
-            .send()
-            .map_err(runtime_error)?;
-        decode(response)
+    #[napi(getter)]
+    pub fn session_id(&self) -> String {
+        self.session_id.clone()
     }
-
-    fn get(&self, request: &GetRequest) -> Result<Option<membrick::MemoryRecord>> {
-        let response = self
-            .request(
-                Method::GET,
-                &format!("/v1/memories/{}", encode_path_segment(&request.memory_id)),
-            )
-            .query(&[
-                ("user_id", request.user_id.as_str()),
-                (
-                    "include_inactive",
-                    if request.include_inactive {
-                        "true"
-                    } else {
-                        "false"
+    #[napi]
+    pub fn close(&self) {
+        self.inner.close();
+    }
+    #[napi]
+    pub async fn add(&self, messages: Vec<Value>, options: Option<AddOptions>) -> Result<Value> {
+        let options = options.unwrap_or(AddOptions {
+            request_id: None,
+            session_id: None,
+            wait_for_visibility: None,
+        });
+        let messages = messages
+            .into_iter()
+            .map(from_value)
+            .collect::<Result<Vec<membrick::Message>>>()?;
+        let client = self.inner.clone();
+        let user_id = self.user_id.clone();
+        let session_id = self.session_id.clone();
+        spawn_blocking(move || {
+            let receipt = client
+                .add(
+                    messages,
+                    &user_id,
+                    CoreAddOptions {
+                        request_id: options.request_id,
+                        session_id: Some(session_id),
+                        wait_for_visibility: options.wait_for_visibility.unwrap_or(false),
                     },
-                ),
-            ])
-            .send()
-            .map_err(runtime_error)?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        decode(response)
+                )
+                .map_err(memory_client_error)?;
+            to_value(receipt)
+        })
+        .await
     }
-
-    fn list(&self, request: &ListRequest) -> Result<membrick::ListResponse> {
-        let response = self
-            .request(Method::GET, "/v1/memories")
-            .query(request)
-            .send()
-            .map_err(runtime_error)?;
-        decode(response)
-    }
-
-    fn update(&self, request: &UpdateRequest) -> Result<Option<membrick::MemoryRecord>> {
-        let response = self
-            .request(
-                Method::PATCH,
-                &format!("/v1/memories/{}", encode_path_segment(&request.memory_id)),
-            )
-            .json(request)
-            .send()
-            .map_err(runtime_error)?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        decode(response)
-    }
-
-    fn delete(&self, user_id: &str, memory_id: &str) -> Result<bool> {
-        let response = self
-            .request(
-                Method::DELETE,
-                &format!("/v1/memories/{}", encode_path_segment(memory_id)),
-            )
-            .query(&[("user_id", user_id)])
-            .send()
-            .map_err(runtime_error)?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(false);
-        }
-        check_status(response.status(), "remote memory deletion")?;
-        Ok(true)
-    }
-
-    fn refresh(&self) -> Result<()> {
-        let response = self
-            .request(Method::POST, "/v1/memories/refresh")
-            .send()
-            .map_err(runtime_error)?;
-        check_status(response.status(), "remote memory refresh")
-    }
-}
-
-fn decode<T: DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T> {
-    let status = response.status();
-    let body = response.text().map_err(runtime_error)?;
-    if !status.is_success() {
-        return Err(Error::from_reason(format!(
-            "remote memory request failed ({status}): {body}"
-        )));
-    }
-    serde_json::from_str(&body).map_err(runtime_error)
-}
-
-fn check_status(status: StatusCode, operation: &str) -> Result<()> {
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(Error::from_reason(format!("{operation} failed ({status})")))
+    #[napi]
+    pub async fn search(
+        &self,
+        query: String,
+        options: Option<SessionSearchOptions>,
+    ) -> Result<Vec<Value>> {
+        let options = options.unwrap_or(SessionSearchOptions {
+            top_k: None,
+            filters: None,
+            scope: None,
+            reference_date: None,
+            options: None,
+        });
+        let filters = options
+            .filters
+            .filter(|value| !value.is_null())
+            .map(from_value::<std::collections::BTreeMap<String, String>>)
+            .transpose()?;
+        let client = self.inner.clone();
+        let user_id = self.user_id.clone();
+        let session_id = self.session_id.clone();
+        spawn_blocking(move || {
+            let results = client
+                .search(
+                    &query,
+                    &user_id,
+                    CoreSearchOptions {
+                        top_k: options.top_k.unwrap_or(10) as usize,
+                        session_id: Some(session_id),
+                        filters,
+                        scope: options.scope,
+                        reference_date: options.reference_date,
+                        options: options.options,
+                    },
+                )
+                .map_err(memory_client_error)?;
+            to_values(results)
+        })
+        .await
     }
 }
 
@@ -428,20 +461,31 @@ fn runtime_error(error: impl std::fmt::Display) -> Error {
     Error::from_reason(error.to_string())
 }
 
-fn lock_error<T>(_: std::sync::PoisonError<T>) -> Error {
-    Error::from_reason("memory service lock is poisoned")
+async fn spawn_blocking<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(runtime_error)?
 }
 
-fn encode_path_segment(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
+fn memory_client_error(error: membrick::MemoryError) -> Error {
+    match error {
+        membrick::MemoryError::Rejected { status, message } => Error::from_reason(format!(
+            "[MEMBRICK_ERROR code=REJECTED status={status}] request rejected ({status}): {message}"
+        )),
+        membrick::MemoryError::Configuration { message } => Error::from_reason(format!(
+            "[MEMBRICK_ERROR code=CONFIGURATION] invalid client configuration: {message}"
+        )),
+        membrick::MemoryError::Unavailable { message } => Error::from_reason(format!(
+            "[MEMBRICK_ERROR code=UNAVAILABLE] memory service unavailable: {message}"
+        )),
+        membrick::MemoryError::Uncertain { message } => Error::from_reason(format!(
+            "[MEMBRICK_ERROR code=UNCERTAIN] memory request outcome uncertain: {message}"
+        )),
+    }
 }
 
 #[napi]

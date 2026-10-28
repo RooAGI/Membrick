@@ -143,7 +143,7 @@ pub enum IndexInspectView {
 #[command(
     name = "membrick",
     version = env!("CARGO_PKG_VERSION"),
-    after_help = "Project commands:\n  membrick status [PATH]                  Show local index state; does not scan\n  membrick review [PATH]                  Run project lint checks\n  membrick analyze [PATH]                 Analyze project structure\n  membrick index [PATH] [--redacted]     Build or refresh the project index\n  membrick query <TEXT> [PATH] [--count N]\n  membrick context <TEXT> [PATH]          Prepare context for an LLM\n  membrick recall <TEXT> [PATH] [--count N]\n  membrick recall serve [PATH]            Serve recall requests over stdin/stdout\n  membrick inspect-index <PATH> [--view VIEW]\n  membrick session promote <ID> [--provider PROVIDER] [--root PATH]\n  membrick session replay <ID> [--provider PROVIDER] [--root PATH]\n  membrick export graph <FORMAT> [PATH] [--output FILE] [--level LEVEL]\n  membrick export ontology [PATH] [--output FILE]\n\nProvider commands:\n  membrick install <provider> [PATH]\n  membrick serve <provider> [PATH]\n  membrick verify <provider> [PATH]\n  membrick uninstall <provider> [PATH]\n  membrick hook <provider> <event> [PATH]\n  membrick statusline <claude|codex> [PATH]\n\nProvider options: --provider-config, --provider-settings, --provider-skills-dir,\n--provider-hooks-dir, --provider-plugin-dir, --force-skill, --timeout.\nUninstall is supported for: claude, codex. Providers: claude, codex, gemini, agy, muse, openclaw, hermes, roo-runtime."
+    after_help = "Project commands:\n  membrick status [PATH]                  Show local index state; does not scan\n  membrick review [PATH]                  Run project lint checks\n  membrick analyze [PATH]                 Analyze project structure\n  membrick index [PATH] [--redacted]     Build or refresh the project index\n  membrick query <TEXT> [PATH] [--count N]\n  membrick context <TEXT> [PATH]          Prepare context for an LLM\n  membrick recall <TEXT> [PATH] [--count N]\n  membrick recall serve [PATH]            Serve recall requests over stdin/stdout\n  membrick inspect-index <PATH> [--view VIEW]\n  membrick session promote <ID> [--provider PROVIDER] [--root PATH]\n  membrick session replay <ID> [--provider PROVIDER] [--root PATH]\n  membrick export graph <FORMAT> [PATH] [--output FILE] [--level LEVEL]\n  membrick export ontology [PATH] [--output FILE]\n\nProvider commands:\n  membrick install <provider> [PATH]\n  membrick serve <provider> [PATH]\n  membrick verify <provider> [PATH]\n  membrick uninstall <provider> [PATH]\n  membrick hook <provider> <event> [PATH]\n  membrick statusline <claude|codex> [PATH]\n\nProvider options: --provider-config, --provider-settings, --provider-skills-dir,\n--provider-hooks-dir, --provider-plugin-dir, --force-skill, --timeout.\nUninstall is supported for: claude, codex, agy. Providers: claude, codex, gemini, agy, muse, openclaw, hermes, roo-runtime."
 )]
 /// CLI arguments for the membrick binary.
 pub struct Args {
@@ -375,6 +375,9 @@ pub struct Args {
     pub agy_install: bool,
     #[arg(long, hide = true)]
     #[cfg(feature = "agy")]
+    pub agy_uninstall: bool,
+    #[arg(long, hide = true)]
+    #[cfg(feature = "agy")]
     pub agy_force_skill: bool,
     #[arg(long, hide = true)]
     #[cfg(feature = "agy")]
@@ -588,6 +591,7 @@ fn normalize_provider_command(args: impl IntoIterator<Item = String>) -> Vec<Str
         ("gemini-cli", "verify-mcp") => "--gemini-cli-verify-mcp",
         ("gemini-cli", "hook") => "--gemini-cli-hook",
         ("agy", "install") => "--agy-install",
+        ("agy", "uninstall") => "--agy-uninstall",
         ("agy", "serve") => "--agy-serve",
         ("agy", "verify-mcp") => "--agy-verify-mcp",
         ("agy", "hook") => "--agy-hook",
@@ -1036,6 +1040,13 @@ mod tests {
                         panic!("public command {args:?} failed to parse: {error}")
                     });
                 }
+            }
+            if provider == "agy" {
+                let args = ["uninstall", provider, "."];
+                let parsed = parse_public_args(&args).unwrap_or_else(|error| {
+                    panic!("public command {args:?} failed to parse: {error}")
+                });
+                assert!(parsed.agy_uninstall);
             }
 
             let events: &[&str] = match provider {

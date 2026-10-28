@@ -2,6 +2,36 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Exclusive lifetime ownership of a project's persistent stores.
+/// The operating system releases this lock when the process exits or crashes.
+pub(crate) struct ProjectOwnerLock {
+    _file: fs::File,
+}
+
+impl ProjectOwnerLock {
+    pub(crate) fn acquire(project_root: &Path) -> anyhow::Result<Self> {
+        use std::fs::OpenOptions;
+        let runtime = project_root.join(".membrick").join("runtime");
+        fs::create_dir_all(&runtime)?;
+        let path = runtime.join("workspace-owner.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+        file.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => anyhow::anyhow!(
+                "workspace owner lock is held for project {}",
+                project_root.display()
+            ),
+            fs::TryLockError::Error(error) => {
+                anyhow::anyhow!("cannot lock {}: {error}", path.display())
+            }
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// A temporary path beside `server.toml` that no other writer, in this process
 /// or another, uses at the same time.
 fn settings_temporary_path(state: &Path) -> anyhow::Result<PathBuf> {

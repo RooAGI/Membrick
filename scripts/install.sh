@@ -117,14 +117,33 @@ if [ "$EXPECTED" != "$ACTUAL" ]; then
 fi
 
 echo "Checksum verified."
-mkdir -p "$INSTALL_DIR"
 chmod 0755 "$BIN_TMP"
+if [ "$OS" = "Darwin" ]; then
+  # Rust's linker emits only a linker-signed ad-hoc signature. Recent macOS
+  # releases may SIGKILL that form at launch; replace it with a full ad-hoc
+  # signature after verifying the downloaded bytes.
+  codesign --force --sign - "$BIN_TMP"
+  codesign --verify --strict "$BIN_TMP"
+fi
+
+if VERSION="$("$BIN_TMP" --version 2>&1)"; then
+  if [ -z "$VERSION" ]; then
+    echo "Downloaded Membrick executable returned no version; refusing to install." >&2
+    exit 1
+  fi
+else
+  printf '%s\n' "$VERSION" >&2
+  echo "Downloaded Membrick executable failed its startup check; refusing to install." >&2
+  exit 1
+fi
+
+mkdir -p "$INSTALL_DIR"
 cp "$BIN_TMP" "${INSTALL_DIR}/membrick"
 BIN="${INSTALL_DIR}/membrick"
 touch "${INSTALL_DIR}/.membrick-managed"
 printf '%s\n' standalone > "${INSTALL_DIR}/membrick-install-method"
 
-echo "Installed $($BIN --version) to ${BIN}"
+echo "Installed ${VERSION} to ${BIN}"
 
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;

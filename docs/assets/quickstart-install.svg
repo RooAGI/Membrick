@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="405" viewBox="0 0 720 405" role="img" aria-labelledby="title desc">
+  <title id="title">Install Membrick</title>
+  <desc id="desc">A responsive terminal illustration showing installation commands for the CLI, npm, Python, and Rust.</desc>
+  <rect width="720" height="405" rx="18" fill="#102433"/>
+  <path d="M0 18A18 18 0 0 1 18 0h684a18 18 0 0 1 18 18v42H0Z" fill="#1a3547"/>
+  <circle cx="25" cy="27" r="6" fill="#f17882"/><circle cx="46" cy="27" r="6" fill="#e8b85c"/><circle cx="67" cy="27" r="6" fill="#67bd91"/>
+  <text x="360" y="33" text-anchor="middle" fill="#a9c1cf" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="600">membrick — installation</text>
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="16">
+    <text x="34" y="128" fill="#77c7f1">$</text><text x="57" y="128" fill="#edf5f8">curl -fsSL …/scripts/install.sh | sh</text><text x="565" y="128" fill="#73c995">✓ CLI</text>
+    <text x="34" y="190" fill="#77c7f1">$</text><text x="57" y="190" fill="#edf5f8">npm install membrick</text><text x="565" y="190" fill="#73c995">✓ npm</text>
+    <text x="34" y="252" fill="#77c7f1">$</text><text x="57" y="252" fill="#edf5f8">python -m pip install membrick</text><text x="565" y="252" fill="#73c995">✓ Python</text>
+    <text x="34" y="314" fill="#77c7f1">$</text><text x="57" y="314" fill="#edf5f8">cargo add membrick</text><text x="565" y="314" fill="#73c995">✓ Rust</text>
+  </g>
+</svg>

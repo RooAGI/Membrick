@@ -73,6 +73,11 @@ pub fn run_hook(kind: AgyHookKind, fallback_root: &Path) -> Result<()> {
     } else {
         &input.conversation_id
     };
+    crate::integrations::provider_lifecycle::note_activity(
+        &root,
+        RecordingProvider::Agy.as_str(),
+        Some(&input.conversation_id),
+    );
     // The MCP search dispatch inherits this session when the agent does not
     // pass session_id explicitly. Skip the "unknown" placeholder; the
     // conversation-state store opens without touching the index (a full
@@ -98,7 +103,13 @@ pub fn run_hook(kind: AgyHookKind, fallback_root: &Path) -> Result<()> {
     ) {
         tracing::warn!("Membrick AGY session recording failed open: {error:#}");
     }
-    let mut output = handle_hook(kind, &input, &root).unwrap_or_else(|error| {
+    let mut output = handle_hook_with_backend(
+        kind,
+        &input,
+        &root,
+        crate::integrations::mcp_tools::MemoryBackend::Resident,
+    )
+    .unwrap_or_else(|error| {
         tracing::warn!("Membrick AGY hook failed open: {error:#}");
         AgyHookOutput::default()
     });
@@ -127,7 +138,12 @@ pub fn run_hook(kind: AgyHookKind, fallback_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_hook(kind: AgyHookKind, input: &AgyHookInput, root: &Path) -> Result<AgyHookOutput> {
+fn handle_hook_with_backend(
+    kind: AgyHookKind,
+    input: &AgyHookInput,
+    root: &Path,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<AgyHookOutput> {
     if !membrick_enabled(RecordingProvider::Agy, root)? {
         return Ok(AgyHookOutput::default());
     }
@@ -151,7 +167,7 @@ fn handle_hook(kind: AgyHookKind, input: &AgyHookInput, root: &Path) -> Result<A
             ) {
                 tracing::warn!("AGY transcript usage capture failed open: {error:#}");
             }
-            let _ = capture_transcript(root, session_id, &path);
+            let _ = capture_transcript(root, session_id, &path, backend);
         }
         return Ok(AgyHookOutput::default());
     }
@@ -197,12 +213,13 @@ fn handle_hook(kind: AgyHookKind, input: &AgyHookInput, root: &Path) -> Result<A
     let started = std::time::Instant::now();
     let hook_session_id =
         (!input.conversation_id.is_empty()).then_some(input.conversation_id.as_str());
-    let results = crate::integrations::mcp_tools::search_hook_documents(
+    let results = crate::integrations::mcp_tools::search_hook_documents_with_backend(
         root,
         RecordingProvider::Agy.as_str(),
         hook_session_id,
         &query,
         5,
+        backend,
     );
     let _ = crate::telemetry::record_project_query(
         root,
@@ -347,7 +364,12 @@ fn is_retrieval_hook(kind: AgyHookKind) -> bool {
     matches!(kind, AgyHookKind::PreToolUse | AgyHookKind::PreInvocation)
 }
 
-fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> Result<()> {
+fn capture_transcript(
+    root: &Path,
+    session_id: &str,
+    transcript_path: &Path,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<()> {
     let content = std::fs::read_to_string(transcript_path)?;
     let project_id = crate::ids::stable_doc_id_from_source(&root.to_string_lossy())
         .trim_start_matches("doc:")
@@ -386,7 +408,23 @@ fn capture_transcript(root: &Path, session_id: &str, transcript_path: &Path) -> 
         key_phrases: Vec::new(),
         key_phrase_extraction_hash: String::new(),
     };
-    crate::integrations::mcp_tools::upsert_hook_documents(root, "agy", session_id, vec![context])
+    crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
+        root,
+        "agy",
+        session_id,
+        vec![context],
+        backend,
+    )
+}
+
+#[cfg(test)]
+fn handle_hook(kind: AgyHookKind, input: &AgyHookInput, root: &Path) -> Result<AgyHookOutput> {
+    handle_hook_with_backend(
+        kind,
+        input,
+        root,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
 }
 
 fn current_timestamp() -> String {
@@ -480,12 +518,16 @@ fn resolve_transcript_path_with_root(
 mod tests {
     use super::*;
 
+    /// Unique per call. The counter keeps parallel tests apart when the clock
+    /// returns the same value twice.
     fn test_nonce() -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        format!("{}-{timestamp}", std::process::id())
+        format!("{}-{timestamp}-{id}", std::process::id())
     }
 
     #[test]
@@ -504,10 +546,12 @@ mod tests {
         assert_eq!(events.len(), 4);
         assert_eq!(events[0]["type"], "USER_INPUT");
         assert!(events.iter().any(|event| event["type"] == "CHECKPOINT"));
-        assert!(events.iter().any(|event| event["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("default route")));
+        assert!(events.iter().any(|event| {
+            event["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("default route")
+        }));
     }
 
     #[test]

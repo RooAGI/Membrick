@@ -2,6 +2,8 @@
 
 mod english_smoke;
 mod integration;
+#[cfg(feature = "python")]
+mod mem0_adapter;
 mod query_path_consistency;
 mod scope_boost;
 mod spanish_smoke;

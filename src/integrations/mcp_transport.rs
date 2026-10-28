@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
 
+pub use membrick_extension_api::ToolDefinition;
+
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_COUNT: usize = 100;
@@ -31,14 +33,6 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    #[serde(rename = "inputSchema")]
-    pub input_schema: Value,
 }
 
 pub fn read_request(reader: &mut impl BufRead) -> Result<Option<(JsonRpcRequest, bool)>> {

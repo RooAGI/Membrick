@@ -41,7 +41,7 @@ Implemented deterministic checks cover formula scaling/decay, malformed and miss
 
 The current 0.25 maximum is an absolute score increment. Observed MCP results have scores in the hundreds, so it may have little ranking influence. This is a calibration hypothesis, not proof that every irrelevant result is caused by recency.
 
-See [temporal resolution](temporal-query-resolution.md), [semantic supersession](semantic-supersession.md), and [document enrichment](document-enrichment-plan.md) for related contracts.
+See [temporal resolution](temporal-query-resolution.md) and [semantic supersession](semantic-supersession.md) for related contracts.
 
 ## Intended query flow
 

@@ -1,23 +1,18 @@
-//! One-shot chunk-level recall over the unified store.
+//! Chunk-level recall over the resident's unified project view.
 //!
-//! The MCP servers answer the same question over a long-lived stdio session.
-//! A remote worker cannot hold that session open, so this module runs the same
-//! retrieval once, writes JSON to stdout and returns, which makes `membrick`
-//! usable as a plain subprocess.
+//! CLI and desktop-worker callers use the same resident search path as agent
+//! integrations, so they never open a competing writer beside the resident.
 
-use crate::adapters::{
-    apply_ignore_paths, build_project_graph, graph_to_source_documents, AdapterInput,
-};
 use crate::index::{DocRecord, SearchResult, SectionChunk};
+#[cfg(test)]
 use crate::integrations::mcp_index;
 use crate::memory_api::MemoryService;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
-use walkdir::WalkDir;
 
 /// The project index is shared with the MCP servers rather than kept under a
 /// name of its own. Both paths build it from the same graph with the same
@@ -29,22 +24,10 @@ use walkdir::WalkDir;
 /// by whole lines so the reported line range stays true to the text emitted.
 const MAX_CHUNK_TEXT_BYTES: usize = 1_600;
 
-/// Directories holding code the project did not write. A recall over a project
-/// root without ignores answers with a vendored README rather than anything the
-/// caller asked about, and a worker on another machine has no chance to notice.
-/// The configured list is added to this rather than replacing it, because no
-/// query for a project's own memory is improved by its dependencies.
-const ALWAYS_IGNORED: [&str; 7] = [
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "vendor",
-    "coverage",
-    ".git",
-];
-
 /// Options for a one-shot recall over a project root.
+///
+/// Workspace scanning limits and ignore paths are retained for callers, but
+/// indexing is resident-owned; recall reads the resident's published index.
 #[derive(Debug, Clone)]
 pub struct RecallOptions<'a> {
     pub root: &'a Path,
@@ -60,7 +43,7 @@ pub struct RecallOptions<'a> {
 /// The wire contract consumed by lint-service: a `results` array whose every
 /// element carries a numeric `score`. Fields beyond that pass through the
 /// dispatcher untouched.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallOutput {
     pub query: String,
     pub root: String,
@@ -68,7 +51,7 @@ pub struct RecallOutput {
     pub results: Vec<RecallHit>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallHit {
     pub score: f32,
     /// Documents keep their repo-relative path here; the dispatcher rewrites
@@ -107,14 +90,14 @@ pub struct RecallHit {
     pub relation_evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecallKind {
     Document,
     Memory,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallChunk {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,56 +114,29 @@ pub struct RecallChunk {
 /// Query the unified store, including project documents and recorded memories,
 /// and return chunk-level hits.
 pub fn recall(options: &RecallOptions<'_>) -> Result<RecallOutput> {
-    let started = Instant::now();
     let root = options
         .root
         .canonicalize()
         .with_context(|| format!("unable to resolve project root {}", options.root.display()))?;
 
-    let mut ignore_paths = options.ignore_paths.to_vec();
-    for fragment in ALWAYS_IGNORED {
-        if !ignore_paths.iter().any(|known| known == fragment) {
-            ignore_paths.push(fragment.to_string());
-        }
-    }
-    let input = AdapterInput {
-        root: &root,
-        max_bytes: options.max_bytes,
-        max_files: options.max_files,
-        max_depth: options.max_depth,
-        max_total_bytes: options.max_total_bytes,
-    };
-    let mut store = crate::memory_api::MemoryService::open_workspace(
-        &root,
-        options.memory_name,
-        &ignore_paths,
-        || {
-            let graph = build_project_graph(&input)?;
-            let graph = apply_ignore_paths(graph, &ignore_paths);
-            Ok(graph_to_source_documents(&graph))
-        },
-    )
-    .with_context(|| format!("unable to open the index for {}", root.display()))?;
-
-    let results = store
-        .query_plain(options.query, options.result_count)
-        .with_context(|| format!("query failed: {}", options.query))?;
-
-    let hits = results
-        .iter()
-        .filter_map(|result| {
-            store
-                .record_by_id(&result.doc_id)
-                .map(|record| hit_from(result, record, options.query))
-        })
-        .collect();
-
-    Ok(RecallOutput {
-        query: options.query.to_string(),
-        root: root.to_string_lossy().to_string(),
-        elapsed_ms: started.elapsed().as_millis(),
-        results: hits,
-    })
+    // Indexing limits and ignores are resident-owned. Keep the legacy options
+    // fields for callers while the resident remains the authoritative indexer.
+    let _ = options;
+    let client = crate::Memory::new(&root)
+        .map_err(|error| anyhow::anyhow!("unable to connect to project resident: {error}"))?;
+    let response = client
+        .call_workspace_tool(
+            &crate::agent::AgentOperationContext::new("codex"),
+            "recall_search",
+            serde_json::json!({
+                "query": options.query,
+                "result_count": options.result_count,
+                "source": "all",
+            }),
+            false,
+        )
+        .map_err(|error| anyhow::anyhow!("resident recall search failed: {error}"))?;
+    serde_json::from_value(response).context("resident returned an invalid recall response")
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,48 +155,6 @@ fn default_source() -> String {
     "documents".to_string()
 }
 
-/// Open each shared memory index where it already lives. All providers read
-/// and write one store per project (`.membrick/memory/`); the provider is
-/// attribution on the records, not the directory. These stores remain
-/// project-scoped; the desktop worker never creates a consolidated copy.
-fn open_memory_stores(root: &Path, _provider: &str) -> Result<Vec<MemoryService>> {
-    crate::memory_api::MemoryService::migrate_legacy_memories(root)?;
-    let mut stores = Vec::new();
-    for entry in WalkDir::new(root)
-        .max_depth(5)
-        .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                ".git" | "node_modules" | "target" | "dist" | "build" | "vendor"
-            )
-        })
-        .filter_map(|entry| entry.ok())
-    {
-        if !entry.file_type().is_dir()
-            || entry.file_name().to_string_lossy() != mcp_index::SHARED_MEMORY_DIR
-        {
-            continue;
-        }
-        // Only project memory roots count; an unrelated `memory/` directory
-        // elsewhere in the tree is not a Membrick store.
-        let is_membrick_memory = entry
-            .path()
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .is_some_and(|name| name == ".membrick");
-        if !is_membrick_memory {
-            continue;
-        }
-        stores.push(MemoryService::at_path(
-            entry.path(),
-            mcp_index::segmented_store_options(),
-        )?);
-    }
-    Ok(stores)
-}
-
 /// Long-lived project recall. The expensive persistent stores are opened once;
 /// each subsequent request only runs the in-memory query and response mapping.
 pub fn run_recall_server(
@@ -251,33 +165,19 @@ pub fn run_recall_server(
     max_depth: usize,
     max_total_bytes: usize,
 ) -> Result<()> {
-    // Documents are needed by the sidebar immediately. Provider memory stores
-    // are deliberately lazy: opening them here used to delay every first boot,
-    // even when the user only searched the configured folder's files.
-    let document_store = {
-        let input = AdapterInput {
-            root,
-            max_bytes,
-            max_files,
-            max_depth,
-            max_total_bytes,
-        };
-        let ignores = ignore_paths.to_vec();
-        crate::memory_api::MemoryService::open_persistent_workspace(
-            root,
-            "desktop-document-index",
-            "desktop-empty-memory",
-            &ignores,
-            || {
-                let graph = build_project_graph(&input)?;
-                let graph = apply_ignore_paths(graph, &ignores);
-                Ok(graph_to_source_documents(&graph))
-            },
-        )?
-    };
-    let mut document_store = document_store;
-    let mut memory_stores: HashMap<String, Option<Vec<MemoryService>>> =
-        HashMap::from([("claude".to_string(), None), ("codex".to_string(), None)]);
+    // The resident owns indexing configuration and project scanning limits.
+    let _ = (
+        ignore_paths,
+        max_bytes,
+        max_files,
+        max_depth,
+        max_total_bytes,
+    );
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("unable to resolve project root {}", root.display()))?;
+    let client = crate::Memory::new(&root)
+        .map_err(|error| anyhow::anyhow!("unable to connect to project resident: {error}"))?;
 
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -290,48 +190,66 @@ pub fn run_recall_server(
             continue;
         }
         let request: RecallServerRequest = serde_json::from_str(&line)?;
-        let source = match request.source.as_str() {
-            "claude" => "claude",
-            "codex" => "codex",
-            _ => "documents",
-        };
-        let started = Instant::now();
-        let mut hits = Vec::new();
-        if source == "documents" {
-            let results = document_store.query_plain(&request.query, request.result_count)?;
-            hits.extend(results.iter().filter_map(|result| {
-                document_store
-                    .record_by_id(&result.doc_id)
-                    .map(|record| hit_from(result, record, &request.query))
-            }));
-        } else {
-            let stores = memory_stores
-                .get_mut(source)
-                .context("recall source store is unavailable")?;
-            if stores.is_none() {
-                *stores = Some(open_memory_stores(root, source)?);
-            }
-            for store in stores.as_mut().unwrap() {
-                let results = store.query_plain(&request.query, request.result_count)?;
-                hits.extend(results.iter().filter_map(|result| {
-                    store
-                        .record_by_id(&result.doc_id)
-                        .map(|record| hit_from(result, record, &request.query))
-                }));
-            }
-        }
-        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
-        hits.truncate(request.result_count);
-        let response = RecallOutput {
-            query: request.query,
-            root: root.to_string_lossy().to_string(),
-            elapsed_ms: started.elapsed().as_millis(),
-            results: hits,
-        };
+        let response = client
+            .call_workspace_tool(
+                &crate::agent::AgentOperationContext::new("codex"),
+                "recall_search",
+                serde_json::json!({
+                    "query": request.query,
+                    "result_count": request.result_count,
+                    "source": request.source,
+                }),
+                false,
+            )
+            .map_err(|error| anyhow::anyhow!("resident recall search failed: {error}"))?;
+        let response: RecallOutput = serde_json::from_value(response)
+            .context("resident returned an invalid recall response")?;
         writeln!(output, "{}", serde_json::to_string(&response)?)?;
         output.flush()?;
     }
     Ok(())
+}
+
+/// Execute recall against the resident's read view. This path is called only
+/// by the resident's private generic workspace operation, never by an SDK
+/// process with a writable service.
+pub(crate) fn recall_from_service(
+    root: &str,
+    query: &str,
+    result_count: usize,
+    source: &str,
+    service: &MemoryService,
+) -> Result<RecallOutput> {
+    anyhow::ensure!(!query.trim().is_empty(), "query is required");
+    anyhow::ensure!(result_count > 0, "result_count must be positive");
+    anyhow::ensure!(
+        matches!(source, "all" | "documents" | "claude" | "codex"),
+        "source must be all, documents, claude, or codex"
+    );
+    let started = Instant::now();
+    let results = service.query_plain_cached(query, result_count.saturating_mul(4))?;
+    let mut hits = results
+        .iter()
+        .filter_map(|result| {
+            let record = service.record_by_id(&result.doc_id)?;
+            let is_memory = record.filters.contains_key("session_id")
+                || record.filters.contains_key("document_type");
+            if (source == "documents" && is_memory)
+                || (matches!(source, "claude" | "codex") && !is_memory)
+            {
+                return None;
+            }
+            Some(hit_from(result, record, query))
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| right.score.total_cmp(&left.score));
+    hits.truncate(result_count);
+    Ok(RecallOutput {
+        query: query.to_string(),
+        root: root.to_string(),
+        elapsed_ms: started.elapsed().as_millis(),
+        results: hits,
+    })
 }
 
 fn hit_from(result: &SearchResult, record: &DocRecord, query: &str) -> RecallHit {
@@ -859,18 +777,16 @@ mod tests {
         memory.refresh().unwrap();
         drop(memory);
 
-        let options = RecallOptions {
-            root: &root,
-            query: "provider-aware recall",
-            result_count: 10,
-            ignore_paths: &[],
-            max_bytes: 5_000_000,
-            max_files: 50_000,
-            max_depth: 20,
-            max_total_bytes: 100_000_000,
-            memory_name: mcp_index::SHARED_MEMORY_DIR,
-        };
-        let output = recall(&options).unwrap();
+        let memory =
+            MemoryService::at_path(&memory_root, mcp_index::segmented_store_options()).unwrap();
+        let output = recall_from_service(
+            &root.to_string_lossy(),
+            "provider-aware recall",
+            10,
+            "all",
+            &memory,
+        )
+        .unwrap();
 
         // The query path sees memories across providers: segment routing
         // (`query_top_n: 3`) picks the best segments, but the hits must span

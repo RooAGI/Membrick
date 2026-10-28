@@ -6,7 +6,8 @@ server to stay running.
 
 If you also want Hermes to recall memories automatically before each model
 call and save turns in the background, follow the optional setup at the end.
-That feature needs a small Membrick server to keep running on your computer.
+That feature needs Membrick's HTTP server to keep running. It uses the HTTP API
+separately from Hermes' MCP connection.
 
 Membrick works alongside Hermes' own notes and memory. It does not replace
 Hermes' existing memory provider.
@@ -77,18 +78,24 @@ hermes plugins enable membrick
 
 If your repository is elsewhere, replace the path with its location.
 
-### 3. Start the local Membrick server
+### 3. Start Membrick's HTTP server
 
-In a separate terminal, run:
+For a local server, follow the [Docker setup](docker.md) from a Membrick
+repository checkout. It starts the API at `http://127.0.0.1:8080` and creates
+a token in `secrets/server-token`.
 
-```bash
-membrick serve
+Copy that token into `server_token` in `$HERMES_HOME/membrick.json` (or
+`~/.hermes/membrick.json`). If the API server is stopped, Hermes continues to
+work, but automatic recall and capture pause until it is available again.
+
+For example, the file should include:
+
+```json
+{
+  "server_url": "http://127.0.0.1:8080",
+  "server_token": "<contents of secrets/server-token>"
+}
 ```
-
-Keep this terminal open while using Hermes with automatic recall and capture.
-The plugin connects to the local server at `http://127.0.0.1:8080`. If the
-server is stopped, Hermes continues to work, but automatic recall and capture
-pause until the server is available again.
 
 ### 4. Try it
 
@@ -109,6 +116,6 @@ for the same project can use those memories too.
   in `~/.hermes/config.yaml` and restart Hermes. The skill gives Hermes
   instructions; the MCP connection provides the callable tools.
 - If automatic recall or capture is missing, confirm the plugin is enabled
-  and `membrick serve` is still running.
+  and the configured HTTP server is reachable.
 
 For setup with another agent, see [Connect your AI agent](connect-agent.md).

@@ -41,6 +41,8 @@ jobs:
       - name: Build native binding
         working-directory: bindings/node
         run: npx napi build --platform --release --target x86_64-unknown-linux-gnu
+      - name: Build resident CLI for the SDK lifecycle test
+        run: cargo build --bin membrick --features agent-integrations
       - name: Run Node tests
         working-directory: bindings/node
         run: npm test

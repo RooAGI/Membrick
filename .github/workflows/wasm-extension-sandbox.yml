@@ -1,0 +1,30 @@
+name: Wasm extension sandbox
+
+on:
+  pull_request:
+    paths:
+      - "crates/membrick-wasm-extension-runtime/**"
+      - ".github/workflows/wasm-extension-sandbox.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/membrick-wasm-extension-runtime/**"
+      - ".github/workflows/wasm-extension-sandbox.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-bubblewrap:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+      - name: Run Linux sandbox integration tests
+        run: cargo test --manifest-path crates/membrick-wasm-extension-runtime/Cargo.toml --locked --test linux_bubblewrap
+      - name: Run runtime test suite
+        run: cargo test --manifest-path crates/membrick-wasm-extension-runtime/Cargo.toml --locked

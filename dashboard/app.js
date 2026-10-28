@@ -1,7 +1,8 @@
 import { renderEventDetail, renderToolCall, toolDetail, toolGroup } from './event-detail.js';
 import { renderCaptureProgressHtml } from './capture-progress.mjs';
 import { renderSearchEvaluationHtml } from './search-evaluation.mjs';
-import { escapeHtml as esc, mergeBoardPosts, parseBoardLinkTarget } from './board-ui.mjs';
+import { flowEventSummary, flowPostLabel, flowStageSteps, flowTrackedWork, mergeBoardPosts as mergeFlowBoardPosts, parseBoardLinkTarget as parseFlowLinkTarget, rollupTasks as rollupFlowBoardTasks } from './board-ui.mjs';
+import { attributeSubagentUsage, escapeHtml as esc, inferSubagentEnds, mergeBoardPosts, pairSubagentRuns, parseBoardLinkTarget, SUBAGENT_IDLE_MS, rollupTasks, tasksByRecentActivity } from './board-ui.mjs';
 
 const VIEWS = {
   overview: { title: 'Overview', sub: 'How the memory index is serving agents right now.' },
@@ -14,9 +15,18 @@ const VIEWS = {
 
 const state = { view: 'overview', status: null, series: [], provider: null, tool: null, hover: null, reviewOffset: 0, reviewTotal: 0, boards: [], selectedBoardId: null, boardSnapshot: null, boardTrail: [], boardGeneration: 0, boardRenderSeq: 0, boardTick: 0, linkedBoards: new Map(), flows: [], selectedFlowId: null, flowSnapshot: null };
 
+// Browser storage can be blocked or throw (private windows, disabled site
+// data). Every read and write goes through these so the page still works.
+function storageGet(key) {
+  try { return window.localStorage.getItem(key); } catch { return null; }
+}
+function storageSet(key, value) {
+  try { window.localStorage.setItem(key, value); } catch { /* storage unavailable */ }
+}
+
 const tokenInput = document.querySelector('#token');
-tokenInput.value = localStorage.getItem('membrick-dashboard-token') || '';
-tokenInput.addEventListener('change', () => localStorage.setItem('membrick-dashboard-token', tokenInput.value));
+tokenInput.value = storageGet('membrick-dashboard-token') || '';
+tokenInput.addEventListener('change', () => storageSet('membrick-dashboard-token', tokenInput.value));
 document.querySelector('#refresh').addEventListener('click', refresh);
 
 async function api(path) {
@@ -32,6 +42,55 @@ const pct = value => `${(Number(value || 0) * 100).toFixed(1)}%`;
 const seconds = ms => ms ? `${(ms / 1000).toFixed(1)}s` : '—';
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const stillness = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+// The Boards and Flows list panels collapse to a narrow rail. The choice is a
+// class on the static layout element, so detail re-renders never reset it.
+// CSS applies the rail only while the list sits beside the detail.
+document.querySelectorAll('[data-rail-toggle]').forEach(button => {
+  const page = button.dataset.railToggle;
+  const layout = button.closest('.boards-layout, .flows-layout');
+  const noun = button.dataset.railNoun || 'list';
+  const key = `membrick-dashboard-rail-${page}`;
+  const apply = collapsed => {
+    layout.classList.toggle('is-rail', collapsed);
+    button.setAttribute('aria-expanded', String(!collapsed));
+    button.setAttribute('aria-label', collapsed ? `Expand ${noun}` : `Collapse ${noun}`);
+    button.title = collapsed ? `Expand ${noun}` : `Collapse ${noun}`;
+  };
+  apply(storageGet(key) === 'collapsed');
+  button.addEventListener('click', () => {
+    const collapsed = !layout.classList.contains('is-rail');
+    apply(collapsed);
+    storageSet(key, collapsed ? 'collapsed' : 'expanded');
+  });
+});
+
+// Work on templated boards shows as Columns (the default) or a List. Phone
+// widths always use the List.
+const WORK_MODE_KEY = 'membrick-dashboard-work-view';
+const phoneWidth = window.matchMedia('(max-width: 699.98px)');
+let workMode = storageGet(WORK_MODE_KEY) === 'list' ? 'list' : 'columns';
+const effectiveWorkMode = () => phoneWidth.matches ? 'list' : workMode;
+function setWorkMode(mode) {
+  if (mode !== 'list' && mode !== 'columns') return Promise.resolve();
+  workMode = mode;
+  storageSet(WORK_MODE_KEY, mode);
+  return state.boardSnapshot ? renderBoardDetail(state.boardSnapshot) : Promise.resolve();
+}
+
+// Sequences of the posts that belong to a task in the main Work panel.
+let boardTaskPosts = new Set();
+// In Columns, the task whose details show under the columns, by Work panel
+// scope. It outlives the DOM, so live re-renders keep it open and selected.
+const workOpenTask = new Map();
+let workOpenBoardId = null;
+// The task view each Work panel was last rendered from, by scope.
+const workViews = new Map();
+// Open or closed state of each disclosure on the selected board, by detail ID.
+const boardDetailState = new Map();
+phoneWidth.addEventListener('change', () => {
+  if (state.boardSnapshot && workMode === 'columns') renderBoardDetail(state.boardSnapshot);
+});
 
 // Animate a figure between readings. `render` receives the interpolated numbers,
 // so composite readouts (p50 / p95) move as one.
@@ -103,7 +162,15 @@ function showView(route, loadData = true) {
   if (view === 'overview') drawSparks();
   if (view === 'reviews') loadSearchReviews(state.reviewOffset);
   if (loadData && view === 'boards') loadBoards(itemId || state.selectedBoardId);
-  if (loadData && view === 'flows') loadFlows();
+  if (loadData && view === 'flows') loadFlows(itemId || state.selectedFlowId);
+  // `providers/<name>` selects a provider by its display name, ignoring case.
+  if (view === 'providers' && itemId) {
+    const items = state.status?.integrations || [];
+    const match = items.find(item => item.provider.toLowerCase() === itemId.toLowerCase());
+    state.provider = match ? match.provider : itemId;
+    state.tool = null;
+    if (items.length) renderProviders(items);
+  }
 }
 
 document.querySelectorAll('.navitem').forEach(item => item.addEventListener('click', () => showView(item.dataset.view)));
@@ -219,30 +286,72 @@ async function refresh() {
 
 /* ── agent-authored boards ────────────────────────────────────── */
 
+const boardCreatedAt = board => Date.parse(board?.created_at || '') || 0;
+
+// Newest boards first, so the default selection is the most recent work.
 function sortBoards(boards) {
-  return (boards || []).slice().sort((a, b) => String(a.title || a.key).localeCompare(String(b.title || b.key)));
+  return (boards || []).slice().sort((a, b) => boardCreatedAt(b) - boardCreatedAt(a)
+    || String(a.title || a.key).localeCompare(String(b.title || b.key)));
+}
+
+// Boards that share a title are one group: the newest copy is shown and the
+// older copies sit under an "Earlier" toggle. Groups keep the newest-first order.
+function boardTitleGroups(boards) {
+  const groups = new Map();
+  for (const board of boards) {
+    const name = String(board.title || board.key || '').trim().toLowerCase();
+    if (!groups.has(name)) groups.set(name, { name, boards: [] });
+    groups.get(name).boards.push(board);
+  }
+  return [...groups.values()];
+}
+
+const openBoardGroups = new Set();
+
+function boardChoiceHtml(board, earlier = false) {
+  const created = earlier && board.created_at ? `<small class="board-choice__key">Created ${esc(absoluteTime(board.created_at))}</small>` : `<small class="board-choice__key">${esc(board.key)}</small>`;
+  return `<button class="board-choice${earlier ? ' board-choice--earlier' : ''}" type="button" data-board-id="${esc(board.board_id)}">
+        <span class="board-choice__top"><strong>${esc(board.title || board.key)}</strong>${board.type && board.type !== 'general' ? `<span class="board-choice__type">${esc(board.type)}</span>` : ''}${board.board_template ? '<span class="board-choice__type board-choice__type--template">template</span>' : ''}</span>
+        ${created}
+        <span class="board-choice__meta" data-board-meta="${esc(board.board_id)}">${esc(boardMetaText(board.board_id))}</span>
+      </button>`;
+}
+
+// An older copy that is selected (for example through a link) is revealed.
+function revealSelectedBoardChoice() {
+  document.querySelectorAll('#boards-list .board-choice').forEach(button => button.classList.toggle('is-selected', button.dataset.boardId === state.selectedBoardId));
+  const selected = document.querySelector('#boards-list .board-choice.is-selected');
+  const earlier = selected?.closest('details[data-board-group]');
+  if (earlier && !earlier.open) earlier.open = true;
 }
 
 // The list is redrawn only when its visible content changes, so polling does
 // not disturb the selection or the sidebar scroll.
 function renderBoardList() {
   const list = document.querySelector('#boards-list');
-  const signature = JSON.stringify(state.boards.map(board => [board.board_id, board.title, board.key, board.type]));
-  document.querySelector('#boards-count').textContent = `${fmt(state.boards.length)} boards`;
+  const signature = JSON.stringify(state.boards.map(board => [board.board_id, board.title, board.key, board.type, board.created_at, Boolean(board.board_template)]));
+  const groups = boardTitleGroups(state.boards);
+  document.querySelector('#boards-count').textContent = `${fmt(groups.length)} boards${groups.length !== state.boards.length ? ` · ${fmt(state.boards.length - groups.length)} earlier` : ''}`;
   if (list.dataset.signature !== signature) {
     list.dataset.signature = signature;
-    list.innerHTML = state.boards.length ? state.boards.map(board => `
-      <button class="board-choice" type="button" data-board-id="${esc(board.board_id)}">
-        <span class="board-choice__top"><strong>${esc(board.title || board.key)}</strong>${board.type && board.type !== 'general' ? `<span class="board-choice__type">${esc(board.type)}</span>` : ''}${board.board_template ? '<span class="board-choice__type board-choice__type--template">template</span>' : ''}</span>
-        <small class="board-choice__key">${esc(board.key)}</small>
-        <span class="board-choice__meta" data-board-meta="${esc(board.board_id)}">${esc(boardMetaText(board.board_id))}</span>
-      </button>`).join('') : '<div class="empty-state">No boards yet. Agents can open a project board and link planning, task, and milestone boards.</div>';
+    list.innerHTML = state.boards.length ? groups.map(group => {
+      const [latest, ...older] = group.boards;
+      if (!older.length) return boardChoiceHtml(latest);
+      return `<div class="board-choice-group">${boardChoiceHtml(latest)}
+        <details class="board-earlier" data-board-group="${esc(group.name)}"${openBoardGroups.has(group.name) ? ' open' : ''}>
+          <summary>Earlier · ${fmt(older.length)}</summary>
+          ${older.map(board => boardChoiceHtml(board, true)).join('')}
+        </details></div>`;
+    }).join('') : '<div class="empty-state">No boards yet. Agents can open a project board and link planning, task, and milestone boards.</div>';
     list.querySelectorAll('[data-board-id]').forEach(button => button.addEventListener('click', () => {
       state.boardTrail = [];
       selectBoard(button.dataset.boardId);
     }));
+    list.querySelectorAll('details[data-board-group]').forEach(item => item.addEventListener('toggle', () => {
+      if (item.open) openBoardGroups.add(item.dataset.boardGroup); else openBoardGroups.delete(item.dataset.boardGroup);
+    }));
   }
-  list.querySelectorAll('.board-choice').forEach(button => button.classList.toggle('is-selected', button.dataset.boardId === state.selectedBoardId));
+  revealSelectedBoardChoice();
   // Summaries load a few boards at a time and refresh at most once a minute.
   const queue = state.boards.slice(0, 40).map(board => board.board_id);
   const worker = async () => { while (queue.length) await loadBoardMeta(queue.shift()); };
@@ -277,7 +386,7 @@ async function selectBoard(boardId, postSequence = null) {
   state.selectedBoardId = boardId;
   if (state.view === 'boards') history.replaceState(null, '', `#boards/${encodeURIComponent(boardId)}`);
   const generation = ++state.boardGeneration;
-  document.querySelectorAll('.board-choice').forEach(button => button.classList.toggle('is-selected', button.dataset.boardId === boardId));
+  revealSelectedBoardChoice();
   document.querySelector('#board-detail').innerHTML = '<div class="empty-state">Loading board…</div>';
   state.boardSnapshot = null;
   await loadBoardPosts(boardId, null, false);
@@ -285,6 +394,7 @@ async function selectBoard(boardId, postSequence = null) {
   if (snapshot?.latestSequence > lastPostSequence(snapshot.posts)) {
     if (await loadLatestBoardPosts(boardId)) await renderBoardDetail(snapshot);
   }
+  await loadAllBoardPosts(boardId, generation);
   // Template sections summarize posts from the first page onward, so a linked
   // post is reached by paging forward rather than loading a partial window.
   // The API pages in sequence order, so do not impose an arbitrary page cap.
@@ -298,7 +408,7 @@ async function selectBoard(boardId, postSequence = null) {
   }
   if (postSequence != null && state.boardGeneration === generation) {
     await renderBoardDetail(state.boardSnapshot);
-    if (!focusBoardPost(postSequence)) {
+    if (!await focusBoardPost(postSequence)) {
       const notice = document.createElement('p');
       notice.className = 'board-link-error';
       notice.textContent = `Post ${postSequence} was not found on this board.`;
@@ -307,15 +417,96 @@ async function selectBoard(boardId, postSequence = null) {
   }
 }
 
-function focusBoardPost(sequence) {
+// A post that belongs to a task opens in the current Work mode: under the
+// columns in Columns, or in its row in the List. The mode never changes.
+// Resolves to whether the post was found.
+async function focusBoardPost(sequence) {
+  if (boardTaskPosts.has(sequence) && document.querySelector('#board-detail .board-work--columns[data-work-scope="main"]')) {
+    const root = workViews.get('main')?.rollup.rootsOf.get(sequence)?.[0];
+    if (root != null) openWorkTask('main', root, { reveal: false });
+  }
   const post = document.querySelector(`#post-${sequence}`);
   if (!post) return false;
-  post.closest('details')?.setAttribute('open', '');
+  // Open every enclosing disclosure (for example a settled group, then the task row).
+  if (post.tagName === 'DETAILS') post.open = true;
+  for (let parent = post.parentElement?.closest('details'); parent; parent = parent.parentElement?.closest('details')) parent.open = true;
+  expandWorkGroupOf(post);
   post.scrollIntoView({ behavior: stillness.matches ? 'auto' : 'smooth', block: 'center' });
   post.classList.add('is-focused');
   setTimeout(() => post.classList.remove('is-focused'), 2400);
   return true;
 }
+
+// Expand a collapsed work group that holds the element, and remember it.
+function expandWorkGroupOf(element) {
+  const group = element.closest('[data-work-group].is-collapsed');
+  if (!group) return;
+  const boardId = document.querySelector('#board-detail')?.dataset.boardId;
+  if (boardId) setWorkGroupCollapsed(boardId, group.dataset.workGroup, false);
+  applyWorkGroupCollapsed(group, false);
+}
+
+// In Columns, a task's details open in the area under the columns of the same
+// Work panel. The mode and the page stay where they are. With `reveal`, the
+// page scrolls only when the area's head is below the visible part, and then
+// only far enough to show it. With `keyboard`, focus moves to the heading.
+function openWorkTask(scope, sequence, { reveal = true, keyboard = false } = {}) {
+  const panel = document.querySelector(`#board-detail .board-work--columns[data-work-scope="${CSS.escape(scope)}"]`);
+  const area = panel?.querySelector(':scope > [data-task-detail-area]');
+  const view = workViews.get(scope);
+  const task = view?.rollup.tasks.find(item => item.sequence === sequence);
+  if (!area || !task) return false;
+  workOpenTask.set(scope, sequence);
+  area.innerHTML = taskDetailHtml(task, view, scope);
+  area.hidden = false;
+  bindBoardLinkButtons(area);
+  bindPostFolds(area);
+  markSelectedCard(panel, sequence);
+  if (reveal) revealWorkDetail(area);
+  if (keyboard) area.querySelector('[data-task-detail-title]')?.focus({ preventScroll: true });
+  return true;
+}
+
+function closeWorkTask(scope, { restoreFocus = false } = {}) {
+  const sequence = workOpenTask.get(scope);
+  workOpenTask.delete(scope);
+  const panel = document.querySelector(`#board-detail .board-work--columns[data-work-scope="${CSS.escape(scope)}"]`);
+  const area = panel?.querySelector(':scope > [data-task-detail-area]');
+  if (!area) return;
+  area.hidden = true;
+  area.innerHTML = '';
+  markSelectedCard(panel, null);
+  if (restoreFocus && sequence != null) panel.querySelector(`[data-task-open="${CSS.escape(String(sequence))}"]`)?.focus({ preventScroll: true });
+}
+
+function markSelectedCard(panel, sequence) {
+  panel.querySelectorAll('[data-task-open]').forEach(card => {
+    const selected = Number(card.dataset.taskOpen) === sequence;
+    card.classList.toggle('is-selected', selected);
+    card.setAttribute('aria-expanded', String(selected));
+  });
+}
+
+// Scroll the least amount that brings the detail head into view. Nothing
+// moves when it is already visible.
+// The page may scroll in .viewport or in the document, so the browser picks
+// the scroller: block "nearest" moves only as far as the head needs.
+function revealWorkDetail(area) {
+  const head = area.querySelector('.board-task-detail__head') || area;
+  const rect = head.getBoundingClientRect();
+  const viewport = document.querySelector('.viewport');
+  const bottom = Math.min(window.innerHeight, viewport && viewport.scrollHeight > viewport.clientHeight ? viewport.getBoundingClientRect().bottom : Infinity);
+  if (rect.bottom <= bottom && rect.top >= 0) return;
+  head.scrollIntoView({ block: 'nearest', behavior: stillness.matches ? 'auto' : 'smooth' });
+}
+
+// Escape closes an open task detail: the one holding focus, else every one.
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape' || event.defaultPrevented || !workOpenTask.size || state.view !== 'boards' || !palette.hidden) return;
+  const focused = document.activeElement?.closest?.('.board-work--columns[data-work-scope]');
+  const scopes = focused && workOpenTask.has(focused.dataset.workScope) ? [focused.dataset.workScope] : [...workOpenTask.keys()];
+  for (const scope of scopes) closeWorkTask(scope, { restoreFocus: Boolean(focused) });
+});
 
 async function loadBoardPosts(boardId, afterSequence, append, render = true) {
   const generation = state.boardGeneration;
@@ -355,6 +546,40 @@ async function loadLatestBoardPosts(boardId) {
     return true;
   } catch {
     return false;
+  }
+}
+
+// Page forward through the whole board (after_sequence while has_more) so the
+// task rollup, tiles and Work counts cover every post. Paging holds the board
+// refresh lock, so a live refresh never appends the same posts at the same
+// time; refreshes that arrive meanwhile run as soon as paging ends, and from
+// then on new posts append incrementally through the usual live path.
+async function loadAllBoardPosts(boardId, generation) {
+  const current = () => state.selectedBoardId === boardId && state.boardGeneration === generation;
+  while (boardsRefreshing) {
+    if (!current()) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  if (!current() || !state.boardSnapshot?.hasMore) return;
+  boardsRefreshing = true;
+  try {
+    for (;;) {
+      const snapshot = state.boardSnapshot;
+      if (!current() || !snapshot?.hasMore) break;
+      const known = lastPostSequence(snapshot.posts);
+      if (!Number.isSafeInteger(snapshot.nextAfter) || snapshot.nextAfter < known) break;
+      snapshot.pagingAll = true;
+      await renderBoardDetail(snapshot);
+      if (!await loadBoardPosts(boardId, snapshot.nextAfter, true, false)) break;
+      if (lastPostSequence(state.boardSnapshot?.posts || []) <= known) break;
+    }
+  } finally {
+    if (state.boardSnapshot) state.boardSnapshot.pagingAll = false;
+    boardsRefreshing = false;
+    if (current() && state.boardSnapshot) await renderBoardDetail(state.boardSnapshot);
+    const pending = boardsRefreshPending;
+    boardsRefreshPending = null;
+    if (pending) refreshBoards(pending);
   }
 }
 
@@ -504,9 +729,8 @@ function bindBoardLiveMarker(snapshot) {
   });
 }
 
-/* Change stream: the server sends one notice per board or Flow write. Each
-   notice names what changed; the page refetches only that through the read
-   APIs. fetch() is used instead of EventSource so the bearer token is sent. */
+/* Extension change stream: notifications stay opaque to the server. The page
+   uses fetch() instead of EventSource so it can send the bearer token. */
 
 const liveStream = { connected: false, controller: null, retryMs: 1000, timer: null, queue: [], flushTimer: null };
 
@@ -538,7 +762,7 @@ async function startLiveStream() {
   liveStream.controller = controller;
   const token = tokenInput.value.trim().replace(/^Bearer\s+/i, '');
   try {
-    const response = await fetch('/api/boards/events', {
+    const response = await fetch('/api/extensions/events', {
       cache: 'no-store',
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       signal: controller.signal,
@@ -628,16 +852,26 @@ function sortFlows(flows) {
 // Redrawn only when its visible content changes, like the board list.
 function renderFlowList() {
   const list = document.querySelector('#flows-list');
-  const signature = JSON.stringify(state.flows.map(({ run = {} }) => [run.flow_id, run.state, run.stage, run.goal, run.template_version, flowTemplateName(run)]));
+  const cards = state.flows.map(({ run = {} }) => {
+    const work = flowWorkFor(run);
+    const boardError = work ? null : flowBoardCache.get(run.board_id)?.error || null;
+    return { run, stage: flowStageName(run, run.stage) || 'No stage', done: work ? work.settledCount : null, total: work ? work.total : null, boardError };
+  });
+  const signature = JSON.stringify(cards.map(({ run, stage, done, total, boardError }) => [run.flow_id, run.state, stage, run.goal, run.template_version, flowTemplateName(run), done, total, boardError]));
   document.querySelector('#flows-count').textContent = `${fmt(state.flows.length)} flows`;
   if (list.dataset.signature !== signature) {
     list.dataset.signature = signature;
-    list.innerHTML = state.flows.length ? state.flows.map(snapshot => {
-      const run = snapshot.run || {};
-      return `<button class="flow-choice" type="button" data-flow-id="${esc(run.flow_id || '')}">
-        <span class="flow-choice__meta"><span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span><small>${esc(run.stage || 'No stage')}</small></span>
-        <strong>${esc(run.goal || 'Untitled Flow')}</strong>
-        <small>${esc(flowTemplateName(run))} · v${esc(run.template_version || '—')}</small>
+    list.innerHTML = state.flows.length ? cards.map(({ run, stage, done, total, boardError }) => {
+      const share = total ? Math.round((done / total) * 100) : 0;
+      const progress = total == null
+        ? `<span class="flowv-card__progress"><small>${boardError ? 'Board unavailable' : 'Loading tasks…'}</small></span>`
+        : total
+          ? `<span class="flowv-card__progress" title="${esc(`${done} of ${total} tracked tasks closed`)}"><span class="flowv-bar" role="img" aria-label="${esc(`${done} of ${total} tracked tasks closed`)}"><i style="width:${share}%"></i></span><small>${fmt(done)}/${fmt(total)} closed</small></span>`
+          : '<span class="flowv-card__progress"><small>No tracked tasks</small></span>';
+      return `<button class="flow-choice flowv-card" type="button" data-flow-id="${esc(run.flow_id || '')}">
+        <span class="flow-choice__meta"><span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span><small>${esc(stage)}</small></span>
+        <strong class="flowv-clamp" title="${esc(run.goal || '')}">${esc(run.goal || 'Untitled Flow')}</strong>
+        ${progress}
       </button>`;
     }).join('') : '<div class="empty-state">No Flows in this workspace yet.</div>';
     list.querySelectorAll('[data-flow-id]').forEach(button => button.addEventListener('click', () => selectFlow(button.dataset.flowId)));
@@ -663,13 +897,16 @@ async function refreshFlows() {
     const result = await api('/api/flows');
     state.flows = sortFlows(result.flows);
     renderFlowList();
+    // Board posts carry task status, so a new post on a flow's board can
+    // change the view even when the flow itself did not change.
+    const boardsChanged = await refreshFlowBoards();
+    renderFlowList();
     const flowId = state.selectedFlowId;
     if (!flowId || !state.flows.some(snapshot => snapshot.run?.flow_id === flowId)) return;
     const detail = await api(`/api/flows/${encodeURIComponent(flowId)}`);
     if (state.selectedFlowId !== flowId || state.view !== 'flows') return;
-    const board = await loadFlowBoardPosts(detail.flow?.board_id);
-    const next = { run: detail.flow, events: detail.events || [], posts: board.posts, postError: board.error };
-    if (JSON.stringify(next) === JSON.stringify(state.flowSnapshot)) return;
+    const next = { run: detail.flow, events: detail.events || [] };
+    if (!boardsChanged.has(next.run?.board_id) && JSON.stringify(next) === JSON.stringify(state.flowSnapshot)) return;
     state.flowSnapshot = next;
     const viewport = document.querySelector('.viewport');
     const scrollTop = viewport.scrollTop;
@@ -689,6 +926,7 @@ async function loadFlows(preferredId = state.selectedFlowId) {
     state.flows = sortFlows(result.flows);
     state.selectedFlowId = preferredId;
     renderFlowList();
+    refreshFlowBoards().then(() => renderFlowList());
     const next = state.flows.some(snapshot => snapshot.run?.flow_id === preferredId)
       ? preferredId
       : state.flows[0]?.run?.flow_id;
@@ -706,38 +944,147 @@ async function loadFlows(preferredId = state.selectedFlowId) {
 
 async function selectFlow(flowId) {
   state.selectedFlowId = flowId;
+  if (state.view === 'flows') history.replaceState(null, '', `#flows/${encodeURIComponent(flowId)}`);
   document.querySelectorAll('.flow-choice').forEach(button => button.classList.toggle('is-selected', button.dataset.flowId === flowId));
   document.querySelector('#flow-detail').innerHTML = '<div class="empty-state">Loading Flow history…</div>';
   try {
     const result = await api(`/api/flows/${encodeURIComponent(flowId)}`);
     if (state.selectedFlowId !== flowId) return;
-    const board = await loadFlowBoardPosts(result.flow?.board_id);
-    if (state.selectedFlowId !== flowId) return;
-    state.flowSnapshot = { run: result.flow, events: result.events || [], posts: board.posts, postError: board.error };
+    state.flowSnapshot = { run: result.flow, events: result.events || [] };
     renderFlowDetail(state.flowSnapshot);
+    const boardId = state.flowSnapshot.run?.board_id;
+    if (boardId && !flowBoardCache.get(boardId)?.loaded) {
+      await loadFlowBoard(boardId);
+      if (state.selectedFlowId === flowId && state.view === 'flows') {
+        renderFlowDetail(state.flowSnapshot);
+        renderFlowList();
+      }
+    }
   } catch (error) {
     if (state.selectedFlowId === flowId) document.querySelector('#flow-detail').innerHTML = `<div class="empty-state">Could not load Flow: ${esc(error.message)}</div>`;
   }
 }
 
-async function loadFlowBoardPosts(boardId) {
-  if (!boardId) return { posts: [], error: 'This Flow has no board linked.' };
-  try {
-    const board = await api(`/api/boards/${encodeURIComponent(boardId)}?latest=true&limit=100`);
-    return { posts: board.posts || [], error: null };
-  } catch (error) {
-    return { posts: [], error: error.message };
-  }
+function flowTaskEntries(tasks) {
+  if (Array.isArray(tasks)) return tasks;
+  if (tasks && typeof tasks === 'object') return Object.entries(tasks).map(([taskId, task]) => ({ task_id: taskId, ...task }));
+  return [];
 }
 
-function flowDataRows(data) {
-  if (data == null || typeof data !== 'object' || Array.isArray(data)) return `<p>${esc(data == null ? '' : JSON.stringify(data))}</p>`;
-  const entries = Object.entries(data).filter(([key]) => !['coordinator_fence'].includes(key));
-  if (!entries.length) return '<span class="muted">No additional event data</span>';
-  return `<dl>${entries.map(([key, value]) => `<div><dt>${esc(key.replaceAll('_', ' '))}</dt><dd>${esc(Array.isArray(value) ? value.join(', ') : typeof value === 'string' ? value : JSON.stringify(value))}</dd></div>`).join('')}</dl>`;
+/* Flow boards. Task status lives in the posts of a flow's board, so each
+   flow board is read once in pages of 100, then caught up with after_sequence,
+   and rolled up with rollupTasks. One cache entry per board. */
+const flowBoardCache = new Map();
+const flowBoardLoads = new Map();
+
+function flowGroupComponent(board) {
+  const components = board?.board_template?.snapshot?.presentation?.components;
+  return Array.isArray(components) ? components.find(component => component?.kind === 'post_groups') || {} : {};
+}
+
+// Resolves to true when new posts arrived.
+function loadFlowBoard(boardId) {
+  if (!boardId) return Promise.resolve(false);
+  if (flowBoardLoads.has(boardId)) return flowBoardLoads.get(boardId);
+  const load = (async () => {
+    const entry = flowBoardCache.get(boardId) || { board: null, posts: [], latest: 0, rollup: null, loaded: false, error: null };
+    const previousError = entry.error;
+    let after = entry.latest;
+    let fresh = [];
+    try {
+      for (let page = 0; page < 50; page += 1) {
+        const query = `limit=100${after ? `&after_sequence=${after}` : ''}`;
+        const result = await api(`/api/boards/${encodeURIComponent(boardId)}?${query}`);
+        entry.board = result.board || entry.board;
+        const posts = result.posts || [];
+        fresh = fresh.concat(posts);
+        const last = posts.length ? posts[posts.length - 1].sequence : after;
+        if (!result.has_more || !posts.length) break;
+        after = Number(result.next_after_sequence) || last;
+      }
+      entry.error = null;
+    } catch (error) {
+      entry.error = error.message;
+    }
+    // A board that has never loaded stays unloaded on error, so the flow shows
+    // the error instead of an empty task list.
+    if (entry.error && !entry.loaded && !fresh.length) {
+      flowBoardCache.set(boardId, entry);
+      return entry.error !== previousError;
+    }
+    const changed = fresh.length > 0 || !entry.loaded || entry.error !== previousError;
+    if (fresh.length) {
+      entry.posts = mergeFlowBoardPosts(entry.posts, fresh);
+      entry.latest = entry.posts.length ? entry.posts[entry.posts.length - 1].sequence : 0;
+    }
+    if (changed) entry.rollup = rollupFlowBoardTasks(entry.posts, boardId, flowGroupComponent(entry.board));
+    entry.loaded = true;
+    flowBoardCache.set(boardId, entry);
+    return changed;
+  })();
+  flowBoardLoads.set(boardId, load);
+  return load.finally(() => flowBoardLoads.delete(boardId));
+}
+
+// Catch up every board a listed flow uses. Returns the IDs that changed.
+async function refreshFlowBoards() {
+  const ids = [...new Set(state.flows.map(snapshot => snapshot.run?.board_id).filter(Boolean))];
+  const results = await Promise.all(ids.map(id => loadFlowBoard(id).then(changed => [id, changed])));
+  return new Set(results.filter(([, changed]) => changed).map(([id]) => id));
+}
+
+// Tracked tasks for a flow, or null while its board has not loaded. The tile
+// groups, tones and order come from workGroups over the board's own declared
+// groups, so the Flow tiles and the board tiles always agree.
+function flowWorkFor(run) {
+  const entry = flowBoardCache.get(run?.board_id);
+  if (!entry?.loaded || !entry.rollup) return null;
+  const work = flowTrackedWork(run.references || [], entry.rollup, run.board_id);
+  const groups = workGroups(work, flowGroupComponent(entry.board));
+  const toneByValue = new Map(groups.filter(group => group.value !== null).map(group => [group.value, group.tone]));
+  return {
+    ...work,
+    tileGroups: groups,
+    settledCount: groups.filter(group => group.settled).reduce((sum, group) => sum + group.count, 0),
+    toneOf: value => toneByValue.get(value) || 'other'
+  };
+}
+
+function flowStageName(run, stageId) {
+  if (stageId == null || stageId === '') return '';
+  const stage = (run?.flow_template?.snapshot?.stages || []).find(item => String(item?.id) === String(stageId));
+  return stage?.name ? String(stage.name) : String(stageId).replaceAll('_', ' ');
+}
+
+const flowRelativeFormat = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
+function flowTime(value) {
+  const time = new Date(value).getTime();
+  if (!value || !Number.isFinite(time)) return '<time>time unavailable</time>';
+  const delta = (time - Date.now()) / 1000;
+  const units = [['year', 31536000], ['month', 2592000], ['week', 604800], ['day', 86400], ['hour', 3600], ['minute', 60]];
+  const unit = units.find(([, size]) => Math.abs(delta) >= size);
+  const text = unit ? flowRelativeFormat.format(Math.round(delta / unit[1]), unit[0]) : 'just now';
+  return `<time datetime="${esc(value)}" title="${esc(new Date(value).toLocaleString())}">${esc(text)}</time>`;
+}
+
+// A titled button that opens a post or board on the Boards view.
+function flowTargetLink(targetId, relation = null) {
+  const target = parseFlowLinkTarget(targetId);
+  const relationHtml = relation ? ` <span class="flowv-rel">(${esc(String(relation).replaceAll('_', ' '))})</span>` : '';
+  if (target.kind === 'post' && target.boardId && target.sequence) {
+    const entry = flowBoardCache.get(target.boardId);
+    const post = entry?.posts.find(item => item.sequence === target.sequence) || null;
+    const label = flowPostLabel(post, target.sequence);
+    const where = entry ? '' : ` · ${flowBoardLabel(target.boardId)}`;
+    return `<button type="button" class="flowv-link" data-flow-board-id="${esc(target.boardId)}" data-flow-post-sequence="${target.sequence}" title="${esc(label)}">${esc(label)}${esc(where)}</button>${relationHtml}`;
+  }
+  if (target.kind === 'board') return `<button type="button" class="flowv-link" data-flow-board-id="${esc(target.boardId)}">Board · ${esc(flowBoardLabel(target.boardId))}</button>${relationHtml}`;
+  return `<span class="flowv-ref">${esc(targetId)}</span>${relationHtml}`;
 }
 
 function flowBoardLabel(boardId) {
+  const cached = flowBoardCache.get(boardId)?.board;
+  if (cached?.title || cached?.key) return String(cached.title || cached.key);
   const board = state.boards.find(item => item.board_id === boardId);
   return board ? `${board.title || board.key} · ${board.type || 'general'}` : boardId;
 }
@@ -757,65 +1104,153 @@ function flowTemplateName(run) {
   return run.flow_template?.snapshot?.name || run.template_id || 'Unknown template';
 }
 
+// Flows whose full audit history is expanded ("Show all").
+const flowEventsExpanded = new Set();
+const FLOW_EVENTS_SHOWN = 10;
+
 function renderFlowDetail(snapshot) {
   const run = snapshot.run || {};
   const events = snapshot.events || [];
-  const posts = snapshot.posts || [];
-  const references = [{ kind: 'board', id: run.board_id, relation: 'flow board' }, ...(run.references || [])]
-    .filter(ref => ref && ref.id)
-    .filter((ref, index, all) => all.findIndex(other => other.id === ref.id) === index);
-  const referenceHtml = references.length ? `<div class="flow-references">${references.map(ref => {
-    const kind = String(ref.kind || '').toLowerCase();
-    const postReference = kind === 'post' || String(ref.id).includes(':post:');
-    const boardId = postReference ? String(ref.id).split(':post:')[0] : ref.id;
-    const postSequence = postReference ? Number(String(ref.id).split(':post:').at(-1)) : null;
-    const label = `${flowBoardLabel(boardId)}${Number.isFinite(postSequence) ? ` · post ${postSequence}` : ''}`;
-    return `<span class="flow-reference"><small>${esc(ref.relation || ref.kind || 'reference')}</small>${postReference || kind === 'board'
-      ? `<button type="button" class="board-link" data-flow-board-id="${esc(boardId)}"${Number.isFinite(postSequence) ? ` data-flow-post-sequence="${postSequence}"` : ''}>${esc(label)}</button>`
-      : `<span class="mono">${esc(label)}</span>`}</span>`;
-  }).join('')}</div>` : '<span class="muted">No board references</span>';
-  const postsHtml = posts.length ? posts.map(post => {
-    const fields = post.fields && typeof post.fields === 'object' && !Array.isArray(post.fields) ? post.fields : {};
-    const title = post.title || fields.objective || fields.title || `Post ${post.sequence || ''}`;
-    const status = fields.status == null ? '' : (Array.isArray(fields.status) ? fields.status.join(', ') : String(fields.status));
-    const summary = post.content || fields.instructions || fields.description || '';
-    const fieldRows = Object.entries(fields)
-      .filter(([key, value]) => key !== 'status' && value != null && value !== '' && !(Array.isArray(value) && value.length === 0))
-      .map(([key, value]) => {
-        const rendered = Array.isArray(value) ? value.join(', ') : typeof value === 'object' ? JSON.stringify(value) : String(value);
-        return `<div><dt>${esc(key.replaceAll('_', ' '))}</dt><dd>${esc(rendered)}</dd></div>`;
-      }).join('');
-    const template = post.post_template_id ? `${post.post_template_id}${post.post_template_version ? ` · v${post.post_template_version}` : ''}` : 'Board post';
-    return `<article class="flow-work-post">
-      <div class="flow-work-post__head"><div><p class="eyebrow">${esc(template)}${post.sequence ? ` · #${fmt(post.sequence)}` : ''}</p><h4>${esc(title)}</h4></div>${status ? `<span class="flow-work-post__status">${esc(status)}</span>` : ''}</div>
-      ${summary ? `<p>${esc(summary)}</p>` : ''}
-      ${fieldRows ? `<dl>${fieldRows}</dl>` : ''}
-      ${post.post_id ? flowPostLink(post.post_id, 'Open work post') : ''}
+  const tasks = flowTaskEntries(run.tasks);
+  const boardEntry = flowBoardCache.get(run.board_id);
+  const work = flowWorkFor(run);
+  const stageName = id => flowStageName(run, id);
+
+  // Header: goal, state, template, coordinator and times. Hash and revision
+  // sit in the Details disclosure.
+  const template = run.flow_template || {};
+  const headHtml = `<header class="flowv-head">
+      <p class="eyebrow">${esc(flowTemplateName(run))} · v${esc(run.template_version ?? template.version ?? '—')}</p>
+      <h2 class="flowv-goal flowv-clamp" title="${esc(run.goal || '')}">${esc(run.goal || 'Untitled Flow')}</h2>
+      <div class="flowv-meta">
+        <span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span>
+        <span><small>Coordinator</small> ${esc(run.coordinator?.agent_id || 'Unclaimed')}</span>
+        <span><small>Created</small> ${flowTime(run.created_at)}${run.created_by ? ` by ${esc(run.created_by)}` : ''}</span>
+        <span><small>Updated</small> ${flowTime(run.updated_at)}</span>
+      </div>
+    </header>`;
+
+  // Stage stepper from the pinned template's stages.
+  const steps = flowStageSteps(template.snapshot?.stages || [], run.stage, run.state, events);
+  const stepLabel = { done: 'Done', current: 'Current', upcoming: 'Upcoming' };
+  const stepperHtml = steps.length ? `<ol class="flowv-stepper" aria-label="Stages">${steps.map((step, index) => `
+      <li class="flowv-step flowv-step--${esc(step.state)}"${step.description ? ` title="${esc(step.description)}"` : ''}${step.state === 'current' ? ' aria-current="step"' : ''}>
+        <span class="flowv-step__dot">${step.state === 'done' ? '✓' : fmt(index + 1)}</span>
+        <span class="flowv-step__text"><strong>${esc(step.name)}</strong><small>${esc(stepLabel[step.state])}</small></span>
+      </li>`).join('')}</ol>` : '';
+
+  // Tile row of tracked tasks, one tile per board group that has tasks, with
+  // the board's labels and tones.
+  const shownGroups = work ? work.tileGroups.filter(group => group.count) : [];
+  const tilesHtml = work
+    ? (shownGroups.length ? `<div class="kpis board-kpis flowv-kpis">${shownGroups.map(group => `
+      <article class="kpi flowv-kpi"><span><i class="group-dot group-tone--${esc(group.tone)}" aria-hidden="true"></i>${esc(group.label)}</span><strong>${fmt(group.count)}</strong><small>of ${fmt(work.total)} tracked</small></article>`).join('')}</div>` : '')
+    : `<div class="kpis board-kpis flowv-kpis"><article class="kpi flowv-kpi"><span>Tracked tasks</span><strong>—</strong><small>${boardEntry?.error ? 'board unavailable' : 'loading'}</small></article></div>`;
+
+  // Tracked work: one row per root task the flow references.
+  let workHtml;
+  if (!work) {
+    workHtml = boardEntry?.error
+      ? `<div class="empty-state">Could not load the flow board: ${esc(boardEntry.error)}</div>`
+      : '<div class="empty-state">Loading tracked tasks…</div>';
+  } else if (!work.tasks.length) {
+    workHtml = '<div class="empty-state">This flow does not reference any task posts yet.</div>';
+  } else {
+    workHtml = `<ul class="flowv-tasks">${work.tasks.map(task => {
+      const latest = task.latest && task.latest.sequence !== task.sequence
+        ? `<span class="flowv-task__latest">Latest: #${fmt(task.latest.sequence)} · ${esc(task.latest.title)} · ${flowTime(task.latest.createdAt)}</span>`
+        : `<span class="flowv-task__latest">Posted ${flowTime(task.post?.created_at)}</span>`;
+      return `<li><button type="button" class="flowv-task" data-flow-board-id="${esc(run.board_id)}" data-flow-post-sequence="${task.sequence}" title="${esc(`Open #${task.sequence} on the board`)}">
+          ${statusPill(task.statusLabel, work.toneOf(task.status))}
+          <span class="flowv-task__main"><strong>${esc(task.title)}</strong>${latest}</span>
+          <span class="flowv-task__side"><span>#${fmt(task.sequence)}</span><span>${esc(task.assignee || 'Unassigned')}</span></span>
+        </button></li>`;
+    }).join('')}</ul>`;
+  }
+  const otherRefs = work ? work.otherReferences : [];
+  const otherHtml = otherRefs.length
+    ? `<div class="flowv-other"><small>Other references</small><ul>${otherRefs.map(ref => `<li>${flowTargetLink(ref.id, ref.relations.join(', '))}</li>`).join('')}</ul></div>`
+    : '';
+  const workNote = `From ${esc(flowBoardLabel(run.board_id))} · status rolled up from board posts`;
+  const workSection = `<section class="flowv-section">
+      <div class="panel__head"><div><p class="eyebrow">Tracked work</p><h3>${work ? `${fmt(work.total)} ${work.total === 1 ? 'task' : 'tasks'}` : 'Tasks'}</h3></div>
+        <button type="button" class="flowv-note-link" data-flow-board-id="${esc(run.board_id)}">${workNote}</button></div>
+      ${workHtml}${otherHtml}
+    </section>`;
+
+  // Audit history: one readable line per event, newest first.
+  const newestFirst = events.slice().reverse();
+  const expanded = flowEventsExpanded.has(run.flow_id);
+  const shownEvents = expanded ? newestFirst : newestFirst.slice(0, FLOW_EVENTS_SHOWN);
+  const historyHtml = shownEvents.length ? `<ol class="flowv-events">${shownEvents.map(event => {
+    const summary = flowEventSummary(event, stageName);
+    const details = summary.details.map(([label, text, value]) => {
+      const target = typeof value === 'string' ? parseFlowLinkTarget(value) : null;
+      const valueHtml = target && (target.kind === 'post' || (target.kind === 'board' && value.startsWith('board:'))) ? flowTargetLink(value) : esc(text);
+      return `<div><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
+    }).join('');
+    const postHtml = event.post_id ? ` · ${flowTargetLink(event.post_id)}` : '';
+    return `<li class="flowv-event">
+        <div class="flowv-event__line"><p><strong>${esc(event.actor || 'Unknown actor')}</strong> ${esc(summary.text)}${summary.reference ? ` ${flowTargetLink(summary.reference.id, summary.reference.relation)}` : ''}${postHtml}</p>${flowTime(event.timestamp)}</div>
+        ${details ? `<dl class="flowv-event__data">${details}</dl>` : ''}
+      </li>`;
+  }).join('')}</ol>` : '<div class="empty-state">No Flow events recorded yet.</div>';
+  const moreHtml = newestFirst.length > FLOW_EVENTS_SHOWN
+    ? `<button type="button" class="btn flowv-more" data-flow-show-all="${esc(run.flow_id || '')}">${expanded ? 'Show latest 10' : `Show all ${fmt(newestFirst.length)} events`}</button>`
+    : '';
+  const historySection = `<section class="flowv-section">
+      <div class="panel__head"><div><p class="eyebrow">Audit history</p><h3>${fmt(events.length)} recorded ${events.length === 1 ? 'event' : 'events'}</h3></div><span class="panel__note">Newest first · recorded by Membrick</span></div>
+      ${historyHtml}${moreHtml}
+    </section>`;
+
+  const detailsHtml = `<details class="flowv-details"><summary>Details</summary><dl>
+      <div><dt>Flow ID</dt><dd>${esc(run.flow_id || '—')}</dd></div>
+      <div><dt>Template</dt><dd>${esc(template.template_id || run.template_id || '—')} · v${esc(run.template_version ?? '—')}</dd></div>
+      <div><dt>Content hash</dt><dd>${esc(template.content_hash || '—')}</dd></div>
+      <div><dt>Revision</dt><dd>${fmt(run.revision || 0)}</dd></div>
+      <div><dt>Coordinator</dt><dd>${esc(run.coordinator?.agent_id || 'Unclaimed')}${run.coordinator?.provider ? ` · ${esc(run.coordinator.provider)}` : ''} · fence ${fmt(run.coordinator_fence || 0)}</dd></div>
+      <div><dt>Board</dt><dd>${esc(run.board_id || '—')}</dd></div>
+    </dl></details>`;
+
+  // Legacy runs that recorded tasks on the flow itself.
+  const legacyHtml = tasks.length ? legacyFlowTasksHtml(tasks, events) : '';
+
+  document.querySelector('#flow-detail').innerHTML = `<div class="flowv">${headHtml}${stepperHtml}${tilesHtml}${workSection}${legacyHtml}${historySection}${detailsHtml}</div>`;
+  document.querySelectorAll('[data-flow-show-all]').forEach(button => button.addEventListener('click', () => {
+    const flowId = button.dataset.flowShowAll;
+    if (flowEventsExpanded.has(flowId)) flowEventsExpanded.delete(flowId);
+    else flowEventsExpanded.add(flowId);
+    renderFlowDetail(state.flowSnapshot || snapshot);
+  }));
+  bindFlowBoardLinks();
+}
+
+function legacyFlowTasksHtml(tasks, events) {
+  const eventByTask = new Map();
+  for (const event of events) if (event.task_id) eventByTask.set(event.task_id, [...(eventByTask.get(event.task_id) || []), event]);
+  const taskHtml = tasks.length ? tasks.map(task => {
+    const taskEvents = eventByTask.get(task.task_id) || [];
+    const review = taskEvents.slice().reverse().find(event => ['review_approved', 'review_changes_requested'].includes(event.kind));
+    const assignee = task.assignee?.agent_id ? `${task.assignee.agent_id} · ${task.assignee.provider || 'agent'}` : 'Unassigned';
+    const evidence = task.evidence || [];
+    const postIds = [...new Set(task.post_ids || [])];
+    return `<article class="flow-task">
+      <div class="flow-task__head"><div><p class="eyebrow">Task · ${esc(task.task_id || 'unknown id')}</p><h3>${esc(task.title || task.task_id || 'Untitled task')}</h3></div><span class="flow-state flow-state--${esc(task.state || 'unknown')}">${esc(task.state || 'unknown')}</span></div>
+      <div class="flow-task__meta"><span><small>Assigned</small>${esc(assignee)}</span><span><small>Attempts</small>${fmt(task.attempts || 0)}</span><span><small>Current attempt</small>${esc(task.attempt_id || '—')}</span><span><small>Revision</small>${fmt(task.revision || 0)}</span></div>
+      ${task.summary ? `<p class="flow-task__summary">${esc(task.summary)}</p>` : ''}
+      ${task.blocker ? `<p class="flow-task__blocker"><strong>Blocker</strong> ${esc(task.blocker)}</p>` : ''}
+      ${review ? `<p class="flow-task__review"><strong>Latest review</strong> ${esc(review.kind.replaceAll('_', ' '))} · ${esc(review.actor || 'unknown reviewer')}</p>` : ''}
+      ${postIds.length ? `<div class="flow-task__posts"><small>Linked task and report posts</small>${postIds.map(postId => flowPostLink(postId)).join('')}</div>` : ''}
+      ${evidence.length ? `<div class="flow-evidence"><small>Evidence</small>${evidence.map(item => `<span>${esc(item)}</span>`).join('')}</div>` : ''}
     </article>`;
-  }).join('') : snapshot.postError
-    ? `<div class="empty-state">Could not load board posts: ${esc(snapshot.postError)}</div>`
-    : '<div class="empty-state">No work posts on this Flow board yet.</div>';
-  const timelineHtml = events.length ? events.slice().reverse().map(event => `
-    <article class="flow-event">
-      <div class="flow-event__head"><div><span class="flow-event__kind">${esc(String(event.kind || 'event').replaceAll('_', ' '))}</span></div><time>${esc(event.timestamp ? new Date(event.timestamp).toLocaleString() : 'Time unavailable')}</time></div>
-      <p class="flow-event__actor">Recorded by ${esc(event.actor || 'unknown actor')} · ${esc(event.provider || 'unknown provider')} · revision ${fmt(event.revision || 0)}</p>
-      ${event.post_id ? `<div class="flow-event__post"><small>Associated board post</small>${flowPostLink(event.post_id, 'Open associated post')}</div>` : ''}
-      <div class="flow-event__data">${flowDataRows(event.data)}</div>
-    </article>`).join('') : '<div class="empty-state">No Flow events recorded yet.</div>';
-  document.querySelector('#flow-detail').innerHTML = `
-    <div class="flow-detail__head"><div><p class="eyebrow">Flow · ${esc(run.flow_id || '')}</p><h2>${esc(run.goal || 'Untitled Flow')}</h2><p class="muted">Created by ${esc(run.created_by || 'unknown agent')} · ${esc(run.created_at ? new Date(run.created_at).toLocaleString() : 'date unavailable')}</p></div><span class="flow-source-label">Flow projection · Membrick recorded</span></div>
-    <div class="flow-summary">
-      <div><small>Template</small><strong>${esc(flowTemplateName(run))} · v${esc(run.template_version || '—')}</strong>${run.flow_template?.content_hash ? `<small class="mono">${esc(run.flow_template.content_hash)}</small>` : ''}</div>
-      <div><small>Current stage</small><strong>${esc(run.stage || '—')}</strong></div>
-      <div><small>Run state</small><strong><span class="flow-state flow-state--${esc(run.state || 'unknown')}">${esc(run.state || 'unknown')}</span></strong></div>
-      <div><small>Revision</small><strong>${fmt(run.revision || 0)}</strong></div>
-      <div><small>Coordinator</small><strong>${esc(run.coordinator?.agent_id || 'Unclaimed')}</strong><small>${esc(run.coordinator?.provider || '')} · fence ${fmt(run.coordinator_fence || 0)}</small></div>
-      <div><small>Updated</small><strong>${esc(run.updated_at ? new Date(run.updated_at).toLocaleString() : '—')}</strong></div>
-    </div>
-    <section class="flow-detail__section"><div class="panel__head"><div><p class="eyebrow">Context</p><h3>Linked boards and posts</h3></div></div>${referenceHtml}</section>
-    <section class="flow-detail__section"><div class="panel__head"><div><p class="eyebrow">Work on this Flow</p><h3>Board posts · ${fmt(posts.length)}</h3></div><span class="panel__note">Posts are the work items; stage changes record handoff after completion.</span></div><div class="flow-work-posts">${postsHtml}</div></section>
-    <section class="flow-detail__section"><div class="panel__head"><div><p class="eyebrow">Audit history</p><h3>Flow event timeline</h3></div><span class="panel__note">${fmt(events.length)} Membrick-recorded events · provider telemetry is shown separately</span></div><div class="flow-timeline">${timelineHtml}</div></section>`;
-  document.querySelectorAll('[data-flow-board-id]').forEach(button => button.addEventListener('click', async () => {
+  }).join('') : '';
+  return `<section class="flowv-section"><div class="panel__head"><div><p class="eyebrow">Recorded on the flow</p><h3>Flow tasks · ${fmt(tasks.length)}</h3></div></div><div class="flow-tasks">${taskHtml}</div></section>`;
+}
+
+// Every flow link opens its board, and its post when it names one, on the
+// Boards view.
+function bindFlowBoardLinks() {
+  document.querySelectorAll('#flow-detail [data-flow-board-id]').forEach(button => button.addEventListener('click', async () => {
     const boardId = button.dataset.flowBoardId;
     const postSequence = button.dataset.flowPostSequence ? Number(button.dataset.flowPostSequence) : null;
     showView('boards', false);
@@ -835,37 +1270,71 @@ function parseLinkTarget(target) {
   return parseBoardLinkTarget(target, state.boards.map(board => board.board_id));
 }
 
-const LINK_KIND_LABELS = { board: 'Board', post: 'Post', external: 'Web', reference: 'Ref' };
+// The board on screen and the titles of its loaded posts, so a link to a post
+// on the same board reads as that post's title without the board name.
+let boardLinkContext = { boardId: null, titles: new Map() };
+
+const relationWords = relation => String(relation || 'related').replaceAll('_', ' ');
+
+// A board ID ends in its key; that key is the readable fallback when the
+// board's title is not known, so a raw board ID is never shown.
+function boardKeyFromId(boardId) {
+  const value = String(boardId || '');
+  return value.slice(value.lastIndexOf(':') + 1) || value;
+}
 
 function boardLabel(boardId) {
   const board = state.boards.find(item => item.board_id === boardId) || state.linkedBoards.get(boardId)?.board;
-  return board ? board.title || board.key : boardId;
+  return board ? board.title || board.key : boardKeyFromId(boardId);
 }
 
-function renderBoardLinks(links = []) {
+function linkTargetLabel(parsed, context = boardLinkContext) {
+  const sameBoard = parsed.boardId === context.boardId;
+  if (parsed.kind === 'board') return sameBoard ? 'this board' : boardLabel(parsed.boardId);
+  let title = sameBoard ? context.titles.get(parsed.sequence) : null;
+  if (!sameBoard) {
+    const linkedPost = state.linkedBoards.get(parsed.boardId)?.posts?.find(post => post.sequence === parsed.sequence);
+    if (linkedPost) title = postTitleParts(linkedPost).title;
+  }
+  const postText = title || `post ${parsed.sequence}`;
+  return sameBoard ? postText : `${boardLabel(parsed.boardId)} · ${postText}`;
+}
+
+// Links read as "<relation> <target title>". More than `limit` links fold
+// into a "+N more" toggle.
+function renderBoardLinks(links = [], context = boardLinkContext, limit = 3) {
   if (!links.length) return '<span class="muted">No linked items</span>';
-  return `<div class="board-links">${links.map(link => {
+  const items = links.map(link => {
     const target = String(link.target || '');
     const parsed = parseLinkTarget(target);
     const navigable = parsed.boardId && parsed.boardId.startsWith('board:') && (parsed.kind === 'board' || parsed.sequence);
     let item;
     if (navigable) {
-      const label = `${boardLabel(parsed.boardId)}${parsed.sequence ? ` · post ${parsed.sequence}` : ''}`;
-      item = `<button type="button" class="board-link" data-board-link="${esc(parsed.boardId)}"${parsed.sequence ? ` data-post-sequence="${parsed.sequence}"` : ''}>${esc(label)}</button>`;
+      const label = linkTargetLabel(parsed, context);
+      item = `<button type="button" class="board-link" title="${esc(label)}" data-board-link="${esc(parsed.boardId)}"${parsed.sequence ? ` data-post-sequence="${parsed.sequence}"` : ''}>${esc(label)}</button>`;
     } else if (parsed.kind === 'external') {
       item = `<a class="board-link" href="${esc(target)}" target="_blank" rel="noopener noreferrer">${esc(target)}</a>`;
     } else {
       item = `<span class="board-link board-link--plain">${esc(target.startsWith('repo:') ? target.slice(5) : target)}</span>`;
     }
-    return `<span class="board-link-item board-link-item--${parsed.kind}"><small>${esc(link.relation || 'related')}</small><span class="board-link-kind">${LINK_KIND_LABELS[parsed.kind]}</span>${item}</span>`;
-  }).join('')}</div>`;
+    return `<span class="board-link-item board-link-item--${parsed.kind}"><small>${esc(relationWords(link.relation))}</small>${item}</span>`;
+  });
+  const rest = items.slice(limit);
+  return `<div class="board-links">${items.slice(0, limit).join('')}${rest.length ? `<details class="board-links__more"><summary>+${fmt(rest.length)} more</summary><div class="board-links">${rest.join('')}</div></details>` : ''}</div>`;
+}
+
+function bindBoardLinkButtons(root) {
+  root.querySelectorAll('[data-board-link]').forEach(button => button.addEventListener('click', () => navigateBoardLink(
+    button.dataset.boardLink,
+    button.dataset.postSequence ? Number(button.dataset.postSequence) : null,
+  )));
 }
 
 // In-place navigation keeps a trail back to where the reader started.
 async function navigateBoardLink(boardId, postSequence) {
   if (boardId === state.selectedBoardId) {
     if (postSequence == null) return;
-    if (document.querySelector(`#post-${postSequence}`)) focusBoardPost(postSequence);
+    if (document.querySelector(`#post-${postSequence}`) || boardTaskPosts.has(postSequence)) await focusBoardPost(postSequence);
     else await selectBoard(boardId, postSequence);
     return;
   }
@@ -883,21 +1352,20 @@ function renderBoardTrail(board) {
   </nav>`;
 }
 
-// Group posts only by the declared group_by field and declared values. Posts
-// whose value is missing or undeclared are counted as "Other", never guessed.
-function groupPosts(component, posts) {
-  const matching = posts.filter(post => postMatches(component, post));
-  const field = typeof component.group_by === 'string' ? component.group_by : null;
+// Count tasks (not posts) per declared group, using the task rollup. Tasks
+// whose status is missing or undeclared are counted as "Other", never guessed.
+// Each group's `posts` holds its tasks, so groupSummaryHtml can count them.
+function groupPosts(component, posts, boardId) {
   const declared = Array.isArray(component.groups) ? component.groups.filter(group => group && typeof group === 'object' && Object.hasOwn(group, 'value')) : [];
+  const rollup = rollupTasks(posts, boardId, component);
   // A group's color comes only from a tone the template declares; otherwise it
   // gets a neutral color by position, so no meaning is read into its value.
-  const groups = declared.map((group, index) => ({
-    label: String(group.label ?? group.value),
-    tone: GROUP_TONES.has(group.tone) ? group.tone : `n${index % 6}`,
-    posts: field ? matching.filter(post => post.fields && Object.hasOwn(post.fields, field) && Object.is(post.fields[field], group.value)) : [],
+  const groups = rollup.groups.map((group, index) => ({
+    label: group.label,
+    tone: GROUP_TONES.has(declared[index]?.tone) ? declared[index].tone : `n${index % 6}`,
+    posts: group.tasks,
   }));
-  const other = matching.filter(post => !groups.some(group => group.posts.includes(post)));
-  return { declared: Boolean(field) && declared.length > 0, groups, other, total: matching.length };
+  return { declared: typeof component.group_by === 'string' && declared.length > 0, groups, other: rollup.other.tasks, total: rollup.total };
 }
 
 const GROUP_TONES = new Set(['neutral', 'info', 'success', 'warning', 'danger']);
@@ -1043,7 +1511,7 @@ async function linkedBoardCards(board, component, used) {
       : childHero ? [childHero.title_field, ...childSummaryFields].filter(Boolean)
         : childFields?.field_ids;
     const rows = fieldRows(linked?.fields, linkedSnapshot?.schema, selectedFields);
-    const summary = childGroups && entry ? groupSummaryHtml(groupPosts(childGroups, entry.posts), entry.hasMore) : '';
+    const summary = childGroups && entry ? groupSummaryHtml(groupPosts(childGroups, entry.posts, entry.board?.board_id || target), entry.hasMore) : '';
     const meta = linkedInstance
       ? `${linkedSnapshot?.name || linkedInstance.template_id} v${linkedInstance.version}`
       : entry ? `${fmt(entry.posts.length)}${entry.hasMore ? '+' : ''} posts` : '';
@@ -1073,17 +1541,15 @@ async function renderTemplateComponent(component, index, board, posts, instance,
   if (component.kind === 'post_list' || component.kind === 'post_timeline' || component.kind === 'post_groups') {
     const matching = posts.filter(post => postMatches(component, post));
     if (component.kind === 'post_groups') {
-      const grouping = groupPosts(component, posts);
-      if (!grouping.declared) {
+      const declaredGroups = typeof component.group_by === 'string' && Array.isArray(component.groups)
+        && component.groups.some(group => group && typeof group === 'object' && Object.hasOwn(group, 'value'));
+      if (!declaredGroups) {
         // Without declared values there is nothing to group by: show a neutral list.
         return `<section class="template-section">${title}<p class="muted template-note">No groups are declared for this section; items are shown in posting order.</p>${matching.map(post => renderPostCard(post, instance, true, component.field_ids)).join('') || '<div class="empty-state">No posts in this section.</div>'}</section>`;
       }
-      const groups = grouping.other.length ? [...grouping.groups, { label: 'Other or unclassified', posts: grouping.other, tone: 'other' }] : grouping.groups;
-      // Empty groups collapse into one row of zero-count chips.
-      const filled = groups.filter(group => group.posts.length);
-      const empty = groups.filter(group => !group.posts.length);
-      const emptyRow = empty.length ? `<div class="template-group-empties"><span class="muted">No items in</span>${empty.map(group => `<span class="group-chip"><i class="group-tone--${esc(group.tone)}"></i>${esc(group.label)} <b>0</b></span>`).join('')}</div>` : '';
-      return `<section class="template-section template-section--groups">${title}${groupSummaryHtml(grouping, hasMorePosts)}<div class="template-groups">${filled.map(group => `<div class="template-group"><div class="template-group__head"><h4><i class="group-dot group-tone--${esc(group.tone)}"></i>${esc(group.label)}</h4><span>${fmt(group.posts.length)}${hasMorePosts ? ' loaded' : ''}</span></div>${group.posts.map(post => renderPostCard(post, instance, true, component.field_ids)).join('')}</div>`).join('')}${emptyRow}</div></section>`;
+      // A further post_groups section is a work list of its own, from the rollup.
+      const view = taskView(posts, board.board_id, component, instance, boardLinkContext.titles, new Set(posts.map(post => post.sequence)));
+      return workPanelHtml(view, hasMorePosts, component.title || 'Work', `s${index}`);
     }
     const ordered = component.kind === 'post_timeline'
       ? matching.slice().sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')))
@@ -1308,8 +1774,330 @@ function contributorsHtml(posts) {
   }
   const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
   if (!ranked.length) return '';
-  const shown = ranked.slice(0, 6);
-  return `<div class="board-contributors"><span class="muted">Contributors</span>${shown.map(([name, count]) => `<span class="board-contributors__item">${agentChip(name)}<b class="board-contributors__count">${fmt(count)}</b></span>`).join('')}${ranked.length > shown.length ? `<span class="muted">+${fmt(ranked.length - shown.length)} more</span>` : ''}</div>`;
+  const shown = ranked.slice(0, 8);
+  return `<ul class="board-side__contributors">${shown.map(([name, count]) => `<li>${agentChip(name)}<b>${fmt(count)} ${count === 1 ? 'post' : 'posts'}</b></li>`).join('')}</ul>${ranked.length > shown.length ? `<p class="muted board-side__more">+${fmt(ranked.length - shown.length)} more</p>` : ''}`;
+}
+
+/* ── board view: tiles, work rows, side panel ──────────────────── */
+
+// Order of the work groups: the board's declared post_groups order, then
+// Other, then the settled groups (a declared success tone, or the common done
+// and cancelled values) in their declared order. Settled groups go last so
+// they fold away at the end of the list and sit at the right in Columns.
+// Nothing else is reordered. Tiles, List, Columns and the Flow page all use
+// this order.
+const SETTLED_STATUSES = new Set(['done', 'cancelled']);
+
+function workGroups(rollup, component) {
+  const declared = Array.isArray(component.groups)
+    ? component.groups.filter(group => group && typeof group === 'object' && Object.hasOwn(group, 'value')) : [];
+  const groups = rollup.groups.map((group, index) => {
+    const tone = GROUP_TONES.has(declared[index]?.tone) ? declared[index].tone : `n${index % 6}`;
+    const settled = tone === 'success' || (!GROUP_TONES.has(declared[index]?.tone) && SETTLED_STATUSES.has(group.value));
+    return { ...group, tone, settled };
+  });
+  const other = rollup.other.count ? [{ ...rollup.other, tone: 'other', settled: false }] : [];
+  return [...groups.filter(group => !group.settled), ...other, ...groups.filter(group => group.settled)];
+}
+
+// Everything the work list needs for one post_groups section, built from the
+// task rollup. `anchored` collects the post sequences that already have an
+// on-page anchor, so each post is anchored once.
+function taskView(posts, boardId, component, instance, titles, anchored) {
+  const rollup = rollupTasks(posts, boardId, component);
+  const groups = workGroups(rollup, component);
+  const byValue = new Map(groups.filter(group => group.value !== null).map(group => [group.value, group]));
+  return {
+    boardId, instance, rollup, groups, titles, anchored, statusField: rollup.statusField,
+    postsBySeq: new Map(posts.map(post => [post.sequence, post])),
+    labelOf: value => byValue.get(value)?.label ?? String(value),
+    toneOf: value => byValue.get(value)?.tone || 'other',
+  };
+}
+
+function statusPill(label, tone) {
+  return `<span class="board-pill"><i class="group-tone--${esc(tone)}" aria-hidden="true"></i>${esc(label)}</span>`;
+}
+
+// One post in a task's history: its own status, author, time, full text,
+// fields and labelled links.
+function historyEntryHtml(post, view) {
+  const anchor = !view.anchored.has(post.sequence);
+  if (anchor) view.anchored.add(post.sequence);
+  const { title, body } = postTitleParts(post);
+  const fields = post.fields && typeof post.fields === 'object' && !Array.isArray(post.fields) ? post.fields : {};
+  const schema = postTemplateFor(view.instance, post)?.schema;
+  const status = fields[view.statusField];
+  const ids = [...new Set([...fieldIndex(schema).keys(), ...Object.keys(fields)])].filter(id => id !== view.statusField);
+  const rows = fieldRows(fields, schema, ids);
+  return `<article class="board-entry"${anchor ? ` id="post-${esc(post.sequence)}"` : ''}>
+      <header class="board-entry__head">
+        <span class="board-entry__seq">#${esc(post.sequence)}</span>
+        <strong class="board-entry__title">${esc(title || `Post ${post.sequence}`)}</strong>
+        <span class="board-entry__meta">${isEmptyValue(status) ? '' : statusPill(view.labelOf(status), view.toneOf(status))}${agentChip(post.author_agent_id || post.provider || 'agent')}${timeHtml(post.created_at)}</span>
+      </header>
+      ${postBodyHtml(post, body)}
+      ${rows ? `<dl class="template-fields board-entry__fields">${rows}</dl>` : ''}
+      ${(post.links || []).length ? renderBoardLinks(post.links) : ''}
+    </article>`;
+}
+
+// The disclosure ID of a task row. The main panel keeps the plain form; a
+// further post_groups section prefixes its scope so IDs stay unique.
+function taskDetailId(sequence, scope) {
+  return scope === 'main' ? `task-${sequence}` : `${scope}-task-${sequence}`;
+}
+
+// The summary parts shared by List rows and Columns cards.
+function taskSummaryHtml(task, view) {
+  const updates = task.updates.length;
+  const latest = updates ? `<span class="board-task__latest-title" title="${esc(task.latest.title)}">${esc(task.latest.title)}</span>` : '<span class="muted">No updates yet</span>';
+  return `<span class="board-task__title" title="${esc(task.title)}">${esc(task.title)}</span>
+        ${statusPill(task.statusLabel, view.toneOf(task.status))}
+        <span class="board-task__assignee">${task.assignee ? agentChip(task.assignee) : '<span class="muted">Unassigned</span>'}</span>
+        <span class="board-task__latest">${latest}${timeHtml(task.latest.createdAt)}</span>
+        <span class="board-task__count">${fmt(updates)} ${updates === 1 ? 'update' : 'updates'}</span>`;
+}
+
+// A task's history: what it depends on, then the root post and its updates
+// in posting order. Shared by List rows and the Columns detail area.
+function taskHistoryHtml(task, view) {
+  const members = [task.sequence, ...task.updates].map(sequence => view.postsBySeq.get(sequence)).filter(Boolean);
+  const depends = task.dependsOn.length
+    ? `<p class="board-task__depends"><span class="muted">Depends on</span>${task.dependsOn.map(sequence => `<button type="button" class="board-link" data-board-link="${esc(view.boardId)}" data-post-sequence="${esc(sequence)}">${esc(view.titles.get(sequence) || `post ${sequence}`)}</button>`).join('')}</p>` : '';
+  return `<div class="board-task__history">${depends}${members.map(post => historyEntryHtml(post, view)).join('')}</div>`;
+}
+
+// A List row: compact summary, expanding in place to the task's history.
+function taskRowHtml(task, view, scope) {
+  return `<details class="board-task" data-detail-id="${esc(taskDetailId(task.sequence, scope))}">
+      <summary class="board-task__summary">
+        ${taskSummaryHtml(task, view)}
+      </summary>
+      ${taskHistoryHtml(task, view)}
+    </details>`;
+}
+
+// A Columns card: the summary only, never expanding in the column. A button,
+// so click, Enter and Space all open the task's details under the columns.
+function taskCardHtml(task, view, scope, selected) {
+  return `<button type="button" class="board-task board-task--card${selected ? ' is-selected' : ''}" data-task-open="${esc(task.sequence)}" data-task-scope="${esc(scope)}" aria-expanded="${selected}" aria-controls="${esc(`${scope}-task-detail`)}" title="Show details below">
+        ${taskSummaryHtml(task, view)}
+      </button>`;
+}
+
+// The Columns detail area content for one task. Task posts are never anchored
+// by Activity, so the main panel anchors their history afresh each time;
+// other panels share the main panel's posts and anchor nothing.
+function taskDetailHtml(task, view, scope) {
+  const local = scope === 'main' ? { ...view, anchored: new Set() } : view;
+  const updates = task.updates.length;
+  return `<header class="board-task-detail__head">
+      <h3 class="board-task-detail__title" data-task-detail-title tabindex="-1"><span class="board-entry__seq">#${esc(task.sequence)}</span>${esc(task.title)}</h3>
+      <span class="board-task-detail__meta">${statusPill(task.statusLabel, view.toneOf(task.status))}${task.assignee ? agentChip(task.assignee) : '<span class="muted">Unassigned</span>'}<span class="board-task__count">${fmt(updates)} ${updates === 1 ? 'update' : 'updates'}</span></span>
+      <button type="button" class="board-task-detail__close" data-task-close aria-label="${esc(`Close details for ${task.title}`)}" title="Close (Esc)">×</button>
+    </header>
+    ${taskHistoryHtml(task, local)}`;
+}
+
+function workPanelHtml(view, partial, eyebrow = 'Work', scope = 'main') {
+  // workGroups already holds the declared order with settled groups last.
+  const ordered = view.groups.filter(group => group.count);
+  const byRecent = tasksByRecentActivity;
+  const total = view.rollup.total;
+  const mode = effectiveWorkMode();
+  // An open task belongs to one board; another board starts with none open.
+  if (workOpenBoardId !== view.boardId) {
+    workOpenTask.clear();
+    workOpenBoardId = view.boardId;
+  }
+  workViews.set(scope, view);
+  // The switch shows only where Columns are possible; phones always get the List.
+  const switchHtml = total ? `<div class="work-switch" role="group" aria-label="Work layout">${[['columns', 'Columns'], ['list', 'List']].map(([value, label]) => `<button type="button" data-work-mode="${value}" aria-pressed="${workMode === value}">${label}</button>`).join('')}</div>` : '';
+  const body = !total ? '<div class="empty-state">No task posts on this board yet.</div>'
+    : mode === 'columns' ? workColumnsHtml(ordered, view, byRecent, scope)
+    : workListHtml(view, scope);
+  return `<section class="panel board-work board-work--${mode}" data-work-scope="${esc(scope)}">
+      <div class="panel__head"><div><p class="eyebrow">${esc(eyebrow)}</p><h2>${fmt(total)} ${total === 1 ? 'task' : 'tasks'}</h2></div><div class="board-work__tools"><span class="panel__note">${partial ? 'From the posts loaded so far' : 'In the board’s declared order'}</span>${switchHtml}</div></div>
+      ${body}
+    </section>`;
+}
+
+// Collapsed work groups, per board and per group, shared by Columns and List.
+// Settled groups start collapsed and every other group starts expanded until
+// the reader toggles it. The map is cached in memory, so the state holds even
+// when browser storage is unavailable.
+const workCollapseCache = new Map();
+
+function workCollapseKey(boardId) {
+  return `membrick-dashboard-work-collapsed:${boardId}`;
+}
+
+function workCollapseState(boardId) {
+  if (!workCollapseCache.has(boardId)) {
+    let saved = {};
+    try {
+      const parsed = JSON.parse(storageGet(workCollapseKey(boardId)) || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) saved = parsed;
+    } catch { /* unreadable state starts fresh */ }
+    workCollapseCache.set(boardId, saved);
+  }
+  return workCollapseCache.get(boardId);
+}
+
+function workGroupId(group, scope) {
+  return `${scope}:${group.value === null || group.value === undefined ? 'other' : `v:${String(group.value)}`}`;
+}
+
+function workGroupCollapsed(boardId, group, scope) {
+  const saved = workCollapseState(boardId)[workGroupId(group, scope)];
+  return typeof saved === 'boolean' ? saved : Boolean(group.settled);
+}
+
+function setWorkGroupCollapsed(boardId, groupId, collapsed) {
+  const saved = workCollapseState(boardId);
+  saved[groupId] = collapsed;
+  storageSet(workCollapseKey(boardId), JSON.stringify(saved));
+}
+
+// Apply a collapse change to the groups on screen without a re-render.
+function applyWorkGroupCollapsed(element, collapsed) {
+  element.classList.toggle('is-collapsed', collapsed);
+  const button = element.querySelector(':scope > .board-col__head > [data-work-collapse], :scope > .board-work__label > [data-work-collapse]');
+  if (!button) return;
+  button.setAttribute('aria-expanded', String(!collapsed));
+  button.setAttribute('aria-label', `${collapsed ? 'Expand' : 'Collapse'} ${button.dataset.groupLabel}`);
+  const body = element.querySelector(':scope > [data-work-body]');
+  if (body) body.hidden = collapsed;
+}
+
+// The shared group toggle: a button holding the dot, label, count and a sign.
+function workToggleHtml(group, view, scope, collapsed) {
+  const label = `${group.label}, ${group.count} ${group.count === 1 ? 'task' : 'tasks'}`;
+  return `<button type="button" class="work-toggle" data-work-collapse="${esc(workGroupId(group, scope))}" data-group-label="${esc(label)}" aria-expanded="${!collapsed}" aria-label="${esc(`${collapsed ? 'Expand' : 'Collapse'} ${label}`)}">
+      <i class="group-dot group-tone--${esc(group.tone)}" aria-hidden="true"></i><span class="board-col__label">${esc(group.label)}</span><b>${fmt(group.count)}</b><span class="work-toggle__sign" aria-hidden="true"></span>
+    </button>`;
+}
+
+// List: one list of every task, most recent activity first, so a task that
+// just changed is at the top. Each row's pill shows its status.
+function workListHtml(view, scope) {
+  return `<div class="board-work__rows board-work__rows--recent">${tasksByRecentActivity(view.rollup.tasks).map(task => taskRowHtml(task, view, scope)).join('')}</div>`;
+}
+
+// Columns: one vertically scrolling column per group that has tasks, in the
+// declared order and tones. A collapsed column is a narrow count column that
+// expands on click. Cards hold summaries only. A card's details open in the
+// area under the columns, so a column never changes width.
+function workColumnsHtml(groups, view, byRecent, scope) {
+  const openSequence = workOpenTask.get(scope);
+  const openTask = openSequence == null ? null : view.rollup.tasks.find(task => task.sequence === openSequence) || null;
+  if (openSequence != null && !openTask) workOpenTask.delete(scope);
+  const columns = groups.map(group => {
+    const id = workGroupId(group, scope);
+    const collapsed = workGroupCollapsed(view.boardId, group, scope);
+    const other = group.value === null || group.value === undefined;
+    return `<section class="board-col${other ? ' board-col--other' : ''}${collapsed ? ' is-collapsed' : ''}" data-work-group="${esc(id)}" aria-label="${esc(`${group.label}, ${group.count} ${group.count === 1 ? 'task' : 'tasks'}`)}">
+        <h3 class="board-col__head">${workToggleHtml(group, view, scope, collapsed)}</h3>
+        <div class="board-col__cards" data-col-scroll="${esc(`work-col-${id}`)}" data-work-body${collapsed ? ' hidden' : ''}>${byRecent(group.tasks).map(task => taskCardHtml(task, view, scope, task === openTask)).join('')}</div>
+      </section>`;
+  });
+  return `<div class="board-kanban">${columns.join('')}</div>
+    <section class="board-task-detail" id="${esc(`${scope}-task-detail`)}" data-task-detail-area aria-label="Task details"${openTask ? '' : ' hidden'}>${openTask ? taskDetailHtml(openTask, view, scope) : ''}</section>`;
+}
+
+// One line per post, newest first. A post that belongs to a task jumps to it;
+// any other post expands in place.
+function activityPanelHtml(posts, view, more, postCount) {
+  const items = posts.slice().reverse().map(post => {
+    const { title, body } = postTitleParts(post);
+    const links = Array.isArray(post.links) ? post.links : [];
+    const first = links[0] ? parseLinkTarget(String(links[0].target || '')) : null;
+    const relation = first && (first.kind === 'board' || first.sequence)
+      ? `<span class="board-activity__rel">${esc(relationWords(links[0].relation))} ${esc(linkTargetLabel(first))}${links.length > 1 ? ` +${fmt(links.length - 1)}` : ''}</span>` : '';
+    const line = `<span class="board-entry__seq">#${esc(post.sequence)}</span><span class="board-activity__title">${esc(title || `Post ${post.sequence}`)}</span>${relation}<span class="board-activity__meta">${agentChip(post.author_agent_id || post.provider || 'agent')}${timeHtml(post.created_at)}</span>`;
+    if (view.rollup.rootsOf.has(post.sequence)) return `<li><button type="button" class="board-activity__line" data-post-focus="${esc(post.sequence)}">${line}</button></li>`;
+    const anchor = !view.anchored.has(post.sequence);
+    if (anchor) view.anchored.add(post.sequence);
+    const rows = fieldRows(post.fields, postTemplateFor(view.instance, post)?.schema);
+    return `<li><details class="board-activity__post"${anchor ? ` id="post-${esc(post.sequence)}"` : ''} data-detail-id="post-${esc(post.sequence)}"><summary class="board-activity__line">${line}</summary>
+      <div class="board-activity__body">${postBodyHtml(post, body)}${rows ? `<dl class="template-fields board-entry__fields">${rows}</dl>` : ''}${links.length ? renderBoardLinks(links) : ''}</div></details></li>`;
+  });
+  return `<details class="panel board-activity" data-detail-id="activity">
+      <summary class="panel__head"><div><p class="eyebrow">Activity</p><h2>${postCount} ${posts.length === 1 ? 'post' : 'posts'} · newest first</h2></div><span class="board-work__toggle">Show</span></summary>
+      <ol class="board-activity__list">${items.join('') || '<li class="empty-state">No posts on this board yet.</li>'}</ol>${more}
+    </details>`;
+}
+
+function boardTilesHtml(board, view, posts, postCount, partial) {
+  const last = posts.at(-1);
+  const lastTile = `<article class="kpi kpi--time"><span>Last activity</span><strong>${last ? esc(relativeTime(last.created_at)) : '—'}</strong><small>${last ? `#${esc(last.sequence)} · ${esc(last.author_agent_id || last.provider || 'agent')}` : 'No posts yet'}</small></article>`;
+  if (view) {
+    const tiles = view.groups.filter(group => group.count).map(group => `<article class="kpi"><span><i class="group-dot group-tone--${esc(group.tone)}" aria-hidden="true"></i>${esc(group.label)}</span><strong>${fmt(group.count)}</strong><small>${group.count === 1 ? 'task' : 'tasks'}${partial ? ' loaded' : ''}</small></article>`);
+    return `<div class="kpis board-kpis">${tiles.join('')}${lastTile}</div>`;
+  }
+  const contributors = new Set(posts.map(post => post.author_agent_id || post.provider || 'agent')).size;
+  return `<div class="kpis board-kpis">
+      <article class="kpi"><span>Posts</span><strong>${postCount}</strong><small>${partial ? 'loaded so far' : 'on this board'}</small></article>
+      <article class="kpi"><span>Contributors</span><strong>${fmt(contributors)}</strong><small>${contributors === 1 ? 'agent' : 'agents'} posting</small></article>
+      ${lastTile}
+      <article class="kpi kpi--time"><span>Created</span><strong>${board.created_at ? esc(relativeTime(board.created_at)) : '—'}</strong><small>${esc(absoluteTime(board.created_at))}</small></article>
+    </div>`;
+}
+
+// Flows anchored on a board, read from the Flows API at most every 20s.
+const boardFlowCache = { at: 0, flows: [], pending: null };
+
+async function boardFlows(boardId) {
+  if (!boardFlowCache.pending && Date.now() - boardFlowCache.at > 20000) {
+    boardFlowCache.pending = api('/api/flows')
+      .then(result => { boardFlowCache.flows = Array.isArray(result?.flows) ? result.flows : []; })
+      .catch(() => {})
+      .finally(() => { boardFlowCache.at = Date.now(); boardFlowCache.pending = null; });
+  }
+  const pending = boardFlowCache.pending;
+  if (pending) await pending;
+  return boardFlowCache.flows.map(item => item?.run).filter(run => run && run.board_id === boardId)
+    .sort((a, b) => (a.state === 'completed') - (b.state === 'completed') || String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+}
+
+function boardFlowHtml(runs) {
+  if (!runs.length) return '';
+  const [run, ...others] = runs;
+  const snapshot = run.flow_template?.snapshot || {};
+  // Same stepper rules as the Flows page, including stage_completed events.
+  const events = boardFlowCache.flows.find(item => item?.run?.flow_id === run.flow_id)?.events;
+  const steps = flowStageSteps(snapshot.stages || [], run.stage, run.state, Array.isArray(events) ? events : [])
+    .map(step => `<li class="board-flow__step is-${esc(step.state)}"${step.state === 'current' ? ' aria-current="step"' : ''}><i aria-hidden="true"></i><span>${esc(step.name)}</span></li>`).join('');
+  const coordinator = run.coordinator?.agent_id;
+  const flowHref = id => `#flows/${esc(encodeURIComponent(String(id || '')))}`;
+  return `<section class="board-side__block board-flow">
+      <div class="board-side__head"><p class="eyebrow">Flow</p><a class="board-link" href="${flowHref(run.flow_id)}">Open in Flows</a></div>
+      <strong class="board-flow__name">${esc(snapshot.name || run.template_id || 'Flow')}</strong>
+      ${run.goal ? `<p class="board-flow__goal" title="${esc(run.goal)}">${esc(run.goal)}</p>` : ''}
+      ${steps ? `<ol class="board-flow__steps">${steps}</ol>` : `<p class="muted">Stage ${esc(run.stage || '—')}</p>`}
+      <dl class="board-flow__meta">
+        <div><dt>State</dt><dd>${esc(run.state || 'unknown')}</dd></div>
+        <div><dt>Coordinator</dt><dd>${coordinator ? agentChip(coordinator) : '<span class="muted">None</span>'}</dd></div>
+        <div><dt>Updated</dt><dd>${timeHtml(run.updated_at)}</dd></div>
+      </dl>
+      ${others.length ? `<details class="board-flow__others" data-detail-id="flow-others"><summary>${fmt(others.length)} other ${others.length === 1 ? 'flow' : 'flows'} on this board</summary>
+        <ul>${others.map(other => `<li><a class="board-link" href="${flowHref(other.flow_id)}" title="${esc(other.goal || '')}">${esc(other.goal || snapshot.name || 'Flow')}</a><small>${esc(other.state || '')} · ${timeHtml(other.updated_at)}</small></li>`).join('')}</ul></details>` : ''}
+    </section>`;
+}
+
+// The hero's summary fields (for example success criteria) as a collapsible
+// side block. A single field shows its value under its own label.
+function boardSummaryHtml(hero, fields, schema) {
+  const ids = Array.isArray(hero?.summary_fields) ? hero.summary_fields.filter(id => typeof id === 'string' && Object.hasOwn(fields, id) && !isEmptyValue(fields[id])) : [];
+  if (!ids.length) return '';
+  const definitions = fieldIndex(schema);
+  const label = ids.length === 1 ? definitions.get(ids[0])?.label || ids[0].replaceAll('_', ' ') : 'Summary';
+  const content = ids.length === 1 ? `<div class="board-side__value">${fieldValueHtml(fields[ids[0]])}</div>` : `<dl class="template-fields board-side__fields">${fieldRows(fields, schema, ids)}</dl>`;
+  return `<details class="board-side__block board-side__summary" data-detail-id="summary" open>
+      <summary class="board-side__head"><p class="eyebrow">${esc(label)}</p><span class="board-work__toggle">Show</span></summary>
+      ${content}
+    </details>`;
 }
 
 async function renderBoardDetail(snapshot) {
@@ -1324,7 +2112,16 @@ async function renderBoardDetail(snapshot) {
   // page when older history has not been loaded yet. Merge by sequence so a
   // latest-page fetch never renders duplicates.
   const posts = mergeBoardPosts(loadedPosts, snapshot.latestPosts || []);
-  const links = renderBoardLinks(board.links || []);
+  const partial = Boolean(snapshot.hasMore);
+  const components = Array.isArray(templateSnapshot?.presentation?.components) ? templateSnapshot.presentation.components : [];
+  const hero = components.find(component => component?.kind === 'hero') || null;
+  // The first post_groups section drives the tiles and the Work panel. Every
+  // status and count shown there comes from the task rollup.
+  const groupComponent = components.find(component => component?.kind === 'post_groups') || null;
+  const titles = new Map(posts.map(post => [post.sequence, postTitleParts(post).title || `Post ${post.sequence}`]));
+  boardLinkContext = { boardId: board.board_id, titles };
+  const view = groupComponent ? taskView(posts, board.board_id, groupComponent, instance, titles, new Set()) : null;
+  const links = renderBoardLinks(board.links || [], boardLinkContext, 6);
   const telemetryEvents = (state.status?.integrations || [])
     .flatMap(provider => (provider.events || []).map(event => ({ ...event, provider: provider.provider })));
   const postHtml = posts.map(post => {
@@ -1357,13 +2154,25 @@ async function renderBoardDetail(snapshot) {
   }).join('');
   const more = snapshot.hasMore
     ? `<div class="board-more"><button class="btn btn--quiet" type="button" id="board-more">Load next posts</button></div>` : '';
-  const components = Array.isArray(templateSnapshot?.presentation?.components) ? templateSnapshot.presentation.components : [];
-  const layout = (await Promise.all(components.map((component, index) => renderTemplateComponent(component, index, board, posts, instance, snapshot.hasMore, usedLinked)))).join('');
-  const hasHero = components.some(component => component?.kind === 'hero');
-  const unknownFields = board.fields && typeof board.fields === 'object' && !Array.isArray(board.fields)
-    ? Object.keys(board.fields).filter(id => !fieldIndex(templateSnapshot?.schema).has(id)) : [];
-  const unknownFieldRows = instance ? fieldRows(board.fields, templateSnapshot?.schema, unknownFields) : '';
+  const postCount = `${fmt(posts.length)}${partial ? '+' : ''}`;
+  const postWord = posts.length === 1 && !partial ? 'post' : 'posts';
+  const boardFields = board.fields && typeof board.fields === 'object' && !Array.isArray(board.fields) ? board.fields : {};
+  const goal = hero?.title_field && Object.hasOwn(boardFields, hero.title_field) && !isEmptyValue(boardFields[hero.title_field])
+    ? displayValue(boardFields[hero.title_field]) : '';
+  // Everything that reads boardLinkContext is built before the first await.
+  const workHtml = view ? workPanelHtml(view, partial) : '';
+  const activityHtml = view ? activityPanelHtml(posts, view, more, postCount) : '';
+  const tilesHtml = boardTilesHtml(board, view, posts, postCount, partial);
+  const summaryHtml = boardSummaryHtml(hero, boardFields, templateSnapshot?.schema);
+  const unknownFields = Object.keys(boardFields).filter(id => !fieldIndex(templateSnapshot?.schema).has(id));
+  const unknownFieldRows = instance ? fieldRows(boardFields, templateSnapshot?.schema, unknownFields) : '';
   const fallbackBoardFields = !instance ? fieldRows(board.fields, null) : '';
+  // Sections other than the hero and the main post_groups render as before.
+  const extraComponents = components.filter(component => component !== hero && component !== groupComponent);
+  const [sections, flows] = await Promise.all([
+    Promise.all(extraComponents.map((component, index) => renderTemplateComponent(component, index, board, posts, instance, partial, usedLinked))),
+    boardFlows(board.board_id),
+  ]);
   // A newer render, or a different board selection, owns the panel now.
   if (renderId !== state.boardRenderSeq || generation !== state.boardGeneration || state.selectedBoardId !== board.board_id) return;
   for (const id of state.linkedBoards.keys()) if (!usedLinked.has(id)) state.linkedBoards.delete(id);
@@ -1371,44 +2180,99 @@ async function renderBoardDetail(snapshot) {
   const viewport = document.querySelector('.viewport');
   const sameBoard = container.dataset.boardId === board.board_id;
   const scrollTop = viewport.scrollTop;
-  const openDetails = [...container.querySelectorAll('details[data-detail-id][open]')].map(item => item.dataset.detailId);
+  // Each disclosure keeps the state the reader left it in across live
+  // re-renders. The map outlives the DOM, so a task opened in the List is
+  // still open after a trip through Columns, which show no task rows.
+  if (!sameBoard) boardDetailState.clear();
+  else container.querySelectorAll('details[data-detail-id]').forEach(item => boardDetailState.set(item.dataset.detailId, item.open));
+  const detailState = boardDetailState;
+  boardTaskPosts = new Set(view ? view.rollup.rootsOf.keys() : []);
+  // Columns keep their sideways and in-column scroll positions too.
+  const kanbanScroll = sameBoard ? [...container.querySelectorAll('.board-kanban')].map(item => item.scrollLeft) : [];
+  const columnScroll = sameBoard ? new Map([...container.querySelectorAll('[data-col-scroll]')].map(item => [item.dataset.colScroll, item.scrollTop])) : new Map();
   container.dataset.boardId = board.board_id;
   const lastActivity = posts.at(-1)?.created_at;
-  const postCount = `${fmt(posts.length)}${snapshot.hasMore ? '+' : ''}`;
   const typeLabel = board.type && board.type !== 'general' ? `${board.type} board` : 'Board';
+  const sectionHtml = sections.filter(Boolean).join('');
+  const emptyHistory = '<div class="empty-state board-empty"><strong>No posts yet</strong><span>Agents add updates to this board with <code>board_post</code>. New posts appear here as they arrive.</span></div>';
+  // Without a work list the full history is the main panel. When template
+  // sections already summarize the posts, it starts folded.
+  const historyHtml = view ? '' : sectionHtml
+    ? `<details class="panel board-history" data-detail-id="history">
+        <summary class="panel__head"><div><p class="eyebrow">All posts</p><h2>${postCount} ${postWord} · oldest first</h2></div><span class="board-work__toggle">Show</span></summary>
+        <div class="board-timeline">${postHtml || emptyHistory}</div>${more}
+      </details>`
+    : `<section class="panel board-history">
+        <div class="panel__head"><div><p class="eyebrow">Activity</p><h2>${postCount} ${postWord} · oldest first</h2></div>${posts.length > 3 ? '<button type="button" class="btn btn--quiet" id="board-jump-latest">Jump to latest ↓</button>' : ''}</div>
+        <div class="board-timeline">${postHtml || emptyHistory}</div>${more}
+      </section>`;
+  const sideBlock = (title, body) => `<section class="board-side__block"><div class="board-side__head"><p class="eyebrow">${esc(title)}</p></div>${body}</section>`;
+  const side = [
+    boardFlowHtml(flows),
+    summaryHtml,
+    posts.length ? sideBlock('Contributors', contributorsHtml(posts)) : '',
+    (board.links || []).length ? sideBlock('Board links', links) : '',
+    unknownFieldRows ? sideBlock('Additional fields', `<p class="muted template-note">Not declared by the pinned template schema.</p><dl class="template-fields board-side__fields">${unknownFieldRows}</dl>`) : '',
+    fallbackBoardFields ? sideBlock('Board fields', `<dl class="template-fields board-side__fields">${fallbackBoardFields}</dl>`) : '',
+    instance ? `<section class="board-side__block">${templateProvenanceHtml(instance)}</section>` : '',
+  ].filter(Boolean).join('');
   container.innerHTML = `
     ${renderBoardTrail(board)}
-    <header class="board-detail__head">
-      <div class="board-detail__title">
-        <p class="eyebrow">${esc(typeLabel)} · <span class="mono">${esc(board.key)}</span></p>
-        ${hasHero ? `<p class="board-detail__subtitle">${esc(board.title || board.key)}</p>` : `<h2>${esc(board.title || board.key)}</h2>`}
-        <div class="board-stats">
-          <span><b>${postCount}</b> ${posts.length === 1 && !snapshot.hasMore ? 'post' : 'posts'}</span>
-          <span>Created ${timeHtml(board.created_at)}</span>
-          ${lastActivity ? `<span>Last post ${timeHtml(lastActivity)}</span>` : ''}
+    <div class="board-view">
+      <header class="board-head">
+        <div class="board-head__title">
+          <p class="eyebrow">${esc(typeLabel)} · <span class="mono">${esc(board.key)}</span></p>
+          <h2>${esc(board.title || board.key)}</h2>
+          ${goal ? `<p class="board-head__goal" title="${esc(goal)}">${esc(goal)}</p>` : ''}
+          <div class="board-stats">
+            <span><b>${postCount}</b> ${postWord}</span>
+            ${snapshot.pagingAll ? `<span class="board-stats__paging" role="status">Loading all posts… ${fmt(lastPostSequence(loadedPosts))} so far</span>` : ''}
+            ${lastActivity ? `<span>Last activity ${timeHtml(lastActivity)}</span>` : ''}
+            <span>Created ${timeHtml(board.created_at)}</span>
+          </div>
         </div>
-        ${instance ? templateProvenanceHtml(instance) : ''}
+        <div class="board-detail__badges"><span class="board-live" id="board-live" aria-live="polite">${boardLiveMarkerHtml(snapshot)}</span></div>
+      </header>
+      ${tilesHtml}
+      <div class="board-columns${side ? '' : ' board-columns--single'}">
+        <div class="board-main">${workHtml}${sectionHtml}${historyHtml}${activityHtml}</div>
+        ${side ? `<aside class="panel board-side" aria-label="Board context">${side}</aside>` : ''}
       </div>
-      <div class="board-detail__badges"><span class="board-live" id="board-live" aria-live="polite">${boardLiveMarkerHtml(snapshot)}</span><span class="board-source-label">Agent-authored</span></div>
-    </header>
-    ${posts.length ? contributorsHtml(posts) : ''}
-    ${layout ? `<div class="template-layout">${layout}</div>` : ''}
-    ${unknownFieldRows ? `<section class="template-section"><h3>Additional fields</h3><p class="muted template-note">These values are not declared by the pinned template schema.</p><dl class="template-fields">${unknownFieldRows}</dl></section>` : ''}
-    ${fallbackBoardFields ? `<section class="template-section"><h3>Board fields</h3><dl class="template-fields">${fallbackBoardFields}</dl></section>` : ''}
-    ${(board.links || []).length ? `<section class="board-detail__links"><h3>Board links</h3>${links}</section>` : ''}
-    ${layout ? `<details class="board-detail__posts board-raw-history" data-detail-id="raw-history">
-      <summary><span class="eyebrow">All posts</span> <span class="muted">${postCount} in posting order, with every field</span></summary>
-      <div class="board-timeline">${postHtml || '<div class="empty-state">No posts on this board yet.</div>'}</div>${more}
-    </details>` : `<section class="board-detail__posts">
-      <div class="board-history__head"><div><p class="eyebrow">Activity</p><h3>${postCount} ${posts.length === 1 && !snapshot.hasMore ? 'post' : 'posts'} · oldest first</h3></div>${posts.length > 3 ? `<button type="button" class="btn btn--quiet" id="board-jump-latest">Jump to latest ↓</button>` : ''}</div>
-      <div class="board-timeline">${postHtml || '<div class="empty-state board-empty"><strong>No posts yet</strong><span>Agents add updates to this board with <code>board_post</code>. New posts appear here as they arrive.</span></div>'}</div>${more}
-    </section>`}`;
-  for (const id of openDetails) container.querySelector(`details[data-detail-id="${CSS.escape(id)}"]`)?.setAttribute('open', '');
+    </div>`;
+  for (const [id, open] of detailState) {
+    const item = container.querySelector(`details[data-detail-id="${CSS.escape(id)}"]`);
+    if (item) item.open = open;
+  }
+  container.querySelectorAll('.board-kanban').forEach((item, index) => { if (kanbanScroll[index]) item.scrollLeft = kanbanScroll[index]; });
+  container.querySelectorAll('[data-col-scroll]').forEach(item => {
+    const top = columnScroll.get(item.dataset.colScroll);
+    if (top) item.scrollTop = top;
+  });
   if (sameBoard) viewport.scrollTop = scrollTop;
-  container.querySelectorAll('[data-board-link]').forEach(button => button.addEventListener('click', () => navigateBoardLink(
-    button.dataset.boardLink,
-    button.dataset.postSequence ? Number(button.dataset.postSequence) : null,
-  )));
+  container.querySelectorAll('[data-work-mode]').forEach(button => button.addEventListener('click', () => {
+    if (button.dataset.workMode !== workMode) setWorkMode(button.dataset.workMode);
+  }));
+  // A card toggles its task's details under the columns. The mode and the
+  // page stay put; a keyboard press (click detail 0) moves focus to the heading.
+  container.querySelectorAll('[data-task-open]').forEach(button => button.addEventListener('click', event => {
+    const scope = button.dataset.taskScope;
+    const sequence = Number(button.dataset.taskOpen);
+    if (workOpenTask.get(scope) === sequence) closeWorkTask(scope, { restoreFocus: event.detail === 0 });
+    else openWorkTask(scope, sequence, { keyboard: event.detail === 0 });
+  }));
+  container.querySelectorAll('[data-task-detail-area]').forEach(area => area.addEventListener('click', event => {
+    if (!event.target.closest('[data-task-close]')) return;
+    const scope = area.closest('[data-work-scope]')?.dataset.workScope;
+    if (scope) closeWorkTask(scope, { restoreFocus: true });
+  }));
+  container.querySelectorAll('[data-work-collapse]').forEach(button => button.addEventListener('click', () => {
+    const group = button.closest('[data-work-group]');
+    if (!group) return;
+    const collapsed = !group.classList.contains('is-collapsed');
+    setWorkGroupCollapsed(board.board_id, button.dataset.workCollapse, collapsed);
+    applyWorkGroupCollapsed(group, collapsed);
+  }));
+  bindBoardLinkButtons(container);
   container.querySelectorAll('[data-post-focus]').forEach(button => button.addEventListener('click', () => focusBoardPost(Number(button.dataset.postFocus))));
   container.querySelectorAll('[data-trail-index]').forEach(button => button.addEventListener('click', () => {
     const index = Number(button.dataset.trailIndex);
@@ -1420,9 +2284,9 @@ async function renderBoardDetail(snapshot) {
   bindBoardLiveMarker(snapshot);
   bindPostFolds(container);
   noteBoardSnapshotMeta(snapshot);
-  container.querySelector('#board-jump-latest')?.addEventListener('click', () => {
+  container.querySelector('#board-jump-latest')?.addEventListener('click', async () => {
     const latestSequence = posts.at(-1)?.sequence;
-    if (latestSequence != null && focusBoardPost(latestSequence)) return;
+    if (latestSequence != null && await focusBoardPost(latestSequence)) return;
     container.querySelector('.board-timeline > .board-post:last-child')?.scrollIntoView({ behavior: stillness.matches ? 'auto' : 'smooth', block: 'start' });
   });
   container.querySelector('#board-more')?.addEventListener('click', () => loadBoardPosts(board.board_id, snapshot.nextAfter, true));
@@ -1886,14 +2750,56 @@ function sessionsFor(events) {
     .sort((a, b) => b.last_seen_ms - a.last_seen_ms);
 }
 
-function cycleAnalytics(events) {
-  const isPrompt = event => event.prompt_preview || /^(UserPromptSubmit|UserPromptExpansion|BeforeAgent)$/i.test(event.event);
-  const isStop = event => event.stop_response_preview || /^(Stop|AfterAgent|SessionEnd)$/i.test(event.event);
+// Run-cycle figures. With `counters` (the server's cumulative per-provider
+// counters) every figure covers the whole ledger. Without them (older server
+// builds) the figures come from the retained event window only, and the
+// result carries `scope` text naming that window so the page never presents
+// a window count as a total. A figure that cannot be known is `null`.
+function cycleAnalytics(events, counters = null) {
+  const times = events.map(event => Number(event.timestamp_ms)).filter(value => value > 0);
+  const from = times.length ? Math.min(...times) : null;
+  const to = times.length ? Math.max(...times) : null;
+  const span = ms => {
+    const s = Math.max(0, ms) / 1000;
+    if (s < 90) return `${Math.round(s)}s`;
+    if (s < 5400) return `${Math.round(s / 60)} min`;
+    if (s < 172800) return `${(s / 3600).toFixed(1)} h`;
+    return `${Math.round(s / 86400)} days`;
+  };
+  const retained = {
+    count: events.length, from, to,
+    label: events.length ? `last ${fmt(events.length)} events, ${span(to - from)}` : 'no retained events'
+  };
+  if (counters) {
+    const prompts = Number(counters.prompts || 0);
+    const completed = Number(counters.cycles_completed || 0);
+    const toolCalls = Number(counters.tool_calls || 0);
+    const since = Number(counters.since_ms || 0);
+    return {
+      cumulative: true,
+      window: retained,
+      scope: since ? `Since ${new Date(since).toLocaleString()}` : 'Cumulative',
+      prompts,
+      toolCalls,
+      responses: Number(counters.tool_results || 0),
+      stops: Number(counters.stops || 0),
+      completed,
+      completionRate: prompts ? Math.min(1, completed / prompts) : null,
+      averageTools: prompts ? toolCalls / prompts : null,
+      averageDuration: counters.cycle_duration_avg_ms ?? null,
+      p50Duration: counters.cycle_duration_p50_ms ?? null,
+      p95Duration: counters.cycle_duration_p95_ms ?? null,
+      reason: prompts ? '' : 'No prompts recorded yet.',
+      tokenUsage: tokenAccounting([], prompts, counters)
+    };
+  }
+  const isPrompt = event => /^(UserPromptSubmit|BeforeAgent)$/i.test(event.event);
+  const isStop = event => /^(Stop|AfterAgent|SessionEnd)$/i.test(event.event);
   const prompts = events.filter(isPrompt);
-  const toolCalls = events.filter(event => event.tool_name);
+  const toolCalls = events.filter(event => /^(PreToolUse|BeforeTool)$/i.test(event.event));
   const responses = events.filter(event => event.tool_response_preview);
+  const stops = events.filter(event => /^(Stop|AfterAgent)$/i.test(event.event));
   const usageEvents = events.filter(event => [event.input_tokens, event.output_tokens, event.total_tokens].some(Number.isFinite));
-  const sumTokens = field => usageEvents.reduce((sum, event) => sum + Number(event[field] || 0), 0);
   const durations = [];
   sessionsFor(events).forEach(session => session.events.forEach((event, index) => {
     if (!isPrompt(event)) return;
@@ -1901,13 +2807,20 @@ function cycleAnalytics(events) {
     if (stop) durations.push(Math.max(0, stop.timestamp_ms - event.timestamp_ms));
   }));
   return {
+    cumulative: false,
+    window: retained,
+    scope: `Window: ${retained.label}`,
     prompts: prompts.length,
     toolCalls: toolCalls.length,
     responses: responses.length,
-    stops: durations.length,
-    completionRate: prompts.length ? durations.length / prompts.length : 0,
-    averageTools: prompts.length ? toolCalls.length / prompts.length : 0,
-    averageDuration: durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : 0,
+    stops: stops.length,
+    completed: durations.length,
+    completionRate: prompts.length ? durations.length / prompts.length : null,
+    averageTools: prompts.length ? toolCalls.length / prompts.length : null,
+    averageDuration: durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : null,
+    p50Duration: null,
+    p95Duration: null,
+    reason: prompts.length ? '' : `No prompts in the ${retained.label}. Busy providers fill the window with retrieval and tool events; totals need a server build with cumulative counters.`,
     tokenUsage: tokenAccounting(usageEvents, prompts.length)
   };
 }
@@ -1917,8 +2830,12 @@ function cycleAnalytics(events) {
 // cache reads. Real context sent = all three summed. The provider's own
 // `total_tokens` ignores both cache fields, so it is recomputed here rather
 // than trusted — reading it directly under-reports a cached turn enormously.
-function tokenAccounting(usageEvents, promptCount) {
-  const sum = field => usageEvents.reduce((total, event) => total + Number(event[field] || 0), 0);
+// With `counters`, the sums come from the server's cumulative token counters,
+// which use the same disjoint fields.
+function tokenAccounting(usageEvents, promptCount, counters = null) {
+  const sum = field => counters
+    ? Number(counters[field] || 0)
+    : usageEvents.reduce((total, event) => total + Number(event[field] || 0), 0);
   const fresh = sum('input_tokens');
   const cacheWrite = sum('cache_creation_input_tokens');
   const cacheRead = sum('cache_read_input_tokens');
@@ -1926,58 +2843,46 @@ function tokenAccounting(usageEvents, promptCount) {
   const contextIn = fresh + cacheWrite + cacheRead;
   const total = contextIn + output;
   return {
-    available: usageEvents.length > 0,
+    available: counters ? Number(counters.usage_events || 0) > 0 : usageEvents.length > 0,
     fresh, cacheWrite, cacheRead, output, contextIn, total,
     cacheHitRate: contextIn ? cacheRead / contextIn : 0,
-    averageTotal: promptCount ? total / promptCount : 0,
-    reportedTotal: sum('total_tokens')
+    averageTotal: promptCount ? total / promptCount : null,
+    reportedTotal: counters ? Number(counters.reported_total_tokens || 0) : sum('total_tokens')
   };
 }
 
 function delegationAnalytics(events) {
   const starts = events.filter(event => event.event === 'SubagentStart');
   const stops = events.filter(event => event.event === 'SubagentStop');
-  const usageByAgent = new Map();
-  events.filter(event => event.event === 'TurnUsage' && (event.agent_id || event.agent_type)).forEach(event => {
-    const key = event.agent_id || event.agent_type;
-    const usage = usageByAgent.get(key) || { fresh: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
-    usage.fresh += Number(event.input_tokens || 0);
-    usage.cacheWrite += Number(event.cache_creation_input_tokens || 0);
-    usage.cacheRead += Number(event.cache_read_input_tokens || 0);
-    usage.output += Number(event.output_tokens || 0);
-    usageByAgent.set(key, usage);
-  });
-  const usedStops = new Set();
-  const runs = starts.map(start => {
-    const stopIndex = stops.findIndex((stop, index) => !usedStops.has(index)
-      && (start.agent_id && stop.agent_id ? start.agent_id === stop.agent_id : stop.timestamp_ms >= start.timestamp_ms));
-    const stop = stopIndex >= 0 ? stops[stopIndex] : null;
-    if (stop) usedStops.add(stopIndex);
-    return { start, stop, duration: stop ? Math.max(0, stop.timestamp_ms - start.timestamp_ms) : null };
-  });
-  const known = new Set(runs.map(run => run.start.agent_id || run.start.agent_type).filter(Boolean));
-  usageByAgent.forEach((usage, key) => {
-    if (!known.has(key)) runs.push({ start: { agent_id: key }, stop: null, duration: null, usageOnly: true });
+  const runs = inferSubagentEnds(pairSubagentRuns(starts, stops), events);
+  const usageEvents = events.filter(event => event.event === 'TurnUsage');
+  attributeSubagentUsage(runs, usageEvents).forEach((usage, key) => {
+    runs.push({ start: { agent_id: key }, stop: null, duration: null, usageOnly: true, usage });
   });
   const completed = runs.filter(run => run.stop);
   return {
     starts: starts.length,
     completed: completed.length,
-    active: runs.filter(run => !run.stop).length,
+    active: runs.filter(run => !run.stop && !run.interrupted && !run.ended && !run.usageOnly).length,
+    unfinished: runs.filter(run => run.interrupted || run.ended === 'session_ended').length,
     averageDuration: completed.length ? completed.reduce((sum, run) => sum + run.duration, 0) / completed.length : 0,
-    usageByAgent,
+    hasUsage: runs.some(run => run.usage),
     runs: runs.sort((a, b) => (b.start.timestamp_ms || 0) - (a.start.timestamp_ms || 0)).slice(0, 8)
   };
 }
 
 function renderCyclePanel(stats) {
   const step = (label, value, note) => `<div class="flow-step"><em>${value}</em><strong>${label}</strong><small>${note}</small></div>`;
+  const known = (value, format) => value == null ? '—' : format(value);
+  const cycleNote = stats.p50Duration != null
+    ? `<small>p50 ≤ ${seconds(stats.p50Duration)} · p95 ≤ ${seconds(stats.p95Duration)}</small>` : '';
   return `
     <section class="panel">
       <div class="panel__head">
         <div><p class="eyebrow">Agent run cycle</p><h2>Execution flow</h2></div>
         <span class="panel__note">Prompt to final response</span>
       </div>
+      <p class="metric-scope ${stats.cumulative ? '' : 'metric-scope--window'}">${esc(stats.scope)}</p>
       <div class="flow">
         ${step('Prompts', fmt(stats.prompts), 'submitted')}
         ${step('Tool work', fmt(stats.toolCalls), 'invocations')}
@@ -1985,10 +2890,11 @@ function renderCyclePanel(stats) {
         ${step('Stops', fmt(stats.stops), 'completed')}
       </div>
       <div class="figure-row">
-        <div><span>Completion rate</span><strong>${pct(stats.completionRate)}</strong></div>
-        <div><span>Avg. tools / prompt</span><strong>${stats.averageTools.toFixed(1)}</strong></div>
-        <div><span>Avg. cycle time</span><strong>${seconds(stats.averageDuration)}</strong></div>
+        <div><span>Completion rate</span><strong>${known(stats.completionRate, pct)}</strong></div>
+        <div><span>Avg. tools / prompt</span><strong>${known(stats.averageTools, value => value.toFixed(1))}</strong></div>
+        <div><span>Avg. cycle time</span><strong>${known(stats.averageDuration, seconds)}</strong>${cycleNote}</div>
       </div>
+      ${stats.reason ? `<p class="metric-reason">${esc(stats.reason)}</p>` : ''}
     </section>`;
 }
 
@@ -1998,9 +2904,13 @@ function renderTokenPanel(stats) {
     <div class="panel__head">
       <div><p class="eyebrow">Token usage</p><h2>Context accounting</h2></div>
       <span class="panel__note">Cache-aware</span>
-    </div>`;
+    </div>
+    <p class="metric-scope ${stats.cumulative ? '' : 'metric-scope--window'}">${esc(stats.scope)}</p>`;
   if (!usage.available) {
-    return `<section class="panel">${head}<div class="empty-state">No provider token usage has been reported yet.</div></section>`;
+    const reason = stats.cumulative
+      ? 'No token usage has been reported since counting began.'
+      : `— No token usage in the ${stats.window.label}. Totals beyond this window need a server build with cumulative counters.`;
+    return `<section class="panel">${head}<div class="empty-state">${esc(reason)}</div></section>`;
   }
   const value = (label, amount, note) => `<div><span>${label}</span><strong>${amount}</strong><small>${note}</small></div>`;
   const parts = [
@@ -2026,26 +2936,54 @@ function renderTokenPanel(stats) {
         ${value('Cache hit rate', pct(usage.cacheHitRate), 'context served from cache')}
       </div>
       ${composition}
-      <p class="token-note">Avg. ${fmt(Math.round(usage.averageTotal))} tokens / prompt. Provider-reported total is ${fmt(usage.reportedTotal)} — it counts neither cache reads nor cache writes.</p>
+      <p class="token-note">${usage.averageTotal == null ? 'Avg. per prompt unknown: no prompts counted.' : `Avg. ${fmt(Math.round(usage.averageTotal))} tokens / prompt.`} Provider-reported total is ${fmt(usage.reportedTotal)} — it counts neither cache reads nor cache writes.</p>
     </section>`;
 }
 
-function renderDelegationPanel(events) {
+// `events` should include the milestone events so subagent runs are not
+// evicted by tool bursts. With `counters`, the headline counts are cumulative
+// and the rows show the most recent runs. Active never comes from starts minus
+// stops, which would count an interrupted run as active forever. Servers that
+// track open subagents give cumulative Active and Did not finish figures;
+// otherwise both come from the paired runs in the retained events.
+function renderDelegationPanel(events, counters = null) {
   const stats = delegationAnalytics(events);
-  if (!stats.starts && !stats.completed && !stats.usageByAgent.size) return '';
+  if (counters) {
+    stats.starts = Number(counters.subagent_starts || 0);
+    stats.completed = Number(counters.subagent_stops || 0);
+  }
+  const tracked = Boolean(counters?.open_subagents);
+  let quiet = 0;
+  if (tracked) {
+    const now = Date.now();
+    const open = Object.values(counters.open_subagents);
+    stats.active = open.filter(entry => now - Number(entry.last_seen_ms || 0) <= SUBAGENT_IDLE_MS).length;
+    quiet = open.length - stats.active;
+    stats.unfinished = Number(counters.subagent_interrupted || 0) + Number(counters.subagent_ended_without_stop || 0);
+  }
+  if (!stats.starts && !stats.completed && !stats.hasUsage) return '';
+  const rowState = run => run.stop ? ['completed', 'completed', seconds(run.duration)]
+    : run.interrupted ? ['interrupted', 'interrupted', 'did not finish']
+    : run.ended === 'session_ended' ? ['ended', 'ended', 'ended without stop']
+    : run.ended === 'idle' ? ['quiet', 'quiet', 'no recent activity']
+    : run.usageOnly ? ['usage', 'usage only', 'no lifecycle events']
+    : ['running', 'running', 'in progress'];
   const rows = stats.runs.map(run => {
     const label = run.start.agent_type || run.start.agent_id || 'Subagent';
     const id = run.start.agent_type ? run.start.agent_id || '' : '';
-    const status = run.stop ? 'completed' : 'running';
-    const usage = stats.usageByAgent.get(run.start.agent_id || run.start.agent_type);
+    const [tone, status, note] = rowState(run);
+    const usage = run.usage;
     const usageTotal = usage ? usage.fresh + usage.cacheWrite + usage.cacheRead + usage.output : 0;
     return `
       <div class="delegation-row">
         <div><strong>${esc(label)}</strong><small>${esc(id || 'delegated task')} · ${clock(run.start.timestamp_ms)}${usage ? ` · ${fmt(usageTotal)} tokens` : ''}</small></div>
-        <span class="delegation-duration ${status}">${run.duration == null ? 'in progress' : seconds(run.duration)}</span>
+        <span class="delegation-duration ${tone}">${note}</span>
         <span class="badge ${run.stop ? 'active' : 'idle'}">${status}</span>
       </div>`;
   }).join('');
+  const scope = !counters ? 'Counts from the retained event window only.'
+    : tracked ? `Counts since counting began; rows are the most recent runs. Did not finish counts runs that were resumed or whose session ended without a stop.${quiet ? ` ${fmt(quiet)} open ${quiet === 1 ? 'run has' : 'runs have'} had no activity for 30 minutes and ${quiet === 1 ? 'is' : 'are'} in neither Active nor Did not finish.` : ''}`
+    : 'Started and Completed count since counting began; Active and Did not finish come from recent events, so they need not add up.';
   return `
     <section class="panel">
       <div class="panel__head">
@@ -2056,8 +2994,10 @@ function renderDelegationPanel(events) {
         <div><span>Started</span><strong>${fmt(stats.starts)}</strong></div>
         <div><span>Completed</span><strong>${fmt(stats.completed)}</strong></div>
         <div><span>Active</span><strong>${fmt(stats.active)}</strong></div>
-        <div><span>Avg. duration</span><strong>${seconds(stats.averageDuration)}</strong></div>
+        <div><span>Did not finish</span><strong>${fmt(stats.unfinished)}</strong></div>
+        <div><span>Avg. duration</span><strong>${seconds(stats.averageDuration)}</strong><small>recent runs</small></div>
       </div>
+      <p class="metric-scope ${tracked ? '' : 'metric-scope--window'}">${scope}</p>
       <div>${rows}</div>
     </section>`;
 }
@@ -2117,7 +3057,16 @@ function renderProvider(provider) {
   }, {});
   const calls = toolEvents.filter(event => !state.tool || toolGroup(event.tool_name) === state.tool).slice(0, 30);
   const details = Object.entries(detailsByGroup[state.tool] || {}).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  const stats = cycleAnalytics(events);
+  // Cumulative counters exist only on newer servers; older ones send none and
+  // every figure falls back to the retained window, labelled as such.
+  const counters = provider.counters || null;
+  const stats = cycleAnalytics(events, counters);
+  const windowLabel = stats.window.label;
+  // Milestone events (prompts, stops, usage, subagents) are kept apart from
+  // the window on newer servers so delegation rows survive tool bursts.
+  const seen = new Set(events.map(event => event.event_id));
+  const withMilestones = events.concat((provider.milestone_events || []).filter(event => !seen.has(event.event_id)));
+  const toolCallTotal = counters ? Number(counters.tool_calls || 0) : toolEvents.filter(event => /^(PreToolUse|BeforeTool)$/i.test(event.event)).length;
 
   document.querySelector('#provider-view').innerHTML = `
     <div class="provider-head">
@@ -2132,20 +3081,20 @@ function renderProvider(provider) {
     </div>
 
     <div class="row row--halves">${renderCyclePanel(stats)}${renderTokenPanel(stats)}</div>
-    ${renderDelegationPanel(events)}
+    ${renderDelegationPanel(withMilestones, counters)}
 
     <div class="stat-row">
       <article class="stat"><span>Documents</span><strong>${fmt(indexes.reduce((sum, index) => sum + Number(index.source_document_count || 0), 0))}</strong><small>${fmt(indexes.length)} private memory stores</small></article>
       <article class="stat"><span>Records</span><strong>${fmt(indexes.reduce((sum, index) => sum + Number(index.record_count || 0), 0))}</strong><small>across private memory stores</small></article>
-      <article class="stat"><span>Sessions</span><strong>${fmt(sessions.length)}</strong><small>${fmt(provider.sessions_active)} currently active</small></article>
-      <article class="stat"><span>Tool calls</span><strong>${fmt(toolEvents.length)}</strong><small>${fmt(tools.length)} categories</small></article>
+      <article class="stat"><span>Sessions</span><strong>${fmt(provider.sessions_started)}</strong><small>started in total · ${fmt(provider.sessions_active)} active · ${fmt(sessions.length)} in ${esc(windowLabel)}</small></article>
+      <article class="stat"><span>Tool calls</span><strong>${fmt(toolCallTotal)}</strong><small>${counters ? 'in total' : `in ${esc(windowLabel)}`} · ${fmt(tools.length)} categories recently</small></article>
     </div>
 
     <div class="row row--narrow-first">
       <section class="panel">
         <div class="sub-head">
           <div><p class="eyebrow">Session history</p><h2>Sessions</h2></div>
-          <span class="panel__note">${sessions.length ? `${sessions.length} observed` : 'None'}</span>
+          <span class="panel__note">${sessions.length ? `${sessions.length} in ${esc(windowLabel)}` : 'None in the retained window'}</span>
         </div>
         <div class="scroll-list">${renderSessions(sessions)}</div>
       </section>
@@ -2169,7 +3118,7 @@ function renderProvider(provider) {
       <section class="panel">
         <div class="sub-head">
           <div><p class="eyebrow">Tool categories</p><h2>Frequently used tools</h2></div>
-          <span class="panel__note">Select for details</span>
+          <span class="panel__note">${esc(windowLabel)} · select for details</span>
         </div>
         <div class="tool-grid">${tools.length ? tools.map(([name, count]) => {
           const top = Object.entries(detailsByGroup[name] || {}).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 3);
@@ -2186,7 +3135,7 @@ function renderProvider(provider) {
     <section class="panel">
       <div class="sub-head">
         <div><p class="eyebrow">Call history</p><h2>${state.tool ? esc(state.tool) : 'All tool categories'}</h2></div>
-        <span class="panel__note">${calls.length} most recent</span>
+        <span class="panel__note">${calls.length} most recent · ${esc(windowLabel)}</span>
       </div>
       <div>${calls.length ? calls.map(event => renderToolCall(event, 'history')).join('') : '<div class="empty-state">No tool calls match this filter.</div>'}</div>
     </section>`;

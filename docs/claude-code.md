@@ -6,6 +6,9 @@ save useful outcomes as work continues. Project memory is stored in
 
 ## 1. Install Membrick
 
+You can [ask Claude Code to install Membrick for this project](quickstart.md#ask-codex-or-claude-code-to-install-it)
+by pasting the ready-to-use prompt from the Quickstart.
+
 On macOS or Linux, download and verify the official release with:
 
 ```bash
