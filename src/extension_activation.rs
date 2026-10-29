@@ -16,9 +16,9 @@ pub enum ActivationBlocker {
     MaintainedSandboxProfileUnavailable,
     /// The current registry cannot own a dynamically loaded extension handler.
     OwnedRegistryBridgeUnavailable,
-    /// The Wasm worker has no parent-mediated, per-hop capability RPC bridge.
+    /// A separate worker has no parent-mediated, per-hop capability RPC bridge.
     CapabilityRpcUnavailable,
-    /// Extension-specific document scoping is not wired to admitted Wasm grants.
+    /// Extension-specific document scoping is not wired to admitted grants.
     ScopedDocumentAuthorizationUnavailable,
 }
 

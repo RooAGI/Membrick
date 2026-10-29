@@ -67,7 +67,6 @@ nav:
       - Overview: extensions/index.md
       - Build an extension: extensions/building.md
       - Extension security: extensions/security.md
-      - Experimental Wasm runtime: extensions/runtime.md
       - Board and Post: extensions/board-post.md
       - FlowRun: extensions/flowrun.md
   - API reference:

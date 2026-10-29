@@ -47,5 +47,4 @@ Do not load an unknown native library into the Membrick process. A future
 independent-install model would need a separate process, a narrow host API, and
 operating-system-enforced limits on filesystem, network, and resource access.
 That is a separate design and is not required for the current reviewed,
-compiled-in model. The experimental worker described in [Wasm runtime](runtime.md)
-is not connected to extension dispatch and does not provide this capability.
+compiled-in model.

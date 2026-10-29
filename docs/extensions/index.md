@@ -37,8 +37,7 @@ install extension code into a running Membrick process.
 See [Board and Post](board-post.md), [FlowRun](flowrun.md), or the
 [extension author guide](building.md) for implementation details. The
 [security guide](security.md) explains the trust boundary for compiled-in
-extensions. The separate [experimental Wasm worker](runtime.md) is not an
-extension loader and is not used to activate extensions.
+extensions.
 
 Flowboard now has a separate stdio MCP process in its own repository. It uses
 `membrick::Memory` to reach the resident. Board/Post REST routes still use the
