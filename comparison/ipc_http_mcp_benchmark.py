@@ -209,7 +209,8 @@ def start_server(
     try:
         if transport == "ipc":
             endpoint = socket_path_for(root)
-        startup_ms = wait_ready(transport, endpoint, root)
+        wait_ready(transport, endpoint, root)
+        startup_ms = (time.perf_counter() - started) * 1000
     except Exception:
         process.terminate()
         process.wait(timeout=10)
@@ -237,6 +238,12 @@ def run_repetition(
     root_base: Path,
 ) -> dict[str, Any]:
     root = (root_base / f"{transport}-{run_number}").resolve()
+    state = root / ".membrick"
+    state.mkdir(parents=True)
+    (state / "server.toml").write_text(
+        f"project_root = {json.dumps(str(root))}\n",
+        encoding="utf-8",
+    )
     docs = root / "benchmark-docs"
     docs.mkdir(parents=True)
     for index in range(100):
