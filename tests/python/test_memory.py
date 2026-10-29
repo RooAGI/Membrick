@@ -113,10 +113,10 @@ class TestRemoteLifecycle(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind(("127.0.0.1", 0))
             cls.port = probe.getsockname()[1]
-        # The server rejects paths that traverse macOS's /var -> /private/var
-        # symlink, so keep its test workspace under the canonical temp root.
+        # Use the canonical temp root because the server rejects paths that
+        # traverse symlinks (for example macOS's /var -> /private/var).
         cls.tmpdir = tempfile.mkdtemp(
-            prefix="membrick-remote-test-", dir="/private/tmp"
+            prefix="membrick-remote-test-", dir=os.path.realpath(tempfile.gettempdir())
         )
         # Scrub ambient auth config so the test controls the server's
         # credentials exactly (JWT auth is env-only; token via CLI flag).

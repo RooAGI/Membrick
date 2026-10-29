@@ -1,0 +1,11 @@
+# Tantivy 0.25.0 uses only zstd's bulk APIs. These three advisories affect
+# context-reuse stream constructors, the streaming write decoder, and the
+# optional seekable API respectively; none are enabled or called by Tantivy's
+# bulk block codec. Membrick's own stream encoder/decoder uses zstd 0.14.3.
+# Recheck this exception when Tantivy or its zstd feature graph changes.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0398",
+]

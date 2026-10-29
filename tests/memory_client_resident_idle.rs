@@ -1,5 +1,5 @@
 use membrick::{AddOptions, Memory, MemoryOptions, Message};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn project_root() -> PathBuf {

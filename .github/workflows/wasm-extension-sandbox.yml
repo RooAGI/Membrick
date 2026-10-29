@@ -24,6 +24,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+      - name: Permit Bubblewrap user namespaces on the ephemeral runner
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run Linux sandbox integration tests
         run: cargo test --manifest-path crates/membrick-wasm-extension-runtime/Cargo.toml --locked --test linux_bubblewrap
       - name: Run runtime test suite

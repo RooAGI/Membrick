@@ -114,9 +114,7 @@ pub fn install_local_config(root: &Path, config_path: Option<&Path>) -> Result<P
         .get(SERVER_NAME)
         .is_some_and(is_manager_entry)
     {
-        config
-            .mcp_servers
-            .insert(SERVER_NAME.to_string(), manager_entry(&executable));
+        refresh_manager_entry(&mut config, &executable);
     } else {
         migrate_legacy_manager_entry(&mut config, &executable);
     }
@@ -240,9 +238,19 @@ fn install_user_manager_entry(config: &mut ClaudeConfig, executable: &str) {
         );
     }
     config.mcp_servers.remove(LEGACY_MANAGER_SERVER_NAME);
-    config
+    refresh_manager_entry(config, executable);
+}
+
+fn refresh_manager_entry(config: &mut ClaudeConfig, executable: &str) {
+    let entry = config
         .mcp_servers
-        .insert(SERVER_NAME.to_string(), manager_entry(executable));
+        .entry(SERVER_NAME.to_string())
+        .or_insert_with(|| manager_entry(executable));
+    let object = entry
+        .as_object_mut()
+        .expect("a replaceable Claude MCP entry is a JSON object");
+    object.insert("command".to_string(), json!(executable));
+    object.insert("args".to_string(), json!([MANAGER_SERVE_ARG]));
 }
 
 /// Move a legacy user-scope `membrick_manager` entry to `membrick` when that
