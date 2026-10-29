@@ -181,7 +181,7 @@ The verification matrix across these changes must cover:
 - Retry limits and behavior for definitively rejected versus uncertain writes.
 
 Do not migrate a consumer to behavior that has not passed its stage gate. Keep
-each stage's examples and the [Quickstart](../README.md) aligned with the
+each stage's examples and the [Quickstart](quickstart.md) aligned with the
 surfaces actually released.
 
 ## Open implementation decisions
