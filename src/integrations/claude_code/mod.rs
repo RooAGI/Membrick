@@ -846,7 +846,7 @@ impl ClaudeMcp {
                     Err(message) => return Ok(error_response(id, -32602, &message)),
                 };
                 let started = std::time::Instant::now();
-                let results = service.search_with_filters(
+                let results = service.search_with_filters_and_comparison_operands(
                     query,
                     crate::integrations::session_recording::RecordingProvider::Claude.as_str(),
                     session_id.as_deref(),
@@ -858,10 +858,16 @@ impl ClaudeMcp {
                     &self.root,
                     started.elapsed().as_millis() as u64,
                     results.is_err(),
-                    results.as_ref().is_ok_and(Vec::is_empty),
+                    results
+                        .as_ref()
+                        .is_ok_and(|(results, _)| results.is_empty()),
                 );
-                let results = results?;
-                let payload = service.search_results_payload(query, results);
+                let (results, comparison_operands) = results?;
+                let payload = service.search_results_payload_with_comparison_operands(
+                    query,
+                    results,
+                    &comparison_operands,
+                );
                 Ok(JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,

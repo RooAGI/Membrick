@@ -278,6 +278,26 @@ impl MemoryService {
         filters: &BTreeMap<String, String>,
         reference_date: Option<&str>,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
+        self.search_with_filters_and_comparison_operands(
+            query,
+            scope,
+            session_id,
+            top_k,
+            filters,
+            reference_date,
+        )
+        .map(|(results, _)| results)
+    }
+
+    pub(crate) fn search_with_filters_and_comparison_operands(
+        &mut self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filters: &BTreeMap<String, String>,
+        reference_date: Option<&str>,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
         // Query-time key-phrase backfill: documents written by provider
         // hooks (separate short-lived processes whose background workers
         // die with them) get their phrases extracted synchronously here, so
@@ -287,7 +307,7 @@ impl MemoryService {
         self.flush()?;
         if self.requires_visibility_allow_list() {
             let allowed_doc_ids = self.visible_doc_ids_matching(filters);
-            self.search_with_filters_cached_and_allowed_doc_ids(
+            self.search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
                 query,
                 scope,
                 session_id,
@@ -297,7 +317,7 @@ impl MemoryService {
                 Some(&allowed_doc_ids),
             )
         } else {
-            self.search_with_filters_cached(
+            self.search_with_filters_cached_and_comparison_operands(
                 query,
                 scope,
                 session_id,
@@ -516,7 +536,30 @@ impl MemoryService {
         filters: &BTreeMap<String, String>,
         reference_date: Option<&str>,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
-        self.search_with_filters_cached_and_allowed_doc_ids(
+        self.search_with_filters_cached_and_comparison_operands(
+            query,
+            scope,
+            session_id,
+            top_k,
+            filters,
+            reference_date,
+        )
+        .map(|(results, _)| results)
+    }
+
+    /// Search and return the comparison operands from the same analysis used
+    /// for retrieval, so MCP response formatting doesn't analyze the query
+    /// again.
+    pub(super) fn search_with_filters_cached_and_comparison_operands(
+        &self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filters: &BTreeMap<String, String>,
+        reference_date: Option<&str>,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
+        self.search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
             query,
             scope,
             session_id,
@@ -537,6 +580,28 @@ impl MemoryService {
         reference_date: Option<&str>,
         additional_allowed_doc_ids: Option<&HashSet<String>>,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
+        self.search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
+            query,
+            scope,
+            session_id,
+            top_k,
+            filters,
+            reference_date,
+            additional_allowed_doc_ids,
+        )
+        .map(|(results, _)| results)
+    }
+
+    fn search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
+        &self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filters: &BTreeMap<String, String>,
+        reference_date: Option<&str>,
+        additional_allowed_doc_ids: Option<&HashSet<String>>,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
         // Prepare the question once. Session follow-ups must be resolved from
         // the raw question before PreparedQuery derives its analysis and
         // augmented lexical search text.
@@ -563,6 +628,14 @@ impl MemoryService {
                 reference_date,
                 Arc::clone(&reasoning_rules),
             )
+        };
+        let comparison_operands = if prepared.analysis().intent
+            == crate::query_semantics::QueryIntent::Compare
+            && prepared.analysis().comparison_operands.len() == 2
+        {
+            prepared.analysis().comparison_operands.clone()
+        } else {
+            Vec::new()
         };
         // Synthetic document terms (Luyi 2026-10-07): bekind's mapping lives
         // in the index, not in the query. Each document's canonical
@@ -597,13 +670,12 @@ impl MemoryService {
         } else {
             top_k
         };
-        let comparison_operands = &prepared.analysis().comparison_operands;
         let is_explicit_comparison = prepared.analysis().intent
             == crate::query_semantics::QueryIntent::Compare
             && comparison_operands.len() == 2;
         let mut lexical = if is_explicit_comparison {
             let mut per_operand = Vec::with_capacity(comparison_operands.len());
-            for operand in comparison_operands {
+            for operand in &comparison_operands {
                 let operand_prepared = match reference_date {
                     Some(date) => PreparedQuery::new_at_with_rules(
                         operand,
@@ -767,7 +839,7 @@ impl MemoryService {
             &prepared,
             &results,
         );
-        Ok(results)
+        Ok((results, comparison_operands))
     }
 }
 

@@ -535,10 +535,16 @@ pub(crate) fn search_hook_documents_with_backend(
             },
         )
         .and_then(|mut service| {
-            let results = service.search_for_hook(query, provider, session_id, top_k)?;
-            Ok(filter_automatic_context_results(search_results_for_query(
-                &service, query, results,
-            )))
+            let (results, comparison_operands) = service
+                .search_for_hook_with_comparison_operands(query, provider, session_id, top_k)?;
+            Ok(filter_automatic_context_results(
+                search_results_for_query_with_comparison_operands(
+                    &service,
+                    query,
+                    results,
+                    &comparison_operands,
+                ),
+            ))
         });
     }
     let root = root.canonicalize()?;
@@ -679,6 +685,20 @@ pub(crate) fn search_results_for_query(
     format_search_results(service, Some(query), results)
 }
 
+pub(crate) fn search_results_for_query_with_comparison_operands(
+    service: &MemoryService,
+    query: &str,
+    results: Vec<SearchResult>,
+    comparison_operands: &[String],
+) -> Value {
+    format_search_results_with_comparison_operands(
+        service,
+        Some(query),
+        results,
+        comparison_operands,
+    )
+}
+
 fn format_search_results(
     service: &MemoryService,
     query: Option<&str>,
@@ -688,6 +708,15 @@ fn format_search_results(
         .map(|query| service.comparison_operands_for_query(query))
         .filter(|operands| operands.len() == 2)
         .unwrap_or_default();
+    format_search_results_with_comparison_operands(service, query, results, &comparison_operands)
+}
+
+fn format_search_results_with_comparison_operands(
+    service: &MemoryService,
+    query: Option<&str>,
+    results: Vec<SearchResult>,
+    comparison_operands: &[String],
+) -> Value {
     let comparison_coverage = (!comparison_operands.is_empty()).then(|| {
         let sides = comparison_operands
             .iter()

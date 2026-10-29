@@ -1952,7 +1952,18 @@ impl MemoryService {
         session_id: Option<&str>,
         top_k: usize,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
-        self.search_with_filters(
+        self.search_for_hook_with_comparison_operands(query, scope, session_id, top_k)
+            .map(|(results, _)| results)
+    }
+
+    pub(crate) fn search_for_hook_with_comparison_operands(
+        &mut self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
+        self.search_with_filters_and_comparison_operands(
             query,
             scope,
             session_id.filter(|id| !id.trim().is_empty()),
@@ -2005,6 +2016,28 @@ impl MemoryService {
         feature = "muse-code",
         feature = "roo-runtime"
     ))]
+    pub(crate) fn search_results_payload_with_comparison_operands(
+        &self,
+        query: &str,
+        results: Vec<crate::SearchResult>,
+        comparison_operands: &[String],
+    ) -> serde_json::Value {
+        crate::integrations::mcp_tools::search_results_for_query_with_comparison_operands(
+            self,
+            query,
+            results,
+            comparison_operands,
+        )
+    }
+
+    #[cfg(any(
+        feature = "claude-code",
+        feature = "codex",
+        feature = "gemini-cli",
+        feature = "agy",
+        feature = "muse-code",
+        feature = "roo-runtime"
+    ))]
     pub(crate) fn search_agent_cached(
         &self,
         query: &str,
@@ -2013,11 +2046,18 @@ impl MemoryService {
         top_k: usize,
         filters: &BTreeMap<String, String>,
     ) -> anyhow::Result<serde_json::Value> {
-        let results =
-            self.search_with_filters_cached(query, scope, session_id, top_k, filters, None)?;
-        Ok(crate::integrations::mcp_tools::search_results_for_query(
-            self, query, results,
-        ))
+        let (results, comparison_operands) = self
+            .search_with_filters_cached_and_comparison_operands(
+                query, scope, session_id, top_k, filters, None,
+            )?;
+        Ok(
+            crate::integrations::mcp_tools::search_results_for_query_with_comparison_operands(
+                self,
+                query,
+                results,
+                &comparison_operands,
+            ),
+        )
     }
 
     #[cfg(any(
