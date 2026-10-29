@@ -5,100 +5,153 @@ Install it once for a project and the agent can look up earlier decisions and
 save useful outcomes as it works. Memories from connected agents are kept in
 the project's `.membrick/memory` folder.
 
-For a one-time user-level setup, run `membrick` after installing the executable.
-This adds a small project manager MCP to the available Codex, Claude Code, and
-AGY user configs. It can list registered projects and install or remove
-Codex/Claude project integrations. It does not receive project memory access.
-To add the current project directly from a terminal, use
-`membrick install codex .` or `membrick install claude .`.
+Each agent uses one MCP server named `membrick`. From the project folder, use
+the provider tab below to connect that project and give the agent access to its
+memory. Running `membrick` with no arguments also configures user-level project
+management tools for Codex, Claude Code, and AGY. Those tools can list projects
+and install or remove project connections; this is the same `membrick` server,
+not a second MCP server.
 
-## Choose your agent
+## Install by provider
 
-| Agent | Setup |
-|---|---|
-| Codex | Run the installer below with `--agent codex`. |
-| Claude Code | Run the installer below with `--agent claude`. |
-| Gemini CLI | Run the installer below with `--agent gemini`. |
-| Antigravity CLI | Run the installer below with `--agent agy`. |
-| OpenClaw | Follow the [OpenClaw setup](openclaw.md). |
-| Hermes | Follow the [Hermes setup](hermes.md). |
-| Muse Code | Follow the [Muse Code setup](muse-code.md). |
-| RooAGI AgentFlow | Follow the [RooAGI AgentFlow setup](roo-runtime.md). |
+Choose a provider to see its project setup command and provider-specific notes.
 
-## Install for Codex, Claude Code, Gemini CLI, or Antigravity
+=== "Codex"
 
-Open a terminal in the project folder and run the command for your agent. The
-installer downloads and checksum-verifies the official Membrick release,
-configures the selected agent, and checks that its MCP connection works.
+    From the project directory, install and verify the Membrick connection:
 
-```bash
-# Codex
-curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent codex --project .
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent codex --project .
+    ```
 
-# Claude Code
-curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent claude --project .
+    Restart Codex if it was already open. See [Codex setup](codex.md) for
+    details.
 
-# Gemini CLI
-curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent gemini --project .
+=== "Claude Code"
 
-# Antigravity CLI
-curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent agy --project .
-```
+    From the project directory, install and verify the Membrick connection:
 
-Restart the agent if it was already open. Then ask a question about a past
-project decision, or ask the agent to remember an outcome from the current
-session. The agent uses Membrick's memory tools and lifecycle integration in
-the background.
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent claude --project .
+    ```
 
-If you already installed the `membrick` executable, use the shared provider
-commands for setup and maintenance:
+    Restart Claude Code if it was already open. See [Claude Code setup](claude-code.md)
+    for details.
+
+=== "Gemini CLI"
+
+    From the project directory, install and verify the Membrick connection:
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent gemini --project .
+    ```
+
+    Restart Gemini CLI if it was already open. See [Gemini CLI setup](gemini-cli.md)
+    for details.
+
+=== "Antigravity CLI"
+
+    From the project directory, install and verify the Membrick connection:
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/install.sh | sh -s -- --agent agy --project .
+    ```
+
+    Restart Antigravity CLI if it was already open. See [Antigravity CLI setup](agy.md)
+    for details.
+
+=== "OpenClaw"
+
+    From the project directory, run `membrick install openclaw .`. Then restart
+    the Gateway and check the MCP connection. See [OpenClaw setup](openclaw.md)
+    for the complete steps.
+
+=== "Hermes"
+
+    From the project directory, run `membrick install hermes .`, then restart
+    Hermes. The optional hooks plugin adds automatic recall and capture and
+    requires Membrick's HTTP server to be running. See [Hermes setup](hermes.md).
+
+=== "Muse Code"
+
+    From the project directory, run `membrick install muse .`. See
+    [Muse Code setup](muse-code.md) for installation options, verification,
+    and lifecycle hooks.
+
+=== "RooAGI AgentFlow"
+
+    From the project directory, run `membrick install roo-runtime .`. See
+    [RooAGI AgentFlow setup](roo-runtime.md) for hook and MCP details.
+
+After setup, ask the agent about a past project decision or ask it to remember
+an outcome. Membrick tools and supported lifecycle integrations work in the
+background.
+
+For example, if the `membrick` executable is installed, connect and check a
+Codex project from its folder with the CLI:
 
 ```bash
 membrick install codex .
-membrick install claude .
-membrick install gemini .
-membrick install agy .
-membrick serve codex .
 membrick verify codex .
-membrick uninstall codex .
 ```
 
-Use `membrick hook <provider> <event> [PATH]` to run a lifecycle hook, such as
-`membrick hook claude session-start .`. `setup` remains an alias for `install`.
-Older provider-specific flags remain accepted for installed agent configs and
-existing scripts.
+For other agents, use the commands in their provider tabs. `membrick setup`
+remains an alias for `membrick install`. To run a lifecycle hook manually, use
+`membrick hook <provider> <event> [PATH]`, for example
+`membrick hook claude session-start .`. Older provider-specific flags remain
+accepted for existing agent configurations and scripts.
 
-Advanced path overrides use `--provider-config`, `--provider-settings`,
+Install options for custom paths are `--provider-config`, `--provider-settings`,
 `--provider-skills-dir`, `--provider-hooks-dir`, and
-`--provider-plugin-dir`. Use `--force-skill` with `install` when you
-intentionally want to replace a customized skill.
+`--provider-plugin-dir`. Use `--force-skill` with `install` only when you
+intend to replace a customized skill.
 
-## Uninstall Claude Code or Codex
+## Uninstall by provider
 
-From the project directory, remove the Membrick integration with:
+Uninstall is available for Codex, Claude Code, and Antigravity CLI. From the
+project directory, choose the matching command:
 
-```bash
-membrick uninstall claude .
-membrick uninstall codex .
-```
+=== "Codex"
+
+    ```bash
+    membrick uninstall codex .
+    ```
+
+=== "Claude Code"
+
+    ```bash
+    membrick uninstall claude .
+    ```
+
+=== "Antigravity CLI"
+
+    ```bash
+    membrick uninstall agy .
+    ```
 
 Uninstall removes only Membrick or legacy Lint-AI MCP entries, hooks, and
 project memory guidance for that provider. It preserves unrelated agent
 settings, customized Claude skills, the project's `.membrick` memory data, and
 the Membrick executable. Restart the agent after uninstalling. The Codex hook
-feature flag is left unchanged because other Codex hooks may use it.
+feature flag is left unchanged because other Codex hooks may use it. Other
+providers do not currently have a `membrick uninstall` command; see their
+provider guide for connection-removal details.
 
 ## Migrate from Lint-AI
 
-Existing Lint-AI users can install Membrick and update one agent connection in
-one step. From the project directory, run:
+Existing Lint-AI users can update one agent connection with an existing
+Membrick executable. The migration script does not install or download a
+Membrick binary. If Membrick is not installed yet, install it separately with
+the [installation instructions](quickstart.md#install-membrick), then run this
+from the project directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/migrate-lint-ai.sh | sh -s -- --agent codex --project .
 ```
 
 Replace `codex` with `claude`, `gemini`, or `agy` for another supported agent.
-The migration installs Membrick, updates that agent's configuration while
+The script uses `membrick` from `PATH`; pass `--membrick-bin /path/to/membrick`
+if it is installed elsewhere. It updates that agent's configuration while
 preserving unrelated settings, and verifies the MCP connection. During agent
 setup, existing `.lint-ai` project state is moved to `.membrick` with its
 contents preserved. Membrick also checks for legacy state when it first accesses
@@ -108,22 +161,6 @@ overwriting current state. It removes the project-root `.lint-ai` directory when
 migration completes. The old `lint-ai` executable is left installed; once you have
 confirmed Membrick works, remove it using the package manager that installed
 it.
-
-## OpenClaw and Hermes
-
-OpenClaw and Hermes have their own setup steps because each host loads its
-integrations differently. Their guides walk through the install and explain
-what is automatic:
-
-- [Set up OpenClaw](openclaw.md): install the MCP connection, memory skill,
-  recall hook, and capture plugin, then restart the Gateway.
-- [Set up Hermes](hermes.md): install the MCP connection and memory skill.
-  The optional hooks plugin adds automatic recall and capture and requires the
-  Membrick server to be running.
-
-Both integrations use the same project memory folder, `.membrick/memory`, as
-the other agents. The agents do not need to be switched to a different memory
-provider.
 
 ## What happens after setup
 
@@ -138,3 +175,30 @@ provider.
 See [Quickstart](quickstart.md) to try memory directly from the command line,
 or [Agent integrations](agents.md) for the implementation details and shared
 memory behavior.
+
+## MCP tools
+
+The provider connection exposes these workspace tools through the agent's MCP
+client. Board and flow management are documented separately in the API
+reference.
+
+| Tool | Purpose |
+|---|---|
+| `search` | Search indexed workspace content and return ranked results with source evidence. Results include a `search_id` for optional review feedback. |
+| `info` | Show the workspace and the connection serving the request. |
+| `list_memories`, `get_memory`, `add_memory`, `delete_memory` | List, read, add, or delete memories owned by the MCP integration. |
+| `review_search` | Retrieve a recorded search or page through unreviewed searches. |
+| `search_feedback` | Record usefulness and relevance feedback for every result from one search. |
+| `enrich_doc` | Add evidence-backed searchable metadata to an indexed source document. |
+| `record_session` | Start, stop, or inspect capture-only session recording. |
+| `enable_membrick`, `disable_membrick`, `membrick_status` | Control and inspect memory retrieval and recording state. |
+| `update_membrick` | Install an available Membrick update after the host approves it. |
+| `membrick_session` | Return Codex session information; Codex only. |
+
+The shared memory and review tools are available across provider adapters;
+Codex additionally exposes `membrick_session`. Lifecycle controls vary by
+provider. The MCP memory tools use a workspace-scoped `mcp` owner, separate
+from memories captured automatically by lifecycle hooks. See the
+[MCP memory server](mcp-memory-server.md) for examples and the
+[local IPC architecture](local-ipc-architecture.md) for resident startup,
+transport fallback, and leases.

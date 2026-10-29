@@ -16,26 +16,9 @@ use walkdir::WalkDir;
 const STORE_INIT_LOCK_WAIT: Duration = Duration::from_secs(30);
 const STORE_INIT_LOCK_RETRY: Duration = Duration::from_millis(100);
 
-/// Exclusive lifetime ownership of one project's persistent workspace and
-/// provider stores. Kept by the resident runtime while it serves requests.
-pub(crate) struct WorkspaceOwnerLock {
-    _file: File,
-}
-
-impl WorkspaceOwnerLock {
-    pub(crate) fn acquire(project_root: &Path) -> Result<Self> {
-        let runtime = project_root.join(".membrick").join("runtime");
-        fs::create_dir_all(&runtime)?;
-        let path = runtime.join("workspace-owner.lock");
-        let file = acquire_file_lock(
-            &path,
-            Duration::ZERO,
-            STORE_INIT_LOCK_RETRY,
-            "workspace resident owner",
-        )?;
-        Ok(Self { _file: file })
-    }
-}
+/// Exclusive ownership shared with standalone `MemoryService` instances.
+/// The resident retains this guard while it serves the project.
+pub(crate) use crate::state_paths::ProjectOwnerLock as WorkspaceOwnerLock;
 
 /// Kernel-released file-lock primitive shared by both guards below.
 ///
@@ -95,14 +78,13 @@ const SHARED_STORE_WRITE_LOCK_RETRY: Duration = Duration::from_millis(50);
 
 /// Open the persistent shared-memory service under the cross-process write
 /// lock and run `operation` against it. This is the write gate for ALL
-/// shared-store mutations — board operations, memory upserts, hook captures,
+/// shared-store mutations — extension operations, memory upserts, hook captures,
 /// migration: everything written here survives the process and is visible to
 /// hooks and other providers. Persistence happens inside `operation` via the
-/// usual `upsert` / `add` / `board_open` / `board_post` calls (they refresh
-/// internally).
+/// usual mutation APIs.
 ///
 /// MCP adapters keep a separate, composed in-memory service for workspace
-/// search. Board/memory writes must use this persistent service so another
+/// search. Extension and memory writes must use this persistent service so another
 /// provider MCP process and later invocations see the same documents. The
 /// advisory file lock serializes mutations across those processes, so
 /// sequence assignment and request-id recovery run against the latest
@@ -137,7 +119,8 @@ fn with_shared_memory_service_timeout<T>(
         "shared store write lock",
     )?;
 
-    let mut service = MemoryService::at_path(&memory_root, segmented_store_options())?;
+    let mut service =
+        MemoryService::at_path_without_owner_lock(&memory_root, segmented_store_options())?;
     operation(&mut service)
 }
 
@@ -197,17 +180,19 @@ pub(super) fn migrate_legacy_provider_memory_dirs(root: &Path) -> Result<()> {
                 fs::rename(&legacy_state, &new_state)?;
             }
         }
-        let documents: Vec<SourceDocument> =
-            match MemoryService::at_path(&legacy_root, segmented_store_options()) {
-                Ok(legacy_store) => legacy_store
-                    .source_documents()
-                    .into_iter()
-                    .cloned()
-                    .collect(),
-                // A concurrent server migrated and removed the directory first.
-                Err(error) if is_not_found(&error) => continue,
-                Err(error) => return Err(error),
-            };
+        let documents: Vec<SourceDocument> = match MemoryService::at_path_without_owner_lock(
+            &legacy_root,
+            segmented_store_options(),
+        ) {
+            Ok(legacy_store) => legacy_store
+                .source_documents()
+                .into_iter()
+                .cloned()
+                .collect(),
+            // A concurrent server migrated and removed the directory first.
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        };
         if documents.is_empty() {
             let _ = fs::remove_dir_all(&legacy_root);
             continue;
@@ -286,7 +271,8 @@ pub(super) fn open_persistent_store(
     crate::state_paths::migrate_legacy_state_dir(root)?;
     let index_root = root.join(".membrick").join(index_name);
     let _init_lock = StoreInitLock::acquire(&index_root)?;
-    let mut store = MemoryService::at_path(&index_root, segmented_store_options())?;
+    let mut store =
+        MemoryService::at_path_without_owner_lock(&index_root, segmented_store_options())?;
     let state = workspace_state(root, ignore_paths)?;
     if store.is_empty() || !index_is_current(&index_root, &state) {
         for doc_id in store
@@ -384,7 +370,7 @@ pub(super) fn open_workspace_memory_owner_with_options_at(
         migrate_legacy_provider_memory_dirs(root)?;
     }
     let _init_lock = StoreInitLock::acquire(workspace_root)?;
-    let mut workspace = MemoryService::at_path(workspace_root, options.clone())?;
+    let mut workspace = MemoryService::at_path_without_owner_lock(workspace_root, options.clone())?;
     let state = workspace_state(root, ignore_paths)?;
     if workspace.is_empty() || !index_is_current(&workspace_root, &state) {
         for doc_id in workspace
@@ -403,7 +389,7 @@ pub(super) fn open_workspace_memory_owner_with_options_at(
     }
 
     let memory_root = root.join(".membrick").join(memory_name);
-    let provider_memory = MemoryService::at_path(&memory_root, options)?;
+    let provider_memory = MemoryService::at_path_without_owner_lock(&memory_root, options)?;
     // Opening rebuilt any segment that changed since the last owner ran, into
     // a new folder. The owner lock guarantees nothing still reads the old one.
     for (store, store_root) in [
@@ -436,7 +422,7 @@ pub(super) fn sync_memory_documents(
     if !memory_root.exists() {
         return Ok(false);
     }
-    let memory = MemoryService::at_path(memory_root, segmented_store_options())?;
+    let memory = MemoryService::at_path_without_owner_lock(memory_root, segmented_store_options())?;
     let mut changed = false;
     for document in memory.source_documents() {
         let unchanged = target
@@ -706,99 +692,6 @@ mod tests {
         assert!(WorkspaceOwnerLock::acquire(&root).is_err());
         drop(first);
         assert!(WorkspaceOwnerLock::acquire(&root).is_ok());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn board_post_is_readable_after_reopening_shared_service() {
-        let root = board_test_root("reopen");
-        let workspace = root.to_string_lossy().into_owned();
-        let board = with_shared_memory_service(&root, |service| {
-            service.board_open("mcp", &workspace, "research", "Research")
-        })
-        .unwrap();
-
-        let posted = with_shared_memory_service(&root, |service| {
-            service.board_post(
-                Some(&board.board_id),
-                "mcp",
-                &workspace,
-                None,
-                "agent-a",
-                "codex",
-                "The parser failure is in the empty-input path.",
-                "research-post-1",
-            )
-        })
-        .unwrap();
-        assert_eq!(posted.sequence, 1);
-
-        // A fresh MemoryService instance must read the durable post from the
-        // same explicit board ID, as a later MCP invocation would.
-        let posts = with_shared_memory_service(&root, |service| {
-            service.board_read(Some(&board.board_id), "mcp", &workspace, None, None, 20)
-        })
-        .unwrap();
-        assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].post_id, posted.post_id);
-        assert_eq!(posts[0].board_id, board.board_id);
-        assert_eq!(posts[0].content, posted.content);
-        assert_eq!(posts[0].sequence, 1);
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn shared_board_lock_serializes_writers_across_service_instances() {
-        const WRITERS: usize = 6;
-        const TEST_LOCK_WAIT: Duration = Duration::from_secs(60);
-        let root = board_test_root("concurrent");
-        let workspace = root.to_string_lossy().into_owned();
-        let board = with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
-            service.board_open("mcp", &workspace, "parallel", "Parallel")
-        })
-        .unwrap();
-
-        let mut writers = Vec::new();
-        for writer in 0..WRITERS {
-            let root = root.clone();
-            let workspace = workspace.clone();
-            let board_id = board.board_id.clone();
-            writers.push(std::thread::spawn(move || {
-                with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
-                    service.board_post(
-                        Some(&board_id),
-                        "mcp",
-                        &workspace,
-                        None,
-                        &format!("agent-{writer}"),
-                        "codex",
-                        &format!("post from writer {writer}"),
-                        &format!("parallel-{writer}"),
-                    )
-                })
-                .unwrap()
-                .sequence
-            }));
-        }
-
-        let mut sequences: Vec<u64> = writers
-            .into_iter()
-            .map(|writer| writer.join().unwrap())
-            .collect();
-        sequences.sort_unstable();
-        assert_eq!(sequences, (1..=WRITERS as u64).collect::<Vec<_>>());
-
-        let posts = with_shared_memory_service_timeout(&root, TEST_LOCK_WAIT, |service| {
-            service.board_read(Some(&board.board_id), "mcp", &workspace, None, None, 100)
-        })
-        .unwrap();
-        assert_eq!(posts.len(), WRITERS);
-        assert_eq!(
-            posts.iter().map(|post| post.sequence).collect::<Vec<_>>(),
-            (1..=WRITERS as u64).collect::<Vec<_>>()
-        );
-
         let _ = fs::remove_dir_all(root);
     }
 

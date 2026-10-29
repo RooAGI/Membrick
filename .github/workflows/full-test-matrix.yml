@@ -39,6 +39,9 @@ jobs:
       - name: Test agent integrations
         run: cargo test --all-targets --features agent-integrations
 
+      - name: Verify SDK project mode starts, serves, and restarts the resident
+        run: cargo test --test memory_client_resident_idle --features agent-integrations
+
       - name: Check all features compile (all targets)
         run: cargo check --all-features --all-targets
 

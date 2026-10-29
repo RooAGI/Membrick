@@ -69,7 +69,6 @@ use crate::integrations::openclaw::{
     install_user_config as install_openclaw_user_config, run_server as run_openclaw_server,
     OpenClawServerOptions,
 };
-use crate::pipeline::{MemoryIndexLayout, PipelineOptions};
 use crate::query_plan::PreparedQuery;
 use crate::report::Report;
 use crate::rules::cross_refs::check_cross_refs;
@@ -244,6 +243,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
                 Path::new(&args.path),
                 args.session_root.as_deref().map(Path::new),
                 session_id,
+                crate::integrations::mcp_tools::MemoryBackend::Resident,
             )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             return Ok(());
@@ -468,7 +468,9 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             args.claude_code_settings.as_deref().map(Path::new),
         )?;
         crate::integrations::project_registry::unregister(Path::new(&args.path), "claude")?;
-        println!("Removed the Claude Code Membrick integration. Project memory data and the Membrick executable were kept.");
+        println!(
+            "Removed the Claude Code Membrick integration. Project memory data and the Membrick executable were kept."
+        );
         return Ok(());
     }
 
@@ -480,7 +482,23 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             args.codex_settings.as_deref().map(Path::new),
         )?;
         crate::integrations::project_registry::unregister(Path::new(&args.path), "codex")?;
-        println!("Removed the Codex Membrick integration. Project memory data and the Membrick executable were kept.");
+        println!(
+            "Removed the Codex Membrick integration. Project memory data and the Membrick executable were kept."
+        );
+        return Ok(());
+    }
+
+    #[cfg(feature = "agy")]
+    if args.agy_uninstall {
+        crate::integrations::agy::uninstall(
+            Path::new(&args.path),
+            args.agy_config.as_deref().map(Path::new),
+            args.agy_settings.as_deref().map(Path::new),
+        )?;
+        crate::integrations::project_registry::unregister(Path::new(&args.path), "agy")?;
+        println!(
+            "Removed the AGY Membrick integration. Project memory data and the Membrick executable were kept."
+        );
         return Ok(());
     }
 
@@ -619,10 +637,9 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         );
         let written = install_agy_memory_skill(Path::new(&args.path), args.agy_force_skill)?;
         println!("Wrote AGY memory skill to {}", written.display());
-        let written = install_agy_user_config(
-            Path::new(&args.path),
-            args.agy_config.as_deref().map(Path::new),
-        )?;
+        let agy_config = args.agy_config.as_deref().map(Path::new);
+        let previous = crate::integrations::agy::installed_project_root(agy_config)?;
+        let written = install_agy_user_config(Path::new(&args.path), agy_config)?;
         println!("Wrote AGY MCP config to {}", written.display());
         let written = install_agy_hook_settings(
             Path::new(&args.path),
@@ -631,6 +648,21 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         println!("Wrote AGY hook settings to {}", written.display());
         let written = crate::integrations::agy::install_update_permission(None)?;
         println!("Configured AGY update approval in {}", written.display());
+        let displaced =
+            crate::integrations::agy::register_install(Path::new(&args.path), previous.as_deref())?;
+        println!(
+            "AGY has one global `membrick` MCP server, and it now serves this project in every \
+             folder in place of the project manager. Run `membrick uninstall agy {}` to restore \
+             the manager.",
+            args.path
+        );
+        if let Some(displaced) = displaced {
+            println!(
+                "This replaced the AGY install for {}, which no longer has AGY memory tools. AGY \
+                 hooks are global, so they still run there while it has .membrick data.",
+                displaced.display()
+            );
+        }
         return Ok(());
     }
 
@@ -1340,35 +1372,57 @@ fn inspect_index_store(index_path: &Path, view: IndexInspectView) -> Result<()> 
     if !index_path.exists() {
         anyhow::bail!("index path does not exist: {}", index_path.display());
     }
-    let options = PipelineOptions {
-        memory_index_layout: MemoryIndexLayout::Segmented {
-            query_top_n: 3,
-            routing_strategy: crate::segments::SegmentRoutingStrategy::LocalDistinctiveness,
-        },
-        ..PipelineOptions::default()
-    };
-    let mut store = crate::MemoryService::at_path(index_path, options)?;
-    store.refresh()?;
+    let records = read_persisted_records_read_only(index_path)?;
+    let manifest_path = index_path.join("segments.json");
+    let manifest = manifest_path
+        .is_file()
+        .then(|| std::fs::read(&manifest_path))
+        .transpose()?
+        .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+        .transpose()?;
+    let inspection = serde_json::json!({
+        "source_document_count": records.len(),
+        "record_count": records.len(),
+        "durable_generation": manifest.as_ref().and_then(|value| value["generation"].as_u64()),
+        "segment_manifest": manifest,
+    });
     let payload = match view {
         IndexInspectView::Summary => serde_json::json!({
             "index_path": index_path,
-            "index_store": store.inspection(),
+            "index_store": inspection,
+            "read_only": true,
         }),
         IndexInspectView::SourceDocuments => serde_json::json!({
             "index_path": index_path,
-            "source_documents": store.source_documents(),
+            "source_documents": records.iter().map(crate::pipeline::source_document_from_record).collect::<Vec<_>>(),
+            "read_only": true,
         }),
         IndexInspectView::Records => serde_json::json!({
             "index_path": index_path,
-            "records": store.diagnostic_records()?,
+            "records": records,
+            "read_only": true,
         }),
         IndexInspectView::Segments => serde_json::json!({
             "index_path": index_path,
-            "snapshot": store.inspection().snapshot,
+            "segment_manifest": manifest,
+            "read_only": true,
         }),
     };
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+/// Load checkpointed records without opening a writer or rebuilding lexical
+/// indexes. Operational inspection intentionally reflects durable on-disk
+/// state and may omit changes still pending in the resident's memory.
+fn read_persisted_records_read_only(index_path: &Path) -> Result<Vec<crate::index::DocRecord>> {
+    let semantic_dir = index_path.join("semantic");
+    let records_path = semantic_dir.join("records.json");
+    let shard_manifest = semantic_dir.join("records-shards/manifest.json");
+    if !records_path.is_file() && !shard_manifest.is_file() {
+        return Ok(Vec::new());
+    }
+    crate::pipeline::load_persisted_records(&semantic_dir)
 }
 
 fn show_project_status(project_root: &Path) -> Result<()> {
@@ -1421,38 +1475,27 @@ fn show_project_status(project_root: &Path) -> Result<()> {
 
     println!("Indexes: {}", index_paths.len());
     for index_path in index_paths {
-        let options = PipelineOptions {
-            memory_index_layout: MemoryIndexLayout::Segmented {
-                query_top_n: 3,
-                routing_strategy: crate::segments::SegmentRoutingStrategy::LocalDistinctiveness,
-            },
-            ..PipelineOptions::default()
+        let records = read_persisted_records_read_only(&index_path)?;
+        let manifest_path = index_path.join("segments.json");
+        let segment_count = if manifest_path.is_file() {
+            std::fs::read(&manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|value| value["segments"].as_array().map(Vec::len))
+                .unwrap_or_default()
+        } else {
+            0
         };
-        let mut store = crate::MemoryService::at_path(&index_path, options)?;
-        store.refresh()?;
-        let inspection = store.inspection();
         let name = index_path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("index");
         println!("\n{name} ({})", index_path.display());
-        println!("  Source documents: {}", inspection.source_document_count);
-        println!("  Records: {}", inspection.record_count);
-        println!(
-            "  State: {}",
-            if inspection.dirty {
-                "pending updates"
-            } else {
-                "current"
-            }
-        );
-        println!(
-            "  Revision: store {}, published {}",
-            inspection.store_revision, inspection.snapshot_revision
-        );
-        if let Some(snapshot) = inspection.snapshot {
-            println!("  Layout: {}", snapshot.layout);
-            println!("  Segments: {}", snapshot.segment_count);
+        println!("  Checkpointed records: {}", records.len());
+        println!("  Snapshot state: durable files (read-only)");
+        if segment_count > 0 {
+            println!("  Layout: segmented");
+            println!("  Segments: {segment_count}");
         }
     }
     Ok(())

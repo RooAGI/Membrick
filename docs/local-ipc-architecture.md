@@ -70,17 +70,20 @@ lock files may remain and are reused by the next owner. Different project roots
 therefore use separate runtime state and endpoints without requiring access to
 the user's home directory.
 
-The provider-launched MCP adapter requests resident startup when its stdio MCP
-process begins. That warm-up uses a short-lived kernel-locked lease in
-`.membrick/runtime/provider-leases/`. Hooks and other one-shot clients hold
-leases while a request is in flight. A Codex adapter also holds a lease while
-it has one or more bound active sessions; `SessionEnd` releases the lease when
-the adapter's final session ends. Other provider adapters do not hold a lease
-for their full process lifetime. The resident is shared by Claude, Codex, and
-other providers using the same project. After all request and session leases
-are released, the resident waits for `resident_idle_timeout_seconds` (60
-seconds by default, clamped to 5–3600) before flushing its writer and shutting
+The provider-launched MCP adapter acquires a kernel-locked lease before
+requesting resident startup. The lease lives as long as the adapter's stdio
+connection, and the OS releases it if the adapter exits or crashes. Project
+`Memory` clients and sessions also hold leases for their handle lifetime;
+one-shot hooks hold a lease while their request is in flight. The resident is
+shared by every provider using the same project. When all client, adapter, and
+request leases are released, the resident flushes pending writes and shuts
 down. A later provider or hook request starts a fresh resident automatically.
+
+Codex can retain an MCP adapter in its long-lived daemon after the TUI or
+desktop closes. Its session-end hook stops the adapter after the last tracked
+conversation ends. If Codex closes the UI without sending that hook and keeps
+the adapter connection open, the adapter cannot observe the UI exit and its
+lease remains until the connection closes.
 Stale lease files are detected by testing the kernel lock and removed during
 the resident's lease scan. Lease registration and the resident's final
 empty-lease check share the kernel lock at
@@ -120,7 +123,11 @@ This requires the updated, trusted Codex hooks. `SessionStart` can run before
 MCP initialization, so `UserPromptSubmit` retries binding. Clients without a
 session binding retain the usual stdin-EOF lifecycle; Membrick cannot infer
 their owning terminal. An abrupt disconnect that does not emit `SessionEnd`
-still relies on the host closing the MCP connection. See the
+still relies on the host closing the MCP connection. Such an adapter process
+can stay alive, but it stops keeping the resident warm once its sessions go
+idle. The Codex CLI ties its adapters to the terminal only when its managed
+app-server daemon is off (`codex features disable daemon_auto_start`); the
+Codex app keeps that daemon, and its adapters, running by design. See the
 [Codex hook lifecycle](https://learn.chatgpt.com/docs/hooks#sessionend) for when
 Codex emits this event.
 
@@ -148,7 +155,6 @@ one possible assignment:
 bind = "127.0.0.1:8080"
 resident_http_bind = "127.0.0.1:8465"
 resident_http_auto_port = true
-resident_idle_timeout_seconds = 60
 dashboard_url = "http://127.0.0.1:8465/dashboard"
 ```
 
@@ -214,7 +220,7 @@ standalone HTTP mode remains available for applications and custom clients. A
 workspace store has one active writer owner across both modes; starting a second
 server against that project fails before it opens the store. See the
 [HTTP server guide](server.md) for network configuration and the
-[MCP interface guide](mcp.md) for provider tools.
+[agent connection guide](connect-agent.md#mcp-tools) for provider tools.
 
 Some integrations, including plugins configured independently from the
 bundled Rust adapters, may still call HTTP endpoints. This does not change the

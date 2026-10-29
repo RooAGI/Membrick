@@ -71,7 +71,7 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
             }
             (_, Some(root)) => root,
             (RooRuntimeHook::RunStart | RooRuntimeHook::RunEnd, None) => {
-                return Ok(HookResult::default())
+                return Ok(HookResult::default());
             }
             (_, None) => anyhow::bail!("Roo memory hook payload is missing workspaceRoot"),
         };
@@ -104,23 +104,46 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
             RooRuntimeHook::AgentTurnStart
                 if crate::integrations::session_recording::automatic_retrieval_enabled(&root) =>
             {
-                recall(&root, &invocation)
+                recall_with_backend(
+                    &root,
+                    &invocation,
+                    crate::integrations::mcp_tools::MemoryBackend::Resident,
+                )
             }
             RooRuntimeHook::AgentTurnStart => Ok(HookResult::default()),
             RooRuntimeHook::AgentTurnEnd => {
-                capture(&root, &invocation, "turn")?;
+                capture_with_backend(
+                    &root,
+                    &invocation,
+                    "turn",
+                    crate::integrations::mcp_tools::MemoryBackend::Resident,
+                )?;
                 Ok(HookResult::default())
             }
             RooRuntimeHook::PreToolUse => {
-                capture_tool_event(&root, &invocation, "tool_call")?;
+                capture_tool_event_with_backend(
+                    &root,
+                    &invocation,
+                    "tool_call",
+                    crate::integrations::mcp_tools::MemoryBackend::Resident,
+                )?;
                 Ok(HookResult::default())
             }
             RooRuntimeHook::PostToolUse => {
-                capture_tool_event(&root, &invocation, "tool_result")?;
+                capture_tool_event_with_backend(
+                    &root,
+                    &invocation,
+                    "tool_result",
+                    crate::integrations::mcp_tools::MemoryBackend::Resident,
+                )?;
                 Ok(tool_result_context(&invocation))
             }
             RooRuntimeHook::PostCompact => {
-                capture_compaction(&root, &invocation)?;
+                capture_compaction_with_backend(
+                    &root,
+                    &invocation,
+                    crate::integrations::mcp_tools::MemoryBackend::Resident,
+                )?;
                 Ok(HookResult::default())
             }
             RooRuntimeHook::RunEnd => {
@@ -133,7 +156,12 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
                     .and_then(Value::as_str)
                     .is_some_and(|path| !path.trim().is_empty())
                 {
-                    capture(&root, &invocation, "run")?;
+                    capture_with_backend(
+                        &root,
+                        &invocation,
+                        "run",
+                        crate::integrations::mcp_tools::MemoryBackend::Resident,
+                    )?;
                 }
                 Ok(HookResult::default())
             }
@@ -218,7 +246,11 @@ fn load_payload_references(root: &Path, payload: &mut Value) -> Result<()> {
     Ok(())
 }
 
-fn recall(root: &Path, input: &HookInvocation) -> Result<HookResult> {
+fn recall_with_backend(
+    root: &Path,
+    input: &HookInvocation,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<HookResult> {
     let query = bounded(
         input
             .payload
@@ -235,12 +267,13 @@ fn recall(root: &Path, input: &HookInvocation) -> Result<HookResult> {
         .get("sessionId")
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty());
-    let hits = crate::integrations::mcp_tools::search_hook_documents(
+    let hits = crate::integrations::mcp_tools::search_hook_documents_with_backend(
         root,
         "rooagi_runtime",
         session_id,
         &query,
         5,
+        backend,
     )?;
     let Some(hits) = hits.get("results").and_then(Value::as_array) else {
         return Ok(HookResult::default());
@@ -376,7 +409,12 @@ fn set_epoch_segment_group(document: &mut SourceDocument, (group, epoch): (Strin
     }
 }
 
-fn capture(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
+fn capture_with_backend(
+    root: &Path,
+    input: &HookInvocation,
+    kind: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<()> {
     let content = if kind == "turn" {
         let user = capture_text::strip_memory_context(
             input
@@ -469,15 +507,21 @@ fn capture(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
         .get("session_id")
         .cloned()
         .unwrap_or_default();
-    crate::integrations::mcp_tools::upsert_hook_document(
+    crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
         root,
         "rooagi_runtime",
         &session_id,
-        document,
+        vec![document],
+        backend,
     )
 }
 
-fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
+fn capture_tool_event_with_backend(
+    root: &Path,
+    input: &HookInvocation,
+    kind: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<()> {
     let tool_name = input
         .payload
         .get("toolName")
@@ -608,20 +652,25 @@ fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result
         .and_then(|chunk| chunk.filters.get("session_id"))
         .cloned()
         .unwrap_or_else(|| memory_session_id(&root.to_string_lossy(), input));
-    crate::integrations::mcp_tools::replace_hook_documents(
+    crate::integrations::mcp_tools::replace_hook_documents_with_backend(
         root,
         "rooagi_runtime",
         &session_id,
         "tool_capture_id",
         &capture_id,
         chunks,
+        backend,
     )
 }
 
 /// Store what one Roo compaction replaced: its summary, as a checkpoint, and
 /// the part of the compacted transcript no other capture holds. Both go to
 /// the epoch the compaction closed, one before the epoch Roo reports.
-fn capture_compaction(root: &Path, input: &HookInvocation) -> Result<()> {
+fn capture_compaction_with_backend(
+    root: &Path,
+    input: &HookInvocation,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<()> {
     let new_epoch = input
         .payload
         .get("compactionEpoch")
@@ -712,11 +761,12 @@ fn capture_compaction(root: &Path, input: &HookInvocation) -> Result<()> {
     if documents.is_empty() {
         return Ok(());
     }
-    crate::integrations::mcp_tools::upsert_hook_documents(
+    crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
         root,
         "rooagi_runtime",
         &session_id,
         documents,
+        backend,
     )
 }
 
@@ -818,8 +868,22 @@ fn tool_result_context(input: &HookInvocation) -> HookResult {
     HookResult {
         additional_context: Some(format!(
             "Tool evidence from Membrick ({completeness}). Tool: {}; call: {}.\n{}\nAdditional evidence is searchable in workspace memory; this preview is not an exhaustive dataset.",
-            bounded(input.payload.get("toolName").and_then(Value::as_str).unwrap_or("unknown"), 128),
-            bounded(input.payload.get("toolUseId").and_then(Value::as_str).unwrap_or("unknown"), 128),
+            bounded(
+                input
+                    .payload
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                128
+            ),
+            bounded(
+                input
+                    .payload
+                    .get("toolUseId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+                128
+            ),
             preview,
         )),
     }
@@ -965,6 +1029,41 @@ fn default_config_path() -> PathBuf {
         .map(|home| PathBuf::from(home).join(".rooagi"))
         .unwrap_or_else(|| PathBuf::from(".rooagi"))
         .join("hooks.json")
+}
+
+#[cfg(test)]
+fn recall(root: &Path, input: &HookInvocation) -> Result<HookResult> {
+    recall_with_backend(
+        root,
+        input,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+#[cfg(test)]
+fn capture(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
+    capture_with_backend(
+        root,
+        input,
+        kind,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+#[cfg(test)]
+fn capture_tool_event(root: &Path, input: &HookInvocation, kind: &str) -> Result<()> {
+    capture_tool_event_with_backend(
+        root,
+        input,
+        kind,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+#[cfg(test)]
+fn capture_compaction(root: &Path, input: &HookInvocation) -> Result<()> {
+    capture_compaction_with_backend(
+        root,
+        input,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
 }
 
 #[cfg(test)]

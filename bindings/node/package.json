@@ -1,6 +1,6 @@
 {
   "name": "membrick",
-  "version": "0.7.3",
+  "version": "0.8.0",
   "description": "Membrick's Rust MemoryService binding and CLI for Node.js",
   "license": "Apache-2.0",
   "repository": {
@@ -29,7 +29,8 @@
   "scripts": {
     "build": "napi build --platform --release && node scripts/sync-types.cjs",
     "build:debug": "napi build --platform && node scripts/sync-types.cjs",
-    "test": "node --test"
+    "test": "node --test test/*.test.js && npm run test:types",
+    "test:types": "tsc --noEmit --strict --target ES2022 --module Node16 --moduleResolution Node16 test/types.test.ts"
   },
   "napi": {
     "binaryName": "membrick_node",
@@ -43,13 +44,14 @@
     ]
   },
   "optionalDependencies": {
-    "@rooagi/membrick-darwin-arm64": "0.7.3",
-    "@rooagi/membrick-darwin-x64": "0.7.3",
-    "@rooagi/membrick-linux-arm64-gnu": "0.7.3",
-    "@rooagi/membrick-linux-x64-gnu": "0.7.3",
-    "@rooagi/membrick-win32-x64-msvc": "0.7.3"
+    "@rooagi/membrick-darwin-arm64": "0.8.0",
+    "@rooagi/membrick-darwin-x64": "0.8.0",
+    "@rooagi/membrick-linux-arm64-gnu": "0.8.0",
+    "@rooagi/membrick-linux-x64-gnu": "0.8.0",
+    "@rooagi/membrick-win32-x64-msvc": "0.8.0"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.4.0"
+    "@napi-rs/cli": "^3.4.0",
+    "typescript": "^6.0.3"
   }
 }

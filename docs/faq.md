@@ -57,9 +57,8 @@
     your agent after updating so it reconnects to the new executable.
 
 ??? question "How do I migrate from Lint-AI?"
-    The Quickstart's [migration section](quickstart.md#2-migrate-from-lint-ai)
-    has a command that installs Membrick, updates your agent connection, and
-    migrates project data.
+    Follow [Migrate from Lint-AI](connect-agent.md#migrate-from-lint-ai) to
+    install Membrick, update your agent connection, and migrate project data.
 
 ??? question "What happens when a decision changes?"
     Membrick can keep the earlier information as history while preferring the

@@ -20,12 +20,22 @@ struct PublicationResult {
 #[serde(untagged)]
 enum JournalEntry {
     Add(Vec<AddRequest>),
-    Upsert { upsert: Vec<crate::SourceDocument> },
+    AddWithMetadata {
+        add_with_metadata: Vec<AddRequestWithMetadata>,
+    },
+    Upsert {
+        upsert: Vec<crate::SourceDocument>,
+    },
 }
 
 #[derive(Serialize)]
 struct JournalUpsert<'a> {
     upsert: &'a [crate::SourceDocument],
+}
+
+#[derive(Serialize)]
+struct JournalAddWithMetadata<'a> {
+    add_with_metadata: &'a [AddRequestWithMetadata],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,6 +75,7 @@ impl MemoryService {
     fn read_view_with_store(&self, store: IndexStore) -> Self {
         Self {
             store,
+            workspace_owner_lock: None,
             // Frozen build inputs never retain a live writable workspace owner.
             workspace_store: None,
             published_search_view: None,
@@ -81,7 +92,6 @@ impl MemoryService {
             relations_cache: Mutex::new(RelationsCache::default()),
             enrichment: Arc::new(Mutex::new(KeyPhraseEnrichment::default())),
             project_rules: self.project_rules.as_ref().map(Arc::clone),
-            board_state: Mutex::new(BoardState::default()),
             search_history_index: Arc::clone(&self.search_history_index),
             search_review_state: Arc::clone(&self.search_review_state),
         }
@@ -115,6 +125,35 @@ impl MemoryService {
         requests
             .iter()
             .map(|request| {
+                let key = (request.user_id.clone(), request.request_id.clone());
+                let receipt = self
+                    .request_receipts
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| self.rebuild_receipt(&key));
+                anyhow::ensure!(
+                    !self.pending_adds.contains_key(&key),
+                    "request has not been published"
+                );
+                Ok(AddResponse {
+                    success: true,
+                    request_id: request.request_id.clone(),
+                    user_id: request.user_id.clone(),
+                    session_id: request.session_id.clone(),
+                    adjudication: receipt,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn completed_add_responses_with_metadata(
+        &self,
+        requests: &[AddRequestWithMetadata],
+    ) -> anyhow::Result<Vec<AddResponse>> {
+        requests
+            .iter()
+            .map(|wrapped| {
+                let request = &wrapped.request;
                 let key = (request.user_id.clone(), request.request_id.clone());
                 let receipt = self
                     .request_receipts
@@ -312,34 +351,82 @@ impl MemoryService {
             .map(|p| p.with_file_name("pending-adds.jsonl"))
     }
 
+    pub(crate) fn has_staged_journal(&self) -> bool {
+        self.staged_journal_path().is_some()
+    }
+
     /// Persist a validated batch before changing mutable state. No index refresh.
     /// A single owner must serialize mutations to a disk-backed service.
     pub fn stage_add_batch(
         &mut self,
         requests: Vec<AddRequest>,
     ) -> anyhow::Result<Vec<StagedAddResponse>> {
+        self.stage_add_batch_with_metadata(
+            requests
+                .into_iter()
+                .map(|request| AddRequestWithMetadata {
+                    request,
+                    metadata: BTreeMap::new(),
+                })
+                .collect(),
+        )
+    }
+
+    pub fn stage_add_with_metadata(
+        &mut self,
+        request: AddRequestWithMetadata,
+    ) -> anyhow::Result<StagedAddResponse> {
+        Ok(self.stage_add_batch_with_metadata(vec![request])?.remove(0))
+    }
+
+    pub fn stage_add_batch_with_metadata(
+        &mut self,
+        requests: Vec<AddRequestWithMetadata>,
+    ) -> anyhow::Result<Vec<StagedAddResponse>> {
+        self.stage_add_batch_with_context(
+            requests
+                .into_iter()
+                .map(|request| AddRequestContext {
+                    request,
+                    session_id_was_omitted: false,
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn stage_add_batch_with_context(
+        &mut self,
+        mut requests: Vec<AddRequestContext>,
+    ) -> anyhow::Result<Vec<StagedAddResponse>> {
         anyhow::ensure!(!requests.is_empty(), "requests must not be empty");
         let mut fingerprints = HashMap::new();
         let mut new_requests = Vec::new();
-        for request in &requests {
-            let (fingerprint, documents) = self.prepare_add(request)?;
+        for wrapped in &mut requests {
+            let request = &mut wrapped.request.request;
+            let (fingerprint, documents) = self.prepare_add(
+                request,
+                &wrapped.request.metadata,
+                wrapped.session_id_was_omitted,
+            )?;
             let key = (request.user_id.clone(), request.request_id.clone());
             if let Some(previous) = fingerprints.insert(key, fingerprint.clone()) {
-                anyhow::ensure!(
-                    previous == fingerprint,
-                    "request_id was already used with different content"
-                );
+                if previous != fingerprint {
+                    return Err(super::RequestFingerprintConflict.into());
+                }
             } else if !documents.is_empty() {
-                new_requests.push(request.clone());
+                new_requests.push(wrapped.request.clone());
             }
         }
         if !new_requests.is_empty() {
-            self.append_journal_entry(&serde_json::to_vec(&new_requests)?)?;
+            self.append_journal_entry(&serde_json::to_vec(&JournalAddWithMetadata {
+                add_with_metadata: &new_requests,
+            })?)?;
         }
         let mut responses = Vec::with_capacity(requests.len());
-        for request in requests {
+        for wrapped in requests {
+            let request = &wrapped.request.request;
             let key = (request.user_id.clone(), request.request_id.clone());
-            let (response, documents) = self.add_unpublished(request)?;
+            let (response, documents) = self.add_unpublished_with_context(wrapped)?;
             if !documents.is_empty() {
                 self.pending_adds.insert(key.clone(), documents);
             }
@@ -509,6 +596,18 @@ impl MemoryService {
                         }
                     }
                 }
+                JournalEntry::AddWithMetadata { add_with_metadata } => {
+                    for request in add_with_metadata {
+                        let key = (
+                            request.request.user_id.clone(),
+                            request.request.request_id.clone(),
+                        );
+                        let (_, documents) = self.add_unpublished_with_metadata(request)?;
+                        if !documents.is_empty() {
+                            self.pending_adds.insert(key, documents);
+                        }
+                    }
+                }
                 JournalEntry::Upsert { upsert } => {
                     for document in upsert {
                         self.upsert(document);
@@ -657,10 +756,21 @@ mod tests {
         let journal = std::fs::read_to_string(path.join("pending-adds.jsonl")).unwrap();
         let transactions = journal
             .lines()
-            .map(|line| serde_json::from_str::<Vec<AddRequest>>(line).unwrap())
+            .map(
+                |line| match serde_json::from_str::<JournalEntry>(line).unwrap() {
+                    JournalEntry::Add(requests) => requests
+                        .into_iter()
+                        .map(|request| request.request_id)
+                        .collect::<Vec<_>>(),
+                    JournalEntry::AddWithMetadata { add_with_metadata } => add_with_metadata
+                        .into_iter()
+                        .map(|entry| entry.request.request_id)
+                        .collect(),
+                    JournalEntry::Upsert { .. } => panic!("expected an add journal entry"),
+                },
+            )
             .collect::<Vec<_>>();
-        assert_eq!(transactions.len(), 1);
-        assert_eq!(transactions[0][0].request_id, "r2");
+        assert_eq!(transactions, vec![vec!["r2".to_string()]]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

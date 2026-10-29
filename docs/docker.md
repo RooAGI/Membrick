@@ -68,8 +68,8 @@ curl -X POST http://127.0.0.1:8080/search \
   }'
 ```
 
-The Compose setup uses the same routes as the [HTTP server API](server.md),
-including `POST /add/batch` for adding up to 128 memories in one request.
+The Compose setup uses the same routes as the [HTTP API](api/http-overview.md),
+including `POST /add/batch` for adding up to 128 memory requests in one call.
 
 ## Stop and manage data
 
@@ -118,18 +118,18 @@ kubectl create secret generic membrick-auth \
   --from-file=SERVER_TOKEN=secrets/server-token
 ```
 
-The chart defaults to `ghcr.io/rooagi/membrick-server:0.7.3`; the repository
+The chart defaults to `ghcr.io/rooagi/membrick-server:0.8.0`; the repository
 does not currently publish this image automatically. Build and push the image
 to a registry you control, then set `image.repository` and `image.tag` during
 installation. For example:
 
 ```bash
-docker build -t registry.example.com/membrick-server:0.7.3 .
-docker push registry.example.com/membrick-server:0.7.3
+docker build -t registry.example.com/membrick-server:0.8.0 .
+docker push registry.example.com/membrick-server:0.8.0
 helm upgrade --install membrick ./charts/membrick \
   --namespace membrick \
   --set image.repository=registry.example.com/membrick-server \
-  --set image.tag=0.7.3
+  --set image.tag=0.8.0
 ```
 
 The default chart provisions a 10 GiB persistent volume claim using the

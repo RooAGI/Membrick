@@ -60,6 +60,7 @@ struct McpServerEntry {
 }
 
 struct MuseMcp {
+    backend: mcp_tools::MemoryBackend,
     root: PathBuf,
     max_bytes: usize,
     max_files: usize,
@@ -293,23 +294,19 @@ pub fn install_memory_policy(root: &Path) -> Result<PathBuf> {
 }
 
 pub fn run_server(root: &Path, options: MuseServerOptions<'_>) -> Result<()> {
+    let _resident_lease =
+        crate::integrations::provider_lifecycle::ResidentConnectionLease::start(root, "muse")?;
     crate::local_ipc::ensure_provider_resident(root, "muse")?;
     tracing::debug!("MCP server starting");
     let mcp = MuseMcp {
+        backend: mcp_tools::MemoryBackend::Resident,
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
         max_files: options.max_files,
         max_depth: options.max_depth,
         max_total_bytes: options.max_total_bytes,
         ignore_paths: options.ignore_paths.to_vec(),
-        workspace_watcher: if cfg!(test) {
-            Some(mcp_index::WorkspaceWatcher::new(
-                root,
-                options.ignore_paths,
-            )?)
-        } else {
-            None
-        },
+        workspace_watcher: None,
         store: Mutex::new(None),
     };
     mcp.serve()
@@ -322,7 +319,7 @@ impl MuseMcp {
             .lock()
             .map_err(|_| anyhow::anyhow!("MCP index lock poisoned"))?;
         anyhow::ensure!(
-            !mcp_tools::resident_backend_enabled(),
+            !self.backend.is_resident(),
             "MCP memory indexes are owned by the resident Membrick server"
         );
         let file_changes = self
@@ -339,6 +336,7 @@ impl MuseMcp {
                     RecordingProvider::Muse,
                     &self.root,
                     file_changes,
+                    self.backend,
                 )
             {
                 tracing::warn!("failed to save workspace file changes: {error:#}");
@@ -478,20 +476,13 @@ impl MuseMcp {
             return mcp_tools::call_update_tool(id, &arguments);
         }
 
-        if crate::integrations::mcp_tools::resident_backend_enabled()
-            && (crate::integrations::mcp_tools::is_flow_tool_name(tool_name)
+        if self.backend.is_resident()
+            && (crate::integrations::mcp_tools::is_extension_tool_name(tool_name)
                 || matches!(
                     tool_name,
                     "search"
                         | "info"
                         | "list_memories"
-                        | "board_open"
-                        | "board_list"
-                        | "board_info"
-                        | "board_post"
-                        | "board_read"
-                        | "board_get"
-                        | "board_search"
                         | "add_memory"
                         | "get_memory"
                         | "delete_memory"
@@ -505,17 +496,10 @@ impl MuseMcp {
             );
         }
 
-        if mcp_tools::is_flow_tool_name(tool_name)
+        if mcp_tools::is_extension_tool_name(tool_name)
             || matches!(
                 tool_name,
-                "board_open"
-                    | "board_list"
-                    | "board_info"
-                    | "board_post"
-                    | "board_read"
-                    | "board_get"
-                    | "board_search"
-                    | "add_memory"
+                "add_memory"
                     | "get_memory"
                     | "delete_memory"
                     | "review_search"
@@ -525,13 +509,14 @@ impl MuseMcp {
         {
             let mut service = self.store()?;
             let service = service.as_mut().expect("MCP store initialized");
-            return mcp_tools::call_board_or_memory_tool(
+            return mcp_tools::call_mcp_tool_with_backend(
                 tool_name,
                 id,
                 &arguments,
                 service,
                 &self.root,
                 RecordingProvider::Muse.as_str(),
+                self.backend,
             );
         }
 
@@ -582,7 +567,7 @@ impl MuseMcp {
                     Err(message) => return Ok(error_response(id, -32602, &message)),
                 };
                 let started = std::time::Instant::now();
-                let results = service.search_with_filters(
+                let results = service.search_with_filters_and_comparison_operands(
                     query,
                     crate::integrations::session_recording::RecordingProvider::Muse.as_str(),
                     session_id.as_deref(),
@@ -594,10 +579,16 @@ impl MuseMcp {
                     &self.root,
                     started.elapsed().as_millis() as u64,
                     results.is_err(),
-                    results.as_ref().is_ok_and(Vec::is_empty),
+                    results
+                        .as_ref()
+                        .is_ok_and(|(results, _)| results.is_empty()),
                 );
-                let results = results?;
-                let payload = service.search_results_payload(query, results);
+                let (results, comparison_operands) = results?;
+                let payload = service.search_results_payload_with_comparison_operands(
+                    query,
+                    results,
+                    &comparison_operands,
+                );
                 Ok(JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
@@ -804,8 +795,7 @@ impl MuseMcp {
             },
             mcp_tools::update_tool_definition(),
         ];
-        tools.extend(mcp_tools::board_tool_definitions());
-        tools.extend(mcp_tools::flow_tool_definitions());
+        tools.extend(mcp_tools::extension_tool_definitions());
         tools.extend(mcp_tools::memory_tool_definitions());
         tools
     }
@@ -921,6 +911,7 @@ mod tests {
         }
         store.refresh().unwrap();
         MuseMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             root,
             max_bytes: 0,
             max_files: 0,
@@ -945,6 +936,47 @@ mod tests {
             .unwrap()
             .to_string();
         serde_json::from_str(&text).unwrap()
+    }
+
+    #[cfg(feature = "flowboard-tests")]
+    #[test]
+    fn board_post_edit_routes_through_muse_mcp() {
+        let root = temp_dir("muse-board-post-edit");
+        let mcp = test_mcp(root.clone(), Vec::new());
+        let session = "muse-board-post-edit";
+        let posted = call_tool(
+            &mcp,
+            "board_post",
+            json!({
+                "content": "Original checkpoint text.",
+                "request_id": "muse-post-edit-1",
+                "session_id": session,
+            }),
+        );
+        let board_id = posted["board_id"].as_str().unwrap().to_string();
+        let post_id = posted["post_id"].as_str().unwrap().to_string();
+
+        let edited = call_tool(
+            &mcp,
+            "board_post_edit",
+            json!({
+                "board_id": board_id,
+                "post_id": post_id,
+                "content": "Edited checkpoint text.",
+                "session_id": session,
+            }),
+        );
+        assert_eq!(edited["post_id"], post_id);
+        assert_eq!(edited["content"], "Edited checkpoint text.");
+
+        let fetched = call_tool(
+            &mcp,
+            "board_get",
+            json!({"board_id": board_id, "post_id": post_id}),
+        );
+        assert_eq!(fetched["content"], "Edited checkpoint text.");
+        drop(mcp);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

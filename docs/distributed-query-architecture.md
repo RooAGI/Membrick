@@ -1,12 +1,9 @@
-# Distributed Query Architecture
+# Segmented query architecture
 
-Status: single-process architecture under hardening; remote transport is a later
-deployment option
-
-This document is the architectural contract for segmented querying in `membrick`.
-It describes the system when one `membrick` process owns the complete corpus and
-how that coordinator can participate in a larger deployment. No network service
-is required for the local architecture below.
+Membrick can query a logical corpus through one index or through multiple
+segments in one resident process. The local segment router, executor, and
+reducer are implemented. Remote worker fan-out is a separate future extension;
+the local design does not imply a distributed or replicated service.
 
 ## Scope and terminology
 
@@ -167,80 +164,27 @@ The architecture intentionally does not claim remote guarantees yet. Network
 deadlines, worker discovery, retries, replication, and cross-process generation
 negotiation belong to the transport layer.
 
-## Maturity gates
+## Implemented local behavior and evidence
 
-The local architecture is ready for further hardening when these properties are
-measured and enforced:
+The resident publishes either a single-index or segmented snapshot. Segmented
+queries route to a configured set of segments, execute in bounded local batches,
+and merge candidates using the same snapshot's global BM25 statistics. The
+default production pipeline starts with five routed segments; adaptive
+expansion and the global comparison arm are configurable. Diagnostics expose
+selected and executed segments, generation, coverage, and completeness.
 
-- **Snapshot identity:** expose and test a generation shared by routing,
-  indexes, and statistics.
-- **Bounded execution:** implemented locally with a maximum batch concurrency
-  of eight; benchmark the setting against corpus size and query latency.
-- **Candidate budget:** implemented locally as a `2 * top_k` oversampling policy;
-  benchmark the multiplier against ranking recall and query cost.
-- **Statistics lifecycle:** snapshot-owned provider caching is implemented;
-  benchmark construction and query costs before adding invalidation complexity.
-- **Ranking parity:** compare all-segment routed results with the single-index
-  reference on representative corpora.
-- **Routing recall:** measure relevant-result loss as segment limits change.
-- **Operational evidence:** benchmark latency, memory, statistics construction,
-  completeness, and degraded-segment behavior.
-- **Persistence evolution:** introduce a physical segmented manifest and
-  per-segment cores before record-based rebuild becomes a scalability
-  bottleneck. The logical manifest is implemented; per-segment binary cores
-  remain the next persistence optimization.
+For retrieval quality and latency numbers, use the dated tables in the
+[segmented benchmark report](benchmark.md#latest-segmented-index-comparison-v062-2026-10-16).
+That report labels its release commit and configuration. Its scores are
+benchmark evidence for that build, not a guarantee for every current working
+tree or corpus. The older 133-query comparison is explicitly historical in
+that report.
 
-These gates are deliberately local. Passing them gives us a stable query
-contract to transport; it does not by itself make the system a remote cluster.
+Local implementation details are covered by
+[index concurrency and publication](index-concurrency.md). A current query
+snapshot remains immutable while a replacement is built and published.
 
-## Current evidence
-
-The latest 133-query multi-session comparison used `coverage-local` routing and
-an explicit top-5 setting:
-
-| Mode | Any-hit Recall@5 | Any-hit Recall@10 | MRR | Mean latency |
-| --- | ---: | ---: | ---: | ---: |
-| Segmented, fixed top-5 | 95.49% | 95.49% | 0.859 | 1.25 ms |
-| Segmented, adaptive 5→12 | 96.24% | 96.24% | 0.839 | 4.36 ms |
-| Single index | 93.23% | 93.98% | 0.814 | 6.41 ms |
-
-These results are the current routed-versus-global comparison. They do not
-change the server's fixed top-5 default.
-
-A previous 500-question run of `segment_scoped_benchmark` on the checked-in
-LongMemEval-S data used an average of 47.7 segments per question and
-`top_k=5`. It remains diagnostic evidence, not a release result:
-
-| Query scope | Fractional Recall@5 | MRR | Mean latency |
-| --- | ---: | ---: | ---: |
-| Top 1 routed segment | 41.3% | 65.4% | 2.83 ms |
-| Top 3 routed segments | 70.9% | 79.9% | 4.33 ms |
-| Top 5 routed segments | 79.5% | 82.8% | 6.07 ms |
-| All segmented partitions | 83.5% | 84.6% | 24.36 ms |
-
-The result supports keeping `query_top_n` configurable and exposing routing
-misses. It does not support silently treating three segments as equivalent to
-full-corpus retrieval. The specialized enrichment variants were slower at
-roughly 9–10 ms without improving top-3 recall, while connected enrichment
-was roughly 67 ms and reduced recall; they should remain opt-in until a
-larger quality case justifies their cost. The candidate multiplier should also
-remain a measured tuning parameter rather than a permanent promise.
-
-The current implementation was also compared with a clean HEAD checkout using
-the same five-query slice. After removing repeated BM25-statistics scans, the
-mean routed latency was:
-
-| Query scope | Clean HEAD | Current | Routed relevant-segment recall |
-| --- | ---: | ---: | ---: |
-| Top 1 routed segment | 0.79 ms | 1.14 ms | 80% |
-| Top 5 routed segments | 0.74 ms | 0.90 ms | 80% |
-
-This historical five-query result exposed structural fan-out cost and motivated
-the routing work. The current 133-query comparison above supersedes it for
-local performance claims. Remote fan-out still needs its own representative
-benchmark before it is enabled by default.
-
-## Remote extension
+## Remote extension (not implemented as typed retrieval)
 
 ### Two-tier topology
 
@@ -263,7 +207,7 @@ Each worker owns one corpus and may use the local segmented layout. The remote
 coordinator owns worker selection and cross-corpus reduction; it must not assume
 that a worker's local segment IDs or local index generation are globally unique.
 
-### Current `lint-service` compatibility
+### Existing `lint-service` compatibility
 
 The existing service is useful transport infrastructure, but its current
 `RunLint` protocol is a generic command-dispatch protocol:
@@ -300,8 +244,7 @@ generation is incompatible, preserve partial-result completeness, and apply
 deterministic tie-breaking after merging. The worker-facing endpoint can be
 gRPC or HTTP; the semantic contract is independent of that choice.
 
-Until that protocol exists, `lint-service` should be described as generic CLI
-federation rather than as a fully consistent distributed `MemoryIndex`.
-
-The concrete wire contract and acceptance criteria are in
-[`remote-query-contract.md`](remote-query-contract.md).
+Until that protocol exists, `lint-service` is generic CLI federation rather
+than a fully consistent distributed `MemoryIndex`. The structured request and
+response requirements above are design guidance; no typed worker query
+transport is promised here.

@@ -173,6 +173,34 @@ fn handle_hook(
     input: CodexHookInput,
     fallback_root: &Path,
 ) -> Result<CodexHookOutput> {
+    handle_hook_with_backend(
+        kind,
+        input,
+        fallback_root,
+        crate::integrations::mcp_tools::MemoryBackend::Resident,
+    )
+}
+
+#[cfg(test)]
+fn handle_hook_test(
+    kind: CodexHookKind,
+    input: CodexHookInput,
+    fallback_root: &Path,
+) -> Result<CodexHookOutput> {
+    handle_hook_with_backend(
+        kind,
+        input,
+        fallback_root,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+
+fn handle_hook_with_backend(
+    kind: CodexHookKind,
+    input: CodexHookInput,
+    fallback_root: &Path,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<CodexHookOutput> {
     if input.hook_event_name != kind.event_name() {
         anyhow::bail!(
             "Codex hook event mismatch: expected {}, got {}",
@@ -187,6 +215,8 @@ fn handle_hook(
         // This must precede optional recording/capture: a disabled memory
         // feature or failed capture must not leave the provider lease alive.
         super::lifecycle::end_session(&root, &input.session_id)?;
+    } else {
+        super::lifecycle::note_activity(&root, &input.session_id);
     }
     if kind == CodexHookKind::SubagentStop {
         if let Some(agent) = input.agent_id.as_deref() {
@@ -260,25 +290,28 @@ fn handle_hook(
             kind.event_name(),
             &input.session_id,
             "decisions unresolved work failures implemented changes",
+            backend,
         ),
         CodexHookKind::UserPromptSubmit => retrieve(
             &root,
             kind.event_name(),
             &input.session_id,
             input.prompt.as_deref().unwrap_or_default(),
+            backend,
         ),
         CodexHookKind::PreToolUse => retrieve(
             &root,
             kind.event_name(),
             &input.session_id,
             &tool_query(&input),
+            backend,
         ),
         CodexHookKind::PostToolUse => {
             let query = tool_query(&input);
             if query_terms(&query).len() < MIN_TOOL_QUERY_TERMS {
                 return Ok(CodexHookOutput::default());
             }
-            retrieve(&root, kind.event_name(), &input.session_id, &query)
+            retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
         }
         CodexHookKind::UserPromptExpansion => {
             let query = [
@@ -292,12 +325,12 @@ fn handle_hook(
             .flatten()
             .collect::<Vec<_>>()
             .join(" ");
-            retrieve(&root, kind.event_name(), &input.session_id, &query)
+            retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
         }
-        CodexHookKind::PreCompact => capture(&root, input, CodexDocumentType::Checkpoint),
-        CodexHookKind::PostCompact => capture(&root, input, CodexDocumentType::Checkpoint),
+        CodexHookKind::PreCompact => capture(&root, input, CodexDocumentType::Checkpoint, backend),
+        CodexHookKind::PostCompact => capture(&root, input, CodexDocumentType::Checkpoint, backend),
         CodexHookKind::Stop if input.stop_hook_active => Ok(CodexHookOutput::default()),
-        CodexHookKind::Stop => capture(&root, input, CodexDocumentType::Outcome),
+        CodexHookKind::Stop => capture(&root, input, CodexDocumentType::Outcome, backend),
         // Codex limits SessionEnd hooks to three seconds. A fresh MemoryService
         // open and durable index refresh can exceed that; Stop already captures
         // the completed turn, so avoid starting a write that Codex may kill.
@@ -307,8 +340,9 @@ fn handle_hook(
             kind.event_name(),
             &input.session_id,
             input.prompt.as_deref().unwrap_or_default(),
+            backend,
         ),
-        CodexHookKind::SubagentStop => capture(&root, input, CodexDocumentType::Outcome),
+        CodexHookKind::SubagentStop => capture(&root, input, CodexDocumentType::Outcome, backend),
     }?;
     if kind == CodexHookKind::SessionEnd && memory_root(&root).exists() {
         MemoryService::deactivate_session_at_path(
@@ -337,6 +371,7 @@ fn retrieve(
     event_name: &str,
     session_id: &str,
     query: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<CodexHookOutput> {
     if query.trim().is_empty() {
         return Ok(CodexHookOutput::default());
@@ -345,12 +380,13 @@ fn retrieve(
         return Ok(CodexHookOutput::default());
     }
     let started = std::time::Instant::now();
-    let results = crate::integrations::mcp_tools::search_hook_documents(
+    let results = crate::integrations::mcp_tools::search_hook_documents_with_backend(
         root,
         "codex",
         Some(session_id),
         query,
         DEFAULT_TOP_K * 3,
+        backend,
     );
     let _ = crate::telemetry::record_project_query(
         root,
@@ -583,11 +619,12 @@ fn capture(
     root: &Path,
     input: CodexHookInput,
     document_type: CodexDocumentType,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<CodexHookOutput> {
     let Some(transcript_path) = transcript_path(&input, root) else {
         return Ok(CodexHookOutput::default());
     };
-    if crate::integrations::mcp_tools::resident_backend_enabled() {
+    if backend.is_resident() {
         let mut capture_input = serde_json::to_value(&input)?;
         capture_input["transcript_path"] = serde_json::to_value(transcript_path.canonicalize()?)?;
         capture_input["cwd"] = serde_json::to_value(root.canonicalize()?)?;
@@ -601,7 +638,7 @@ fn capture(
     }
     let state_dir = provider_state_dir(RecordingProvider::Codex, root);
     transcript_cursor::replay_batches(&state_dir, &input.session_id, &transcript_path, |slice| {
-        capture_slice(root, &input, document_type, slice)
+        capture_slice(root, &input, document_type, slice, backend)
     })?;
     Ok(CodexHookOutput::default())
 }
@@ -611,14 +648,16 @@ fn capture_slice(
     input: &CodexHookInput,
     document_type: CodexDocumentType,
     slice: &transcript_cursor::TranscriptSlice,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<()> {
     let documents = build_capture_documents(root, input, document_type, slice)?;
     if !documents.is_empty() {
-        crate::integrations::mcp_tools::upsert_hook_documents(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             root,
             "codex",
             &input.session_id,
             documents,
+            backend,
         )?;
     }
     Ok(())
@@ -1025,7 +1064,15 @@ mod tests {
             &state_dir,
             &hook_input.session_id,
             &transcript,
-            |slice| capture_slice(&root, &hook_input, CodexDocumentType::Outcome, slice),
+            |slice| {
+                capture_slice(
+                    &root,
+                    &hook_input,
+                    CodexDocumentType::Outcome,
+                    slice,
+                    crate::integrations::mcp_tools::MemoryBackend::InProcess,
+                )
+            },
         )
         .unwrap();
 
@@ -1115,7 +1162,15 @@ mod tests {
             &hook_input.session_id,
             &transcript,
             1,
-            |slice| capture_slice(&root, &hook_input, CodexDocumentType::Outcome, slice),
+            |slice| {
+                capture_slice(
+                    &root,
+                    &hook_input,
+                    CodexDocumentType::Outcome,
+                    slice,
+                    crate::integrations::mcp_tools::MemoryBackend::InProcess,
+                )
+            },
         )
         .unwrap();
 
@@ -1163,7 +1218,7 @@ mod tests {
         )).unwrap();
         let mut stop = input(&root, Some(transcript), "Stop");
         stop.turn_id = Some("latest".into());
-        handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop, &root).unwrap();
         let store = open_store(&root).unwrap();
         let documents = store.source_documents();
         let capture = documents
@@ -1191,12 +1246,12 @@ mod tests {
         .unwrap();
         let mut stop = input(&root, Some(transcript.clone()), "Stop");
         stop.turn_id = Some("turn-a".into());
-        handle_hook(CodexHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop.clone(), &root).unwrap();
         append_line(
             &transcript,
             r#"{"turn_id":"turn-a","message":{"role":"assistant","content":"An answer"}}"#,
         );
-        handle_hook(CodexHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop.clone(), &root).unwrap();
         let before = {
             let store = open_store(&root).unwrap();
             store
@@ -1209,7 +1264,7 @@ mod tests {
                 .collect::<HashSet<_>>()
         };
         fs::remove_dir_all(provider_state_dir(RecordingProvider::Codex, &root)).unwrap();
-        handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop, &root).unwrap();
         let store = open_store(&root).unwrap();
         let after = store
             .source_documents()
@@ -1242,7 +1297,7 @@ mod tests {
             }
             let mut stop = input(&root, Some(transcript.clone()), "Stop");
             stop.turn_id = Some(turn_id.into());
-            handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
+            handle_hook_test(CodexHookKind::Stop, stop, &root).unwrap();
         }
         let store = open_store(&root).unwrap();
         let documents = store.source_documents();
@@ -1270,7 +1325,7 @@ mod tests {
     #[test]
     fn session_start_does_not_create_memory_store() {
         let root = temp_dir("session-start");
-        let output = handle_hook(
+        let output = handle_hook_test(
             CodexHookKind::SessionStart,
             input(&root, None, "SessionStart"),
             &root,
@@ -1285,7 +1340,7 @@ mod tests {
     #[test]
     fn empty_prompt_does_not_open_memory_store() {
         let root = temp_dir("empty-prompt");
-        let output = handle_hook(
+        let output = handle_hook_test(
             CodexHookKind::UserPromptSubmit,
             input(&root, None, "UserPromptSubmit"),
             &root,
@@ -1302,7 +1357,7 @@ mod tests {
         set_membrick_state(RecordingProvider::Codex, &root, false).unwrap();
         let mut prompt = input(&root, None, "UserPromptSubmit");
         prompt.prompt = Some("retrieve prior routing decision".to_string());
-        let output = handle_hook(CodexHookKind::UserPromptSubmit, prompt, &root).unwrap();
+        let output = handle_hook_test(CodexHookKind::UserPromptSubmit, prompt, &root).unwrap();
         assert!(output.hook_specific_output.is_none());
         assert!(!memory_root(&root).join("index.json").exists());
         fs::remove_dir_all(root).unwrap();
@@ -1329,7 +1384,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_hook(
+        handle_hook_test(
             CodexHookKind::Stop,
             input(&root, Some(transcript), "Stop"),
             &root,
@@ -1346,7 +1401,7 @@ mod tests {
 
         let mut prompt = input(&root, None, "UserPromptSubmit");
         prompt.prompt = Some("How is cobalt routing configured?".into());
-        let output = handle_hook(CodexHookKind::UserPromptSubmit, prompt, &root).unwrap();
+        let output = handle_hook_test(CodexHookKind::UserPromptSubmit, prompt, &root).unwrap();
         assert!(output.hook_specific_output.is_none());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1362,7 +1417,7 @@ mod tests {
         .unwrap();
         let mut stop = input(&root, Some(transcript), "Stop");
         stop.stop_hook_active = true;
-        let output = handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
+        let output = handle_hook_test(CodexHookKind::Stop, stop, &root).unwrap();
         assert!(output.hook_specific_output.is_none());
         assert!(!memory_root(&root).exists());
         fs::remove_dir_all(root).unwrap();
@@ -1378,7 +1433,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = handle_hook(
+        let output = handle_hook_test(
             CodexHookKind::SessionEnd,
             input(&root, Some(transcript), "SessionEnd"),
             &root,
@@ -1409,7 +1464,7 @@ mod tests {
         .unwrap();
 
         let stop_input = input(&root, Some(transcript.clone()), "Stop");
-        handle_hook(CodexHookKind::Stop, stop_input.clone(), &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop_input.clone(), &root).unwrap();
         let mut stored = open_store(&root).unwrap();
         stored.refresh_index().unwrap();
         assert_eq!(
@@ -1419,7 +1474,7 @@ mod tests {
         );
         let records_after_first_capture = stored.records().len();
         drop(stored);
-        handle_hook(CodexHookKind::Stop, stop_input, &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop_input, &root).unwrap();
 
         let mut stored = open_store(&root).unwrap();
         stored.refresh_index().unwrap();
@@ -1437,7 +1492,7 @@ mod tests {
 
         let mut prompt = input(&root, None, "UserPromptSubmit");
         prompt.prompt = Some("docker routing".to_string());
-        let output = handle_hook(CodexHookKind::UserPromptSubmit, prompt, &root).unwrap();
+        let output = handle_hook_test(CodexHookKind::UserPromptSubmit, prompt, &root).unwrap();
         let context = output
             .hook_specific_output
             .expect("captured memory should be retrieved")
@@ -1450,7 +1505,8 @@ mod tests {
         expansion.command_name = Some("review".to_string());
         expansion.command_args = Some("docker routing".to_string());
         expansion.prompt = Some("/review docker routing".to_string());
-        let output = handle_hook(CodexHookKind::UserPromptExpansion, expansion, &root).unwrap();
+        let output =
+            handle_hook_test(CodexHookKind::UserPromptExpansion, expansion, &root).unwrap();
         assert!(output
             .hook_specific_output
             .unwrap()
@@ -1635,7 +1691,7 @@ mod tests {
                     ),
                 );
             }
-            handle_hook(kind, input(&root, Some(transcript.clone()), event), &root).unwrap();
+            handle_hook_test(kind, input(&root, Some(transcript.clone()), event), &root).unwrap();
         }
 
         let store = open_store(&root).unwrap();
@@ -1682,12 +1738,12 @@ mod tests {
         )
         .unwrap();
         let stop = input(&root, Some(transcript.clone()), "Stop");
-        handle_hook(CodexHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop.clone(), &root).unwrap();
         append_line(
             &transcript,
             r#"{"type":"assistant","message":{"role":"assistant","content":"Switched to the amber cache"}}"#,
         );
-        handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop, &root).unwrap();
 
         let store = open_store(&root).unwrap();
         let records = store.source_documents();
@@ -1734,7 +1790,7 @@ mod tests {
         )
         .unwrap();
         let stop = input(&root, Some(transcript.clone()), "Stop");
-        handle_hook(CodexHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop.clone(), &root).unwrap();
         fs::write(
             &transcript,
             concat!(
@@ -1743,7 +1799,7 @@ mod tests {
             ),
         )
         .unwrap();
-        handle_hook(CodexHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(CodexHookKind::Stop, stop, &root).unwrap();
 
         let store = open_store(&root).unwrap();
         let outcomes = store

@@ -188,7 +188,13 @@ pub(crate) fn replace_session_documents(
     request: &CaptureRequest,
     documents: Vec<SourceDocument>,
 ) -> Result<()> {
-    replace_session_documents_in_chunks(root, request, documents, REPLACE_CHUNK_BYTES)
+    replace_session_documents_in_chunks(
+        root,
+        request,
+        documents,
+        REPLACE_CHUNK_BYTES,
+        crate::integrations::mcp_tools::MemoryBackend::Resident,
+    )
 }
 
 fn replace_session_documents_in_chunks(
@@ -196,6 +202,7 @@ fn replace_session_documents_in_chunks(
     request: &CaptureRequest,
     documents: Vec<SourceDocument>,
     chunk_limit: usize,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<()> {
     let session_id = request.session_id()?.to_string();
     anyhow::ensure!(
@@ -223,20 +230,22 @@ fn replace_session_documents_in_chunks(
             .push(document);
     }
     let mut chunks = chunks.into_iter();
-    crate::integrations::mcp_tools::replace_hook_documents(
+    crate::integrations::mcp_tools::replace_hook_documents_with_backend(
         root,
         &request.provider,
         &session_id,
         "session_id",
         &session_id,
         chunks.next().expect("a chunk always exists"),
+        backend,
     )?;
     for chunk in chunks {
-        crate::integrations::mcp_tools::upsert_hook_documents(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             root,
             &request.provider,
             &session_id,
             chunk,
+            backend,
         )?;
     }
     Ok(())
@@ -691,11 +700,20 @@ mod tests {
         };
         let stale = stored("codex://p/rebuild-session/old-slice", session);
         let other = stored("codex://p/other-session/outcome", "other-session");
-        crate::integrations::mcp_tools::upsert_hook_documents(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             &f.0,
             "codex",
             session,
-            vec![stale.clone(), other.clone()],
+            vec![stale.clone()],
+            crate::integrations::mcp_tools::MemoryBackend::InProcess,
+        )
+        .unwrap();
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
+            &f.0,
+            "codex",
+            "other-session",
+            vec![other.clone()],
+            crate::integrations::mcp_tools::MemoryBackend::InProcess,
         )
         .unwrap();
 
@@ -712,7 +730,14 @@ mod tests {
             .exists());
 
         // One document per chunk forces a replace followed by plain upserts.
-        replace_session_documents_in_chunks(&f.0, &request, rebuilt.documents.clone(), 1).unwrap();
+        replace_session_documents_in_chunks(
+            &f.0,
+            &request,
+            rebuilt.documents.clone(),
+            1,
+            crate::integrations::mcp_tools::MemoryBackend::InProcess,
+        )
+        .unwrap();
         MemoryService::with_shared_memory(&f.0, |memory| {
             let ids = |wanted: &str| {
                 memory
@@ -738,7 +763,14 @@ mod tests {
         .unwrap();
 
         // A second run converges on the same set.
-        replace_session_documents(&f.0, &request, rebuilt.documents).unwrap();
+        replace_session_documents_in_chunks(
+            &f.0,
+            &request,
+            rebuilt.documents,
+            REPLACE_CHUNK_BYTES,
+            crate::integrations::mcp_tools::MemoryBackend::InProcess,
+        )
+        .unwrap();
         assert!(replace_session_documents(&f.0, &request, vec![]).is_err());
     }
 

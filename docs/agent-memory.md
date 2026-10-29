@@ -1,44 +1,49 @@
 # How Membrick remembers
 
-AI assistants often forget useful details when a conversation ends. Membrick
-helps an assistant pick up where you left off, using information saved from
-earlier work.
+Membrick gives connected AI assistants access to useful project context across
+turns and sessions. It supports two complementary ways to use that memory:
+automatic lifecycle hooks and explicit MCP tools.
 
-## What it helps your assistant do
+## Automatic recall and capture
 
-### Remember across sessions
+When you connect a supported agent to a project, Membrick can use its lifecycle
+hooks to retrieve relevant context and capture new information as work
+continues. At configured retrieval events, Membrick returns selected project
+context to the agent. At supported capture events, it saves available session
+content or a turn outcome and refreshes the searchable memory. A later retrieval
+can then use that information; the current response is not rewritten after a
+capture.
 
-Your assistant can find decisions, preferences, and useful outcomes from earlier
-sessions, so you do not have to repeat them or search through old chats.
+Hook events and the transcript data available vary by agent. See the
+[agent lifecycle guide](agents.md#memory-lifecycle) for capture and retrieval
+details, and [connect an agent](connect-agent.md) for setup instructions.
 
-### Keep up when things change
+## Explicit memory actions through MCP
 
-Projects change. When a newer decision replaces an older one, Membrick helps the
-assistant tell which information is current while keeping the history available
-when it matters.
+An agent can also use Membrick tools directly when it needs to search, save, or
+manage a memory. For example, `search` finds relevant project content, while
+`add_memory` saves a chosen memory. Other tools can list, read, or delete
+memories and provide feedback on search results.
 
-### Find the right context while you work
+These are explicit tool calls. They complement lifecycle hooks, which can
+retrieve context or capture content automatically. See the [MCP tool list and
+examples](mcp-memory-server.md).
 
-Membrick connects to supported AI tools. The assistant can look up relevant
-project context as you work, without you having to copy and paste old notes.
-Memories are saved with the project, so connected agents can use the same
-knowledge.
+## Project memory
 
-## What can it remember?
+Project memory lives under `.membrick/memory/`. Connected agents use the same
+project store, while Membrick keeps source and provider attribution with the
+records. The resident owns project writes so connected clients share one
+consistent store.
 
-Anything useful to future work: how you prefer answers, why a technical choice
-was made, what has already been tried, or what still needs to happen. You can
-also add, edit, or remove memory files yourself.
+Use the MCP tools or a supported client to manage memories. You can inspect the
+project data on disk, but the service should remain responsible for writing and
+indexing it.
 
-Membrick keeps its project memory in `.membrick/memory`. You stay in control of
-those files and can inspect them at any time.
+## Get started
 
-## Use it with your AI assistant
+[Connect your AI tool](connect-agent.md){ .md-button .md-button--primary }
 
-Set up Membrick for the AI tool you already use. Once connected, supported tools
-can search project memories and save useful outcomes as work continues.
-
-[Choose your AI tool and follow the setup steps](connect-agent.md){ .md-button .md-button--primary }
-
-You can also [try it from the command line](quickstart.md) or read about the
-[available agent integrations](agents.md).
+You can also try memory from the [command line](quickstart.md) or connect an
+application through the [HTTP API](api/http-overview.md), [Python](python.md),
+[Node.js](node.md), or [Rust](memory-client-rust.md) client.

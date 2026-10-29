@@ -20,34 +20,32 @@ meta:
 
 # MCP Memory Server: Agent Memory Over the Model Context Protocol
 
-Plenty of projects ship a "memory MCP server." Most of them do the same thing: store text blobs, return them by keyword or vector similarity, and call it memory. Your agent gets back whatever is topically related — including the decisions you already reversed.
+Membrick exposes workspace search, memory management, session recording, and
+review tools through the Model Context Protocol (MCP). Its retrieval core
+tracks current state, evidence, and supersession across supported clients.
 
-What you need is an MCP memory server that knows what is *still true*.
+## Tools
 
-## The problem with naive memory servers
-
-A typical memory MCP server gives your agent two operations: save this, find things like this. That breaks down in practice:
-
-- **No sense of time.** A decision from January and its reversal from June are equally retrievable. The server can't tell your agent which one is current. (This is the [stale-memory problem](stale-memory.md).)
-- **No evidence.** Results come back as bare text with no link to where they came from — no session, no revision, no provenance.
-- **Locked to one client.** Memory you build inside one agent's proprietary format doesn't travel.
-
-Membrick's MCP interface is built on the same retrieval core as everything else in the project: current-state ranking, evidence links, and supersession tracking — exposed as standard MCP tools any MCP-capable client can call.
-
-Bundled Rust MCP adapters connect to their resident workspace owner over local IPC; this is separate from the transport the agent uses to reach its MCP adapter. The standalone HTTP API remains available to custom clients and integrations. See the [local IPC architecture](local-ipc-architecture.md).
-
-## What the server gives your agent
-
-Seven tools, same names across every supported agent:
+Provider adapters expose these workspace search, memory, review, and session
+operations. Tool availability can vary slightly by provider; Codex also has the
+`membrick_session` tool. See the [MCP tools section of the agent connection guide](connect-agent.md#mcp-tools) for tool availability.
 
 | Tool | What it does |
 | --- | --- |
-| `search` | Search the indexed workspace, ranked by what's still true. Takes `query`, optional `top_k` (1–20). |
-| `info` | Basic information about the indexed workspace. |
-| `list_memories` | Bounded previews of indexed agent memories (`limit` 1–100, default 20). |
+| `search` | Search indexed workspace content and return ranked results with source evidence. |
+| `info` | Report workspace and connection information. |
+| `list_memories` | List bounded previews of indexed agent memories. |
+| `add_memory` | Add a memory you choose to save. |
+| `get_memory` | Read one memory by ID. |
+| `delete_memory` | Permanently delete a memory owned by the MCP integration. |
+| `review_search` | Retrieve a recorded search or page through unreviewed searches. |
+| `search_feedback` | Record usefulness and relevance feedback for a search. |
+| `enrich_doc` | Add evidence-backed metadata to an indexed source document. |
 | `record_session` | Start, stop, or inspect capture-only session recording. |
-| `enable_membrick` / `disable_membrick` | Toggle memory retrieval and capture without touching config. |
+| `enable_membrick` / `disable_membrick` | Enable or disable retrieval and automatic capture. |
 | `membrick_status` | Report independent memory and recording state. |
+| `update_membrick` | Install an available Membrick update after host approval. |
+| `membrick_session` | Return session information; Codex only. |
 
 MCP calls are explicit agent actions — the model calls `search` when it needs workspace evidence. (For automatic injection without a tool call, see the [lifecycle hooks](claude-code.md).)
 
@@ -119,7 +117,10 @@ For the full agent experience (automatic retrieval at session start, capture at 
 ## Frequently asked questions
 
 **Which clients can use the MCP server?**
-Any MCP-capable client. The same tool names are exposed through the Claude Code, Codex, Gemini CLI, and Antigravity CLI integrations, and the server speaks standard MCP JSON-RPC over the client's configured transport.
+Any MCP-capable client. Provider MCP adapters are available for Claude Code,
+Codex, Gemini CLI, Antigravity CLI, Muse Code, OpenClaw, Hermes, and Roo
+Runtime. They speak standard MCP JSON-RPC over the client's configured
+transport; Codex also exposes a session information tool.
 
 **Do I need the agent CLIs installed to use it?**
 No. MCP and server mode are general Membrick interfaces — an application doesn't need Claude Code, Codex, Gemini CLI, or Antigravity to use the core index, the HTTP API, or the MCP tools. Only the lifecycle hooks are agent-specific.
@@ -132,7 +133,7 @@ Memory state is project- and provider-scoped: the same project indexed once serv
 
 ## Go deeper
 
-- [MCP interface reference](mcp.md) — the complete tool contract and server modes
+- [Connect agent](connect-agent.md) — provider setup and available tools
 - [Stale agent memory](stale-memory.md) — why current-state ranking beats similarity ranking
 - [Claude Code memory](claude-code.md) / [Codex memory](codex.md) — the full agent integrations
 - [Agent memory guide](agent-memory.md) — the bigger picture on persistent agent memory

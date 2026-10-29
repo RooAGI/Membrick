@@ -101,16 +101,28 @@ pub fn run_hook_for(
             return write_output(&GeminiHookOutput::default());
         }
     };
+    crate::integrations::provider_lifecycle::note_activity(
+        &root,
+        provider.as_str(),
+        Some(&input.session_id),
+    );
     if let Err(error) =
         record_event_if_enabled(provider, &root, &input.session_id, kind.event_name(), raw)
     {
         tracing::warn!("Membrick {provider_label} session recording failed open: {error:#}");
     }
-    let mut output =
-        handle_hook(kind, &input, &root, provider, provider_label).unwrap_or_else(|error| {
-            tracing::warn!("Membrick {provider_label} hook failed open: {error:#}");
-            GeminiHookOutput::default()
-        });
+    let mut output = handle_hook_with_backend(
+        kind,
+        &input,
+        &root,
+        provider,
+        provider_label,
+        crate::integrations::mcp_tools::MemoryBackend::Resident,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!("Membrick {provider_label} hook failed open: {error:#}");
+        GeminiHookOutput::default()
+    });
     if kind == GeminiHookKind::SessionEnd {
         let memory = crate::integrations::mcp_index::shared_memory_root(&root);
         if memory.exists() {
@@ -134,12 +146,13 @@ fn write_output(output: &GeminiHookOutput) -> Result<()> {
     Ok(())
 }
 
-fn handle_hook(
+fn handle_hook_with_backend(
     kind: GeminiHookKind,
     input: &GeminiHookInput,
     _root: &Path,
     provider: RecordingProvider,
     provider_label: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<GeminiHookOutput> {
     if input.hook_event_name != kind.event_name() {
         anyhow::bail!("{provider_label} hook event mismatch")
@@ -172,9 +185,13 @@ fn handle_hook(
         return Ok(GeminiHookOutput::default());
     }
     match kind {
-        GeminiHookKind::AfterAgent => return capture(_root, input, provider, "outcome"),
-        GeminiHookKind::PreCompress => return capture(_root, input, provider, "checkpoint"),
-        GeminiHookKind::SessionEnd => return capture(_root, input, provider, "session-summary"),
+        GeminiHookKind::AfterAgent => return capture(_root, input, provider, "outcome", backend),
+        GeminiHookKind::PreCompress => {
+            return capture(_root, input, provider, "checkpoint", backend);
+        }
+        GeminiHookKind::SessionEnd => {
+            return capture(_root, input, provider, "session-summary", backend);
+        }
         _ => {}
     }
     if is_retrieval_hook(kind)
@@ -191,12 +208,13 @@ fn handle_hook(
         return Ok(GeminiHookOutput::default());
     }
     let started = std::time::Instant::now();
-    let results = crate::integrations::mcp_tools::search_hook_documents(
+    let results = crate::integrations::mcp_tools::search_hook_documents_with_backend(
         _root,
         provider.as_str(),
         Some(&input.session_id),
         &query,
         5,
+        backend,
     );
     let _ = crate::telemetry::record_project_query(
         _root,
@@ -259,6 +277,24 @@ fn handle_hook(
     })
 }
 
+#[cfg(test)]
+fn handle_hook(
+    kind: GeminiHookKind,
+    input: &GeminiHookInput,
+    root: &Path,
+    provider: RecordingProvider,
+    provider_label: &str,
+) -> Result<GeminiHookOutput> {
+    handle_hook_with_backend(
+        kind,
+        input,
+        root,
+        provider,
+        provider_label,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+
 fn is_retrieval_hook(kind: GeminiHookKind) -> bool {
     matches!(
         kind,
@@ -275,6 +311,7 @@ fn capture(
     input: &GeminiHookInput,
     provider: RecordingProvider,
     document_type: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<GeminiHookOutput> {
     let content = capture_content(input)?;
     if content.trim().is_empty() {
@@ -311,11 +348,12 @@ fn capture(
         key_phrases: Vec::new(),
         key_phrase_extraction_hash: String::new(),
     };
-    crate::integrations::mcp_tools::upsert_hook_document(
+    crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
         root,
         provider.as_str(),
         &input.session_id,
-        document,
+        vec![document],
+        backend,
     )?;
     Ok(GeminiHookOutput::default())
 }

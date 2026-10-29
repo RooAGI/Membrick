@@ -170,6 +170,34 @@ fn handle_hook(
     input: ClaudeHookInput,
     fallback_root: &Path,
 ) -> Result<ClaudeHookOutput> {
+    handle_hook_with_backend(
+        kind,
+        input,
+        fallback_root,
+        crate::integrations::mcp_tools::MemoryBackend::Resident,
+    )
+}
+
+#[cfg(test)]
+fn handle_hook_test(
+    kind: ClaudeHookKind,
+    input: ClaudeHookInput,
+    fallback_root: &Path,
+) -> Result<ClaudeHookOutput> {
+    handle_hook_with_backend(
+        kind,
+        input,
+        fallback_root,
+        crate::integrations::mcp_tools::MemoryBackend::InProcess,
+    )
+}
+
+fn handle_hook_with_backend(
+    kind: ClaudeHookKind,
+    input: ClaudeHookInput,
+    fallback_root: &Path,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<ClaudeHookOutput> {
     if input.hook_event_name != kind.event_name() {
         anyhow::bail!(
             "Claude hook event mismatch: expected {}, got {}",
@@ -180,6 +208,11 @@ fn handle_hook(
     let Some(root) = resolve_root(&input.cwd, fallback_root)? else {
         return Ok(ClaudeHookOutput::default());
     };
+    crate::integrations::provider_lifecycle::note_activity(
+        &root,
+        "claude",
+        Some(&input.session_id),
+    );
     // Keep every filesystem, resident IPC, and transcript operation inside
     // run_with_budget. Otherwise a stalled resident request can bypass the
     // hook timeout before capture/retrieval even starts.
@@ -244,12 +277,14 @@ fn handle_hook(
             kind.event_name(),
             &input.session_id,
             "decisions unresolved work failures implemented changes",
+            backend,
         ),
         ClaudeHookKind::UserPromptSubmit => retrieve(
             &root,
             kind.event_name(),
             &input.session_id,
             input.prompt.as_deref().unwrap_or_default(),
+            backend,
         ),
         ClaudeHookKind::UserPromptExpansion => {
             let query = [
@@ -263,32 +298,43 @@ fn handle_hook(
             .flatten()
             .collect::<Vec<_>>()
             .join(" ");
-            retrieve(&root, kind.event_name(), &input.session_id, &query)
+            retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
         }
         ClaudeHookKind::PostToolUse => {
             let query = tool_query(&input);
             if query_terms(&query).len() < MIN_TOOL_QUERY_TERMS {
                 return Ok(ClaudeHookOutput::default());
             }
-            retrieve(&root, kind.event_name(), &input.session_id, &query)
+            retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
         }
         ClaudeHookKind::PreToolUse => retrieve(
             &root,
             kind.event_name(),
             &input.session_id,
             &tool_query(&input),
+            backend,
         ),
-        ClaudeHookKind::PreCompact => capture(&root, input, ClaudeCodeDocumentType::Checkpoint),
+        ClaudeHookKind::PreCompact => {
+            capture(&root, input, ClaudeCodeDocumentType::Checkpoint, backend)
+        }
         ClaudeHookKind::Stop if input.stop_hook_active => Ok(ClaudeHookOutput::default()),
-        ClaudeHookKind::Stop => capture(&root, input, ClaudeCodeDocumentType::Outcome),
-        ClaudeHookKind::SessionEnd => capture(&root, input, ClaudeCodeDocumentType::SessionSummary),
+        ClaudeHookKind::Stop => capture(&root, input, ClaudeCodeDocumentType::Outcome, backend),
+        ClaudeHookKind::SessionEnd => capture(
+            &root,
+            input,
+            ClaudeCodeDocumentType::SessionSummary,
+            backend,
+        ),
         ClaudeHookKind::SubagentStart => retrieve(
             &root,
             kind.event_name(),
             &input.session_id,
             input.prompt.as_deref().unwrap_or_default(),
+            backend,
         ),
-        ClaudeHookKind::SubagentStop => capture(&root, input, ClaudeCodeDocumentType::Outcome),
+        ClaudeHookKind::SubagentStop => {
+            capture(&root, input, ClaudeCodeDocumentType::Outcome, backend)
+        }
     }?;
     if kind == ClaudeHookKind::SessionEnd && memory_root(&root).exists() {
         MemoryService::deactivate_session_at_path(
@@ -317,6 +363,7 @@ fn retrieve(
     event_name: &str,
     session_id: &str,
     query: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<ClaudeHookOutput> {
     if query.trim().is_empty() {
         return Ok(ClaudeHookOutput::default());
@@ -325,12 +372,13 @@ fn retrieve(
         return Ok(ClaudeHookOutput::default());
     }
     let started = std::time::Instant::now();
-    let results = crate::integrations::mcp_tools::search_hook_documents(
+    let results = crate::integrations::mcp_tools::search_hook_documents_with_backend(
         root,
         "claude",
         Some(session_id),
         query,
         DEFAULT_TOP_K * 3,
+        backend,
     );
     let _ = crate::telemetry::record_project_query(
         root,
@@ -459,11 +507,12 @@ fn capture(
     root: &Path,
     input: ClaudeHookInput,
     document_type: ClaudeCodeDocumentType,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<ClaudeHookOutput> {
     let Some(transcript_path) = input.transcript_path.as_deref() else {
         return Ok(ClaudeHookOutput::default());
     };
-    if crate::integrations::mcp_tools::resident_backend_enabled() {
+    if backend.is_resident() {
         let mut capture_input = serde_json::to_value(&input)?;
         capture_input["transcript_path"] = serde_json::to_value(transcript_path.canonicalize()?)?;
         capture_input["cwd"] = serde_json::to_value(root.canonicalize()?)?;
@@ -477,7 +526,7 @@ fn capture(
     }
     let state_dir = provider_state_dir(RecordingProvider::Claude, root);
     transcript_cursor::replay_batches(&state_dir, &input.session_id, transcript_path, |slice| {
-        capture_slice(root, &input, document_type, slice)
+        capture_slice(root, &input, document_type, slice, backend)
     })?;
     Ok(ClaudeHookOutput::default())
 }
@@ -487,14 +536,16 @@ fn capture_slice(
     input: &ClaudeHookInput,
     document_type: ClaudeCodeDocumentType,
     slice: &transcript_cursor::TranscriptSlice,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<()> {
     let documents = build_capture_documents(root, input, document_type, slice)?;
     if !documents.is_empty() {
-        crate::integrations::mcp_tools::upsert_hook_documents(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             root,
             "claude",
             &input.session_id,
             documents,
+            backend,
         )?;
     }
     Ok(())
@@ -891,7 +942,15 @@ mod tests {
             &hook_input.session_id,
             &transcript,
             1,
-            |slice| capture_slice(&root, &hook_input, ClaudeCodeDocumentType::Outcome, slice),
+            |slice| {
+                capture_slice(
+                    &root,
+                    &hook_input,
+                    ClaudeCodeDocumentType::Outcome,
+                    slice,
+                    crate::integrations::mcp_tools::MemoryBackend::InProcess,
+                )
+            },
         )
         .unwrap();
 
@@ -939,7 +998,7 @@ mod tests {
         )).unwrap();
         let mut stop = input(&root, Some(transcript), "Stop");
         stop.turn_id = Some("latest".into());
-        handle_hook(ClaudeHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop, &root).unwrap();
         let store = open_store(&root).unwrap();
         let documents = store.source_documents();
         let capture = documents
@@ -967,12 +1026,12 @@ mod tests {
         .unwrap();
         let mut stop = input(&root, Some(transcript.clone()), "Stop");
         stop.turn_id = Some("turn-a".into());
-        handle_hook(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
         append_line(
             &transcript,
             r#"{"turn_id":"turn-a","message":{"role":"assistant","content":"An answer"}}"#,
         );
-        handle_hook(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
         let before = {
             let store = open_store(&root).unwrap();
             store
@@ -985,7 +1044,7 @@ mod tests {
                 .collect::<HashSet<_>>()
         };
         fs::remove_dir_all(provider_state_dir(RecordingProvider::Claude, &root)).unwrap();
-        handle_hook(ClaudeHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop, &root).unwrap();
         let store = open_store(&root).unwrap();
         let after = store
             .source_documents()
@@ -1018,7 +1077,7 @@ mod tests {
             }
             let mut stop = input(&root, Some(transcript.clone()), "Stop");
             stop.turn_id = Some(turn_id.into());
-            handle_hook(ClaudeHookKind::Stop, stop, &root).unwrap();
+            handle_hook_test(ClaudeHookKind::Stop, stop, &root).unwrap();
         }
         let store = open_store(&root).unwrap();
         let documents = store.source_documents();
@@ -1046,7 +1105,7 @@ mod tests {
     #[test]
     fn session_start_does_not_create_memory_store() {
         let root = temp_dir("session-start");
-        let output = handle_hook(
+        let output = handle_hook_test(
             ClaudeHookKind::SessionStart,
             input(&root, None, "SessionStart"),
             &root,
@@ -1061,7 +1120,7 @@ mod tests {
     #[test]
     fn empty_prompt_does_not_open_memory_store() {
         let root = temp_dir("empty-prompt");
-        let output = handle_hook(
+        let output = handle_hook_test(
             ClaudeHookKind::UserPromptSubmit,
             input(&root, None, "UserPromptSubmit"),
             &root,
@@ -1078,7 +1137,7 @@ mod tests {
         set_membrick_state(RecordingProvider::Claude, &root, false).unwrap();
         let mut prompt = input(&root, None, "UserPromptSubmit");
         prompt.prompt = Some("retrieve prior routing decision".to_string());
-        let output = handle_hook(ClaudeHookKind::UserPromptSubmit, prompt, &root).unwrap();
+        let output = handle_hook_test(ClaudeHookKind::UserPromptSubmit, prompt, &root).unwrap();
         assert!(output.hook_specific_output.is_none());
         assert!(!memory_root(&root).join("index.json").exists());
         fs::remove_dir_all(root).unwrap();
@@ -1105,7 +1164,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_hook(
+        handle_hook_test(
             ClaudeHookKind::Stop,
             input(&root, Some(transcript), "Stop"),
             &root,
@@ -1122,7 +1181,7 @@ mod tests {
 
         let mut prompt = input(&root, None, "UserPromptSubmit");
         prompt.prompt = Some("How is cobalt routing configured?".into());
-        let output = handle_hook(ClaudeHookKind::UserPromptSubmit, prompt, &root).unwrap();
+        let output = handle_hook_test(ClaudeHookKind::UserPromptSubmit, prompt, &root).unwrap();
         assert!(output.hook_specific_output.is_none());
         fs::remove_dir_all(root).unwrap();
     }
@@ -1138,7 +1197,7 @@ mod tests {
         .unwrap();
         let mut stop = input(&root, Some(transcript), "Stop");
         stop.stop_hook_active = true;
-        let output = handle_hook(ClaudeHookKind::Stop, stop, &root).unwrap();
+        let output = handle_hook_test(ClaudeHookKind::Stop, stop, &root).unwrap();
         assert!(output.hook_specific_output.is_none());
         assert!(!memory_root(&root).exists());
         fs::remove_dir_all(root).unwrap();
@@ -1160,7 +1219,7 @@ mod tests {
         .unwrap();
 
         let stop_input = input(&root, Some(transcript.clone()), "Stop");
-        handle_hook(ClaudeHookKind::Stop, stop_input.clone(), &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop_input.clone(), &root).unwrap();
         let mut stored = open_store(&root).unwrap();
         stored.refresh_index().unwrap();
         assert_eq!(
@@ -1171,7 +1230,7 @@ mod tests {
         let records_after_first_capture = stored.records().len();
         drop(stored);
 
-        handle_hook(ClaudeHookKind::Stop, stop_input, &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop_input, &root).unwrap();
         let mut stored = open_store(&root).unwrap();
         stored.refresh_index().unwrap();
         assert_eq!(
@@ -1188,7 +1247,7 @@ mod tests {
 
         let mut prompt = input(&root, None, "UserPromptSubmit");
         prompt.prompt = Some("docker routing".to_string());
-        let output = handle_hook(ClaudeHookKind::UserPromptSubmit, prompt, &root).unwrap();
+        let output = handle_hook_test(ClaudeHookKind::UserPromptSubmit, prompt, &root).unwrap();
         let context = output
             .hook_specific_output
             .expect("captured memory should be retrieved")
@@ -1199,7 +1258,8 @@ mod tests {
         expansion.command_name = Some("review".to_string());
         expansion.command_args = Some("docker routing".to_string());
         expansion.prompt = Some("/review docker routing".to_string());
-        let output = handle_hook(ClaudeHookKind::UserPromptExpansion, expansion, &root).unwrap();
+        let output =
+            handle_hook_test(ClaudeHookKind::UserPromptExpansion, expansion, &root).unwrap();
         assert!(output
             .hook_specific_output
             .unwrap()
@@ -1326,7 +1386,7 @@ mod tests {
                     ),
                 );
             }
-            handle_hook(kind, input(&root, Some(transcript.clone()), event), &root).unwrap();
+            handle_hook_test(kind, input(&root, Some(transcript.clone()), event), &root).unwrap();
         }
 
         let store = open_store(&root).unwrap();
@@ -1370,7 +1430,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_hook(
+        handle_hook_test(
             ClaudeHookKind::Stop,
             input(&root, Some(transcript), "Stop"),
             &root,
@@ -1380,7 +1440,7 @@ mod tests {
         let mut post_tool = input(&root, None, "PostToolUse");
         post_tool.tool_name = Some("Bash".to_string());
         post_tool.tool_input = Some(serde_json::json!({"command": "cargo test search"}));
-        let output = handle_hook(ClaudeHookKind::PostToolUse, post_tool, &root).unwrap();
+        let output = handle_hook_test(ClaudeHookKind::PostToolUse, post_tool, &root).unwrap();
         assert!(output.hook_specific_output.is_some());
         let context = output.hook_specific_output.unwrap().additional_context;
         assert!(context.contains("search"));
@@ -1404,7 +1464,7 @@ mod tests {
         )
         .unwrap();
 
-        handle_hook(
+        handle_hook_test(
             ClaudeHookKind::Stop,
             input(&root, Some(transcript), "Stop"),
             &root,
@@ -1413,7 +1473,7 @@ mod tests {
 
         let mut subagent = input(&root, None, "SubagentStart");
         subagent.prompt = Some("auth module JWT signing".to_string());
-        let output = handle_hook(ClaudeHookKind::SubagentStart, subagent, &root).unwrap();
+        let output = handle_hook_test(ClaudeHookKind::SubagentStart, subagent, &root).unwrap();
         let context = output
             .hook_specific_output
             .expect("relevant memory should be retrieved")
@@ -1436,10 +1496,10 @@ mod tests {
         .unwrap();
 
         let stop_input = input(&root, Some(transcript.clone()), "SubagentStop");
-        handle_hook(ClaudeHookKind::SubagentStop, stop_input.clone(), &root).unwrap();
+        handle_hook_test(ClaudeHookKind::SubagentStop, stop_input.clone(), &root).unwrap();
         let records_after_first_capture = open_store(&root).unwrap().records().len();
         assert_eq!(records_after_first_capture, 2);
-        handle_hook(ClaudeHookKind::SubagentStop, stop_input, &root).unwrap();
+        handle_hook_test(ClaudeHookKind::SubagentStop, stop_input, &root).unwrap();
 
         let store = open_store(&root).unwrap();
         assert_eq!(
@@ -1478,12 +1538,12 @@ mod tests {
         )
         .unwrap();
         let stop = input(&root, Some(transcript.clone()), "Stop");
-        handle_hook(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
         append_line(
             &transcript,
             r#"{"type":"assistant","message":{"role":"assistant","content":"Switched to the amber cache"}}"#,
         );
-        handle_hook(ClaudeHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop, &root).unwrap();
 
         let store = open_store(&root).unwrap();
         let records = store.source_documents();
@@ -1530,7 +1590,7 @@ mod tests {
         )
         .unwrap();
         let stop = input(&root, Some(transcript.clone()), "Stop");
-        handle_hook(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop.clone(), &root).unwrap();
         fs::write(
             &transcript,
             concat!(
@@ -1539,7 +1599,7 @@ mod tests {
             ),
         )
         .unwrap();
-        handle_hook(ClaudeHookKind::Stop, stop, &root).unwrap();
+        handle_hook_test(ClaudeHookKind::Stop, stop, &root).unwrap();
 
         let store = open_store(&root).unwrap();
         let outcomes = store

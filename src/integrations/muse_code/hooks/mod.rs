@@ -94,6 +94,11 @@ pub fn handle_hook(kind: MuseHookKind, input: &MuseHookInput, fallback_root: &Pa
     };
     let root = crate::state_paths::find_project_root(start)?
         .context("no installed Membrick project covers Muse working folder")?;
+    crate::integrations::provider_lifecycle::note_activity(
+        &root,
+        RecordingProvider::Muse.as_str(),
+        Some(&input.session_id),
+    );
     let payload = serde_json::json!({
         "hook_event_name": input.hook_event_name,
         "model": input.model,

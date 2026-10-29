@@ -3,6 +3,22 @@
 use super::*;
 
 impl MemoryService {
+    /// Search a frozen/read-only view without mutating conversation state.
+    pub(crate) fn query_plain_cached(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<crate::SearchResult>> {
+        self.search_with_filters_cached(
+            query,
+            "integration",
+            None,
+            top_k,
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+    }
+
     /// The API-facing search entry point (HTTP server, Python bindings).
     ///
     /// This is a thin wrapper — it is NOT a separate retrieval path. All
@@ -16,16 +32,38 @@ impl MemoryService {
     /// (argument translation + response shaping only) so the HTTP/Python
     /// path and the MCP/benchmark path can never diverge.
     pub fn search(&mut self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
-        self.search_impl(request)
+        self.search_impl(request, None)
+    }
+
+    pub fn search_with_filter_ast(
+        &mut self,
+        request: SearchRequest,
+        filter_ast: &Mem0FilterExpr,
+    ) -> anyhow::Result<SearchResponse> {
+        filter_ast.validate_mem0_fields()?;
+        self.search_impl(request, Some(filter_ast))
     }
 
     /// Search the already-published index snapshot. Server callers use this
     /// under a shared service lock after mutations have refreshed the index.
     pub fn search_cached(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
-        self.search_impl_cached(request)
+        self.search_impl_cached(request, None)
     }
 
-    fn search_impl(&mut self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
+    pub fn search_cached_with_filter_ast(
+        &self,
+        request: SearchRequest,
+        filter_ast: &Mem0FilterExpr,
+    ) -> anyhow::Result<SearchResponse> {
+        filter_ast.validate_mem0_fields()?;
+        self.search_impl_cached(request, Some(filter_ast))
+    }
+
+    fn search_impl(
+        &mut self,
+        request: SearchRequest,
+        filter_ast: Option<&Mem0FilterExpr>,
+    ) -> anyhow::Result<SearchResponse> {
         if !request.user_id.trim().is_empty() {
             validate_identifier(&request.user_id, "user_id")?;
         }
@@ -56,7 +94,18 @@ impl MemoryService {
                 }
             }
         }
-        let results = if self.requires_visibility_allow_list() {
+        let results = if let Some(filter_ast) = filter_ast {
+            let allowed = self.filter_ast_doc_ids(&filters, filter_ast);
+            self.search_with_filters_restricted(
+                &request.query,
+                &scope,
+                request.session_id.as_deref(),
+                request.top_k,
+                &filters,
+                request.reference_date.as_deref(),
+                &allowed,
+            )?
+        } else if self.requires_visibility_allow_list() {
             let allowed_doc_ids = self.visible_doc_ids_matching(&filters);
             self.search_with_filters_restricted(
                 &request.query,
@@ -80,7 +129,11 @@ impl MemoryService {
         Ok(self.format_search_response(results))
     }
 
-    fn search_impl_cached(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
+    fn search_impl_cached(
+        &self,
+        request: SearchRequest,
+        filter_ast: Option<&Mem0FilterExpr>,
+    ) -> anyhow::Result<SearchResponse> {
         if !request.user_id.trim().is_empty() {
             validate_identifier(&request.user_id, "user_id")?;
         }
@@ -106,7 +159,18 @@ impl MemoryService {
                 }
             }
         }
-        let results = if self.requires_visibility_allow_list() {
+        let results = if let Some(filter_ast) = filter_ast {
+            let allowed = self.filter_ast_doc_ids(&filters, filter_ast);
+            self.search_with_filters_cached_and_allowed_doc_ids(
+                &request.query,
+                &scope,
+                request.session_id.as_deref(),
+                request.top_k,
+                &filters,
+                request.reference_date.as_deref(),
+                Some(&allowed),
+            )?
+        } else if self.requires_visibility_allow_list() {
             let allowed_doc_ids = self.visible_doc_ids_matching(&filters);
             self.search_with_filters_cached_and_allowed_doc_ids(
                 &request.query,
@@ -128,6 +192,26 @@ impl MemoryService {
             )?
         };
         Ok(self.format_search_response(results))
+    }
+
+    fn filter_ast_doc_ids(
+        &self,
+        mandatory_filters: &BTreeMap<String, String>,
+        filter_ast: &Mem0FilterExpr,
+    ) -> HashSet<String> {
+        self.store
+            .source_documents()
+            .into_iter()
+            .filter(|doc| {
+                self.is_visible(doc)
+                    && !is_session_observation(doc)
+                    && mandatory_filters.iter().all(|(key, value)| {
+                        doc.filters.get(key).is_some_and(|actual| actual == value)
+                    })
+                    && filter_ast.matches(doc)
+            })
+            .map(|doc| doc.doc_id.clone())
+            .collect()
     }
 
     pub(super) fn is_visible(&self, doc: &SourceDocument) -> bool {
@@ -194,6 +278,26 @@ impl MemoryService {
         filters: &BTreeMap<String, String>,
         reference_date: Option<&str>,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
+        self.search_with_filters_and_comparison_operands(
+            query,
+            scope,
+            session_id,
+            top_k,
+            filters,
+            reference_date,
+        )
+        .map(|(results, _)| results)
+    }
+
+    pub(crate) fn search_with_filters_and_comparison_operands(
+        &mut self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filters: &BTreeMap<String, String>,
+        reference_date: Option<&str>,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
         // Query-time key-phrase backfill: documents written by provider
         // hooks (separate short-lived processes whose background workers
         // die with them) get their phrases extracted synchronously here, so
@@ -203,7 +307,7 @@ impl MemoryService {
         self.flush()?;
         if self.requires_visibility_allow_list() {
             let allowed_doc_ids = self.visible_doc_ids_matching(filters);
-            self.search_with_filters_cached_and_allowed_doc_ids(
+            self.search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
                 query,
                 scope,
                 session_id,
@@ -213,7 +317,7 @@ impl MemoryService {
                 Some(&allowed_doc_ids),
             )
         } else {
-            self.search_with_filters_cached(
+            self.search_with_filters_cached_and_comparison_operands(
                 query,
                 scope,
                 session_id,
@@ -432,7 +536,30 @@ impl MemoryService {
         filters: &BTreeMap<String, String>,
         reference_date: Option<&str>,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
-        self.search_with_filters_cached_and_allowed_doc_ids(
+        self.search_with_filters_cached_and_comparison_operands(
+            query,
+            scope,
+            session_id,
+            top_k,
+            filters,
+            reference_date,
+        )
+        .map(|(results, _)| results)
+    }
+
+    /// Search and return the comparison operands from the same analysis used
+    /// for retrieval, so MCP response formatting doesn't analyze the query
+    /// again.
+    pub(super) fn search_with_filters_cached_and_comparison_operands(
+        &self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filters: &BTreeMap<String, String>,
+        reference_date: Option<&str>,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
+        self.search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
             query,
             scope,
             session_id,
@@ -453,6 +580,28 @@ impl MemoryService {
         reference_date: Option<&str>,
         additional_allowed_doc_ids: Option<&HashSet<String>>,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
+        self.search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
+            query,
+            scope,
+            session_id,
+            top_k,
+            filters,
+            reference_date,
+            additional_allowed_doc_ids,
+        )
+        .map(|(results, _)| results)
+    }
+
+    fn search_with_filters_cached_and_allowed_doc_ids_and_comparison_operands(
+        &self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filters: &BTreeMap<String, String>,
+        reference_date: Option<&str>,
+        additional_allowed_doc_ids: Option<&HashSet<String>>,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
         // Prepare the question once. Session follow-ups must be resolved from
         // the raw question before PreparedQuery derives its analysis and
         // augmented lexical search text.
@@ -479,6 +628,14 @@ impl MemoryService {
                 reference_date,
                 Arc::clone(&reasoning_rules),
             )
+        };
+        let comparison_operands = if prepared.analysis().intent
+            == crate::query_semantics::QueryIntent::Compare
+            && prepared.analysis().comparison_operands.len() == 2
+        {
+            prepared.analysis().comparison_operands.clone()
+        } else {
+            Vec::new()
         };
         // Synthetic document terms (Luyi 2026-10-07): bekind's mapping lives
         // in the index, not in the query. Each document's canonical
@@ -513,13 +670,12 @@ impl MemoryService {
         } else {
             top_k
         };
-        let comparison_operands = &prepared.analysis().comparison_operands;
         let is_explicit_comparison = prepared.analysis().intent
             == crate::query_semantics::QueryIntent::Compare
             && comparison_operands.len() == 2;
         let mut lexical = if is_explicit_comparison {
             let mut per_operand = Vec::with_capacity(comparison_operands.len());
-            for operand in comparison_operands {
+            for operand in &comparison_operands {
                 let operand_prepared = match reference_date {
                     Some(date) => PreparedQuery::new_at_with_rules(
                         operand,
@@ -558,7 +714,7 @@ impl MemoryService {
                     side_results.truncate(depth);
                 }
                 let user_id = filters.get(USER_FILTER).cloned().unwrap_or_default();
-                let structured = if user_id.is_empty() {
+                let mut structured = if user_id.is_empty() {
                     Vec::new()
                 } else {
                     let request = SearchRequest {
@@ -579,6 +735,9 @@ impl MemoryService {
                         Arc::clone(&reasoning_rules),
                     )
                 };
+                if let Some(allowed_doc_ids) = additional_allowed_doc_ids {
+                    structured.retain(|hit| allowed_doc_ids.contains(&hit.doc_id));
+                }
                 side_results = blend_structured_first(structured, side_results, depth);
                 for result in &mut side_results {
                     result.comparison_operands.push(operand.clone());
@@ -623,7 +782,7 @@ impl MemoryService {
         // ahead of the lexical results. The ownership filter comes from the
         // caller's filters when present (benchmark); provider-scoped callers
         // (MCP) get no structured results, which is safe — lexical still works.
-        let structured = if is_explicit_comparison {
+        let mut structured = if is_explicit_comparison {
             Vec::new()
         } else {
             let user_id = filters.get(USER_FILTER).cloned().unwrap_or_default();
@@ -653,6 +812,9 @@ impl MemoryService {
                 )
             }
         };
+        if let Some(allowed_doc_ids) = additional_allowed_doc_ids {
+            structured.retain(|hit| allowed_doc_ids.contains(&hit.doc_id));
+        }
         let results = blend_structured_first(
             structured,
             lexical,
@@ -677,7 +839,7 @@ impl MemoryService {
             &prepared,
             &results,
         );
-        Ok(results)
+        Ok((results, comparison_operands))
     }
 }
 

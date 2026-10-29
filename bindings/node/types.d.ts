@@ -1,14 +1,14 @@
 export interface MemoryOptions {
-  /** Persistent local store path. Omit for an in-memory local service. */
+  /** Existing project root whose resident owns the memory service. */
   path?: string
-  /** Connect to the resident HTTP server instead of opening a local store. */
+  /** Remote Membrick HTTP service URL. Cannot be combined with path. */
   baseUrl?: string
-  /** Optional bearer token for the HTTP server. */
+  /** Optional bearer token for baseUrl. */
   apiKey?: string
-  /** Local-only entity provider: heuristic (default) or spacy. */
-  nerProvider?: 'heuristic' | 'spacy'
-  /** Optional local-only spaCy model override. */
-  spacyModel?: string
+  /** Request timeout in milliseconds. Defaults to 30000. */
+  requestTimeoutMs?: number
+  /** Override the bundled Membrick resident executable used for project connections. */
+  residentExecutable?: string
 }
 
 export interface Message {
@@ -17,47 +17,6 @@ export interface Message {
   timestamp?: number | null
   expires_at_ms?: number | null
   supersedes_id?: string | null
-}
-
-export interface AddRequest {
-  request_id: string
-  user_id: string
-  session_id: string
-  messages: Message[]
-}
-
-export interface SearchRequest {
-  query: string
-  user_id: string
-  top_k?: number
-  session_id?: string | null
-  scope?: string | null
-  filters?: Record<string, string> | null
-  reference_date?: string | null
-  options?: string[] | null
-}
-
-export interface GetRequest {
-  user_id: string
-  memory_id: string
-  include_inactive?: boolean
-}
-
-export interface ListRequest {
-  user_id: string
-  session_id?: string | null
-  limit?: number
-  cursor?: string | null
-  include_inactive?: boolean
-}
-
-export interface UpdateRequest {
-  user_id: string
-  memory_id: string
-  content: string
-  role?: string | null
-  timestamp?: number | null
-  expires_at_ms?: number | null
 }
 
 export interface MemoryRecord {
@@ -72,12 +31,55 @@ export interface MemoryRecord {
   metadata: Record<string, string>
 }
 
-export interface SearchMemory extends Partial<MemoryRecord> {
+export interface SearchMemory {
   id: string
   content: string
   score: number
+  created_at?: string
+  role: string | null
+  user_id: string | null
+  session_id: string | null
   relation_evidence?: string[]
+  comparison_operands?: string[]
+  claim_states?: Array<Record<string, unknown>>
 }
+
+export interface AddOptions {
+  requestId?: string
+  sessionId?: string
+  waitForVisibility?: boolean
+}
+
+export interface SearchOptions {
+  topK?: number
+  sessionId?: string
+  filters?: Record<string, string>
+  scope?: string
+  referenceDate?: string
+  options?: string[]
+}
+
+export interface ListOptions {
+  sessionId?: string
+  limit?: number
+  cursor?: string
+  includeInactive?: boolean
+}
+
+export interface UpdateOptions {
+  role?: string
+  timestamp?: number
+  expiresAtMs?: number
+}
+
+export interface SessionSearchOptions extends Omit<SearchOptions, 'sessionId'> {}
+
+export type MemoryErrorCode = 'REJECTED' | 'UNCERTAIN' | 'UNAVAILABLE' | 'CONFIGURATION'
+export interface MemoryError extends Error {
+  code: MemoryErrorCode
+  status?: number
+}
+export declare function isMemoryError(value: unknown): value is MemoryError
 
 export interface ListResponse {
   data: MemoryRecord[]
@@ -92,16 +94,36 @@ export interface AddResponse {
   adjudication?: unknown
 }
 
+export interface AddTransactionRequest {
+  request_id: string
+  user_id: string
+  session_id: string
+  messages: Message[]
+  metadata?: Record<string, unknown>
+}
+
 export declare class Memory {
-  constructor(options?: MemoryOptions)
-  add(requestId: string, userId: string, sessionId: string, messages: Message[]): Promise<AddResponse>
-  addBatch(requests: AddRequest[]): Promise<AddResponse[]>
-  search(query: string, userId: string, topK?: number, sessionId?: string, filters?: Record<string, string>, scope?: string): Promise<SearchMemory[]>
+  static init(options: MemoryOptions): Memory
+  constructor(options: MemoryOptions)
+  add(messages: Message[], userId: string, options?: AddOptions): Promise<AddResponse>
+  addTransaction(requests: AddTransactionRequest[]): Promise<AddResponse[]>
+  search(query: string, userId: string, options?: SearchOptions): Promise<SearchMemory[]>
   get(memoryId: string, userId: string, includeInactive?: boolean): Promise<MemoryRecord | null>
-  list(userId: string, sessionId?: string, limit?: number, cursor?: string, includeInactive?: boolean): Promise<ListResponse>
-  update(memoryId: string, userId: string, content: string, role?: string, timestamp?: number, expiresAtMs?: number): Promise<MemoryRecord | null>
-  delete(userId: string, memoryId: string): Promise<boolean>
+  list(userId: string, options?: ListOptions): Promise<ListResponse>
+  update(memoryId: string, userId: string, content: string, options?: UpdateOptions): Promise<MemoryRecord | null>
+  delete(memoryId: string, userId: string): Promise<boolean>
   refresh(): Promise<void>
+  close(): void
+  session(userId: string, sessionId: string): MemorySession
+}
+
+/** A client view that pins user and session identity across calls. */
+export declare class MemorySession {
+  readonly userId: string
+  readonly sessionId: string
+  close(): void
+  add(messages: Message[], options?: Pick<AddOptions, 'requestId' | 'waitForVisibility'>): Promise<AddResponse>
+  search(query: string, options?: SessionSearchOptions): Promise<SearchMemory[]>
 }
 
 export declare function version(): string

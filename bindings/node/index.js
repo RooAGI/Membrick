@@ -89,8 +89,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-android-arm64')
         const bindingPackageVersion = require('@rooagi/membrick-android-arm64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -105,8 +105,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-android-arm-eabi')
         const bindingPackageVersion = require('@rooagi/membrick-android-arm-eabi/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -126,8 +126,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-win32-x64-gnu')
           const bindingPackageVersion = require('@rooagi/membrick-win32-x64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -142,8 +142,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-win32-x64-msvc')
           const bindingPackageVersion = require('@rooagi/membrick-win32-x64-msvc/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -159,8 +159,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-win32-ia32-msvc')
         const bindingPackageVersion = require('@rooagi/membrick-win32-ia32-msvc/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -175,8 +175,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-win32-arm64-msvc')
         const bindingPackageVersion = require('@rooagi/membrick-win32-arm64-msvc/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -194,8 +194,8 @@ function requireNative() {
     try {
       const binding = require('@rooagi/membrick-darwin-universal')
       const bindingPackageVersion = require('@rooagi/membrick-darwin-universal/package.json').version
-      if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-        throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+      if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+        throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
       }
       return binding
     } catch (e) {
@@ -210,8 +210,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-darwin-x64')
         const bindingPackageVersion = require('@rooagi/membrick-darwin-x64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -226,8 +226,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-darwin-arm64')
         const bindingPackageVersion = require('@rooagi/membrick-darwin-arm64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -246,8 +246,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-freebsd-x64')
         const bindingPackageVersion = require('@rooagi/membrick-freebsd-x64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -262,8 +262,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-freebsd-arm64')
         const bindingPackageVersion = require('@rooagi/membrick-freebsd-arm64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -283,8 +283,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-x64-musl')
           const bindingPackageVersion = require('@rooagi/membrick-linux-x64-musl/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -299,8 +299,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-x64-gnu')
           const bindingPackageVersion = require('@rooagi/membrick-linux-x64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -317,8 +317,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-arm64-musl')
           const bindingPackageVersion = require('@rooagi/membrick-linux-arm64-musl/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -333,8 +333,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-arm64-gnu')
           const bindingPackageVersion = require('@rooagi/membrick-linux-arm64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -351,8 +351,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-arm-musleabihf')
           const bindingPackageVersion = require('@rooagi/membrick-linux-arm-musleabihf/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -367,8 +367,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-arm-gnueabihf')
           const bindingPackageVersion = require('@rooagi/membrick-linux-arm-gnueabihf/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -385,8 +385,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-loong64-musl')
           const bindingPackageVersion = require('@rooagi/membrick-linux-loong64-musl/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -401,8 +401,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-loong64-gnu')
           const bindingPackageVersion = require('@rooagi/membrick-linux-loong64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -419,8 +419,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-riscv64-musl')
           const bindingPackageVersion = require('@rooagi/membrick-linux-riscv64-musl/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -435,8 +435,8 @@ function requireNative() {
         try {
           const binding = require('@rooagi/membrick-linux-riscv64-gnu')
           const bindingPackageVersion = require('@rooagi/membrick-linux-riscv64-gnu/package.json').version
-          if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-            throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+            throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
           return binding
         } catch (e) {
@@ -452,8 +452,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-linux-ppc64-gnu')
         const bindingPackageVersion = require('@rooagi/membrick-linux-ppc64-gnu/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -468,8 +468,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-linux-s390x-gnu')
         const bindingPackageVersion = require('@rooagi/membrick-linux-s390x-gnu/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -488,8 +488,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-openharmony-arm64')
         const bindingPackageVersion = require('@rooagi/membrick-openharmony-arm64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -504,8 +504,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-openharmony-x64')
         const bindingPackageVersion = require('@rooagi/membrick-openharmony-x64/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -520,8 +520,8 @@ function requireNative() {
       try {
         const binding = require('@rooagi/membrick-openharmony-arm')
         const bindingPackageVersion = require('@rooagi/membrick-openharmony-arm/package.json').version
-        if (bindingPackageVersion !== '0.7.3' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
-          throw new Error(`Native binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+        if (bindingPackageVersion !== '0.8.0' && process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
+          throw new Error(`Native binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
         }
         return binding
       } catch (e) {
@@ -661,8 +661,8 @@ if (!nativeBinding || forceWasi) {
       if (!candidateFailed) {
         if (process.env.NAPI_RS_ENFORCE_VERSION_CHECK && process.env.NAPI_RS_ENFORCE_VERSION_CHECK !== '0') {
           const bindingPackageVersion = require('@rooagi/membrick-wasm32-wasi/package.json').version
-          if (bindingPackageVersion !== '0.7.3') {
-            throw new Error(`WASI binding package version mismatch, expected 0.7.3 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
+          if (bindingPackageVersion !== '0.8.0') {
+            throw new Error(`WASI binding package version mismatch, expected 0.8.0 but got ${bindingPackageVersion}. You can reinstall dependencies to fix this issue.`)
           }
         }
         wasiBinding = require('@rooagi/membrick-wasm32-wasi')
@@ -779,4 +779,86 @@ function __napiStampBindingTarget(exportsObject, target) {
 module.exports.__napiBindingTarget = __napiStampBindingTarget(nativeBinding, __napiLoadedBindingTarget)
 module.exports = nativeBinding
 module.exports.Memory = nativeBinding.Memory
+module.exports.MemorySession = nativeBinding.MemorySession
 module.exports.version = nativeBinding.version
+
+
+// membrick:error-codes:start
+const __memoryErrorCodes = new Set(['REJECTED', 'UNCERTAIN', 'UNAVAILABLE', 'CONFIGURATION'])
+function __decorateMemoryError(error) {
+  if (!error || typeof error.message !== 'string') return error
+  const match = /^\[MEMBRICK_ERROR code=(REJECTED|UNCERTAIN|UNAVAILABLE|CONFIGURATION)(?: status=(\d+))?\]\s*/.exec(error.message)
+  if (!match) return error
+  error.code = match[1]
+  if (match[2] !== undefined) error.status = Number(match[2])
+  error.message = error.message.slice(match[0].length)
+  return error
+}
+function __wrapMemoryMethod(prototype, name) {
+  const original = prototype && prototype[name]
+  if (typeof original !== 'function') return
+  prototype[name] = function (...args) {
+    try {
+      return Promise.resolve(original.apply(this, args)).catch((error) => { throw __decorateMemoryError(error) })
+    } catch (error) {
+      throw __decorateMemoryError(error)
+    }
+  }
+}
+for (const name of ['add', 'search', 'get', 'list', 'update', 'delete', 'refresh']) {
+  __wrapMemoryMethod(module.exports.Memory && module.exports.Memory.prototype, name)
+  __wrapMemoryMethod(module.exports.MemorySession && module.exports.MemorySession.prototype, name)
+}
+const __nativeMemory = module.exports.Memory
+function __bundledResidentExecutable() {
+  let packageName
+  if (process.platform === 'darwin') {
+    if (process.arch === 'arm64') packageName = '@rooagi/membrick-darwin-arm64'
+    if (process.arch === 'x64') packageName = '@rooagi/membrick-darwin-x64'
+  } else if (process.platform === 'linux') {
+    if (process.arch === 'arm64') packageName = '@rooagi/membrick-linux-arm64-gnu'
+    if (process.arch === 'x64') packageName = '@rooagi/membrick-linux-x64-gnu'
+  } else if (process.platform === 'win32' && process.arch === 'x64') {
+    packageName = '@rooagi/membrick-win32-x64-msvc'
+  }
+  if (!packageName) return undefined
+  try {
+    const packageJson = require.resolve(packageName + '/package.json')
+    const executable = require('node:path').join(require('node:path').dirname(packageJson), process.platform === 'win32' ? 'membrick.exe' : 'membrick')
+    return require('node:fs').existsSync(executable) ? executable : undefined
+  } catch {
+    return undefined
+  }
+}
+function __withResidentExecutable(args) {
+  const options = args[0]
+  if (!options || typeof options !== 'object' || !options.path || options.residentExecutable) return args
+  const residentExecutable = __bundledResidentExecutable()
+  return [{ ...options, residentExecutable }, ...args.slice(1)]
+}
+if (__nativeMemory) {
+  function Memory(...args) {
+    if (!new.target) throw new TypeError('Memory must be constructed with new')
+    try { return Reflect.construct(__nativeMemory, __withResidentExecutable(args), new.target) }
+    catch (error) { throw __decorateMemoryError(error) }
+  }
+  Memory.prototype = __nativeMemory.prototype
+  Object.setPrototypeOf(Memory, __nativeMemory)
+  if (typeof __nativeMemory.init === 'function') {
+    Object.defineProperty(Memory, 'init', {
+      value: function (options) {
+        try {
+          return __nativeMemory.init(...__withResidentExecutable([options]))
+        } catch (error) {
+          throw __decorateMemoryError(error)
+        }
+      },
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    })
+  }
+  module.exports.Memory = Memory
+}
+module.exports.isMemoryError = (value) =>
+  value instanceof Error && __memoryErrorCodes.has(value.code)

@@ -74,9 +74,7 @@ replaced or edited, the cursor is rejected and pagination should restart from
 the first page. Appending new records does not invalidate an existing cursor.
 Each page is capped at 8 MiB of history records, and records over 16 MiB are
 skipped and counted in the response.
-See the [MCP interface](mcp.md#tools) and the
-[document enrichment implementation plan](document-enrichment-plan.md) for
-scope and current limitations.
+See the [MCP tools](connect-agent.md#mcp-tools) for the supported operations.
 
 ## Provider lifecycle events
 

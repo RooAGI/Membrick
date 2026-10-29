@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="405" viewBox="0 0 720 405" role="img" aria-labelledby="title desc">
+  <title id="title">Host Membrick your way</title>
+  <desc id="desc">Three equal illustrations for running Membrick on a local server, in Docker, or through its HTTP API.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#e9f5fb"/><stop offset="1" stop-color="#f8edf6"/></linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#2879ad"/><stop offset="1" stop-color="#bb4e9a"/></linearGradient>
+  </defs>
+  <rect width="720" height="405" rx="18" fill="url(#bg)"/>
+  <g fill="#fff" stroke="#c7dce8" stroke-width="2">
+    <rect x="28" y="34" width="206" height="337" rx="16"/>
+    <rect x="257" y="34" width="206" height="337" rx="16"/>
+    <rect x="486" y="34" width="206" height="337" rx="16"/>
+  </g>
+  <g fill="none" stroke="url(#line)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="98" y="91" width="66" height="49" rx="7"/><path d="M91 151h80M112 140v11m38-11v11M131 107v17m-9-9 9 9 9-9"/>
+    <path d="M327 104h64l12 14v42h-89v-42z"/><path d="M314 118h89M335 101l-8 17m31-17-8 17m31-17-8 17M329 136h9m15 0h9m15 0h9"/>
+    <path d="M554 106h70a9 9 0 0 1 9 9v48a9 9 0 0 1-9 9h-70a9 9 0 0 1-9-9v-48a9 9 0 0 1 9-9Z"/><path d="m569 120-12 17 12 17m38-34 12 17-12 17m-12-40-13 46"/>
+  </g>
+  <g font-family="Inter,Arial,sans-serif" text-anchor="middle" fill="#172b3c">
+    <text x="131" y="248" font-size="17" font-weight="800" letter-spacing="2">LOCAL SERVER</text>
+    <text x="360" y="248" font-size="17" font-weight="800" letter-spacing="2">DOCKER</text>
+    <text x="589" y="248" font-size="17" font-weight="800" letter-spacing="2">HTTP API</text>
+    <text x="131" y="280" font-size="13" fill="#586d7e">Your machine</text>
+    <text x="360" y="280" font-size="13" fill="#586d7e">Container</text>
+    <text x="589" y="280" font-size="13" fill="#586d7e">API reference</text>
+  </g>
+</svg>

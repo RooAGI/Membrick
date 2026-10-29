@@ -2,9 +2,16 @@ use crate::index::SearchResult;
 use crate::integrations::mcp_transport::{JsonRpcError, JsonRpcResponse, ToolDefinition};
 use crate::memory_api::MemoryService;
 use crate::source::SourceDocument;
+use membrick_extension_api::{
+    CapabilityId, DocumentQuery, ExtensionContext, ExtensionDocument, ExtensionError,
+    ExtensionHttpRequest, ExtensionHttpResponse, ExtensionRouteMatch, InvocationIdentity,
+    ScopedDocumentStore,
+};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::rc::Rc;
 
 pub(crate) fn provider_filter_values() -> Vec<&'static str> {
     crate::provider_sources::PROVIDERS
@@ -16,8 +23,19 @@ pub(crate) fn provider_filter_values() -> Vec<&'static str> {
         .collect()
 }
 
-pub(crate) const fn resident_backend_enabled() -> bool {
-    !cfg!(test)
+/// Selects where an integration sends memory operations. Production entry
+/// points construct with `Resident`; in-process behavior is selected only by
+/// explicit unit-test fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryBackend {
+    Resident,
+    InProcess,
+}
+
+impl MemoryBackend {
+    pub(crate) const fn is_resident(self) -> bool {
+        matches!(self, Self::Resident)
+    }
 }
 
 /// Whether the resident backend has either half of the searchable project
@@ -31,23 +49,6 @@ pub(crate) fn has_search_store(root: &Path) -> bool {
         || membrick_root
             .join(crate::memory_api::workspace::WORKSPACE_MEMORY_NAME)
             .is_dir()
-}
-
-fn post_resident_json(
-    root: &Path,
-    path: &str,
-    payload: &Value,
-) -> anyhow::Result<(reqwest::StatusCode, Value)> {
-    let (status, body, _) = crate::local_ipc::post_json_with_transport(root, path, payload)?;
-    Ok((status, body))
-}
-
-fn post_resident_json_with_transport(
-    root: &Path,
-    path: &str,
-    payload: &Value,
-) -> anyhow::Result<(reqwest::StatusCode, Value, &'static str)> {
-    crate::local_ipc::post_json_with_transport(root, path, payload)
 }
 
 fn resident_text_response(id: Option<Value>, text: &str) -> JsonRpcResponse {
@@ -132,45 +133,46 @@ pub(crate) fn call_resident_tool(
     arguments: &Value,
 ) -> anyhow::Result<JsonRpcResponse> {
     let root = root.canonicalize()?;
-    let (status, mut body, transport) = match post_resident_json_with_transport(
-        &root,
-        "/provider-memory/mcp/tools/call",
-        &json!({
-            "workspace": root,
-            "provider": provider,
-            "user_id": MCP_MEMORY_USER_ID,
-            "session_id": arguments.get("session_id"),
-            "tool": tool,
-            "arguments": arguments,
-        }),
+    let workspace = root.to_string_lossy().into_owned();
+    let client = match crate::memory_client::Memory::new(&root) {
+        Ok(client) => client,
+        Err(error) => return Ok(resident_error_response(id, -32602, &error.to_string())),
+    };
+    let context = crate::memory_client::AgentOperationContext {
+        workspace: Some(workspace),
+        provider: provider.to_owned(),
+        session_id: None,
+    };
+    let may_mutate = extension_tool_is_mutating(tool)
+        || matches!(
+            tool,
+            "add_memory" | "delete_memory" | "update_memory" | "refresh"
+        );
+    let (mut body, transport) = match client.call_workspace_tool_with_transport(
+        &context,
+        tool,
+        arguments.clone(),
+        may_mutate,
     ) {
-        Ok(response) => response,
+        Ok(result) => result,
         Err(error) => {
-            return Ok(resident_error_response(
-                id,
-                -32002,
-                &format!("resident Membrick IPC service unavailable: {error}"),
-            ));
+            let code = match &error {
+                crate::memory_client::MemoryError::Unavailable { .. } => -32002,
+                crate::memory_client::MemoryError::Uncertain { .. } => -32003,
+                crate::memory_client::MemoryError::Rejected { .. }
+                | crate::memory_client::MemoryError::Configuration { .. } => -32602,
+            };
+            return Ok(resident_error_response(id, code, &error.to_string()));
         }
     };
-    if !status.is_success() {
-        let detail = body
-            .get("detail")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| body.to_string());
-        return Ok(resident_error_response(
-            id,
-            -32602,
-            &format!("resident memory tool failed (HTTP {status}): {detail}"),
-        ));
-    }
     if tool == "info" {
-        let endpoint = crate::local_ipc::transport_endpoint(&root, transport);
-        let transport = json!({"transport":transport, "status":"connected", "endpoint":endpoint});
-        if let Some(info) = body.as_object_mut() {
-            info.insert("server".to_string(), transport);
-        }
+        let server = body
+            .as_object_mut()
+            .expect("successful info response is an object")
+            .entry("server")
+            .or_insert_with(|| json!({}));
+        server["status"] = json!("connected");
+        server["transport"] = json!(transport);
     }
     Ok(resident_text_response(
         id,
@@ -347,17 +349,23 @@ pub(crate) fn submit_transcript_capture(
     input: Value,
 ) -> anyhow::Result<()> {
     let root = root.canonicalize()?;
-    let (status, body) = post_resident_json(
-        &root,
-        "/provider-memory/captures",
-        &json!({
-            "workspace":root, "provider":provider, "document_type":document_type, "input":input,
-        }),
-    )?;
-    anyhow::ensure!(
-        status == reqwest::StatusCode::ACCEPTED,
-        "resident rejected transcript capture: {status}: {body}"
-    );
+    let client = crate::Memory::new(&root).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    client
+        .submit_capture(
+            &crate::agent::AgentOperationContext {
+                workspace: Some(root.to_string_lossy().into_owned()),
+                provider: provider.to_owned(),
+                session_id: input
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+            crate::agent::CaptureRequest {
+                document_type: document_type.to_owned(),
+                input,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(())
 }
 
@@ -379,8 +387,23 @@ pub(crate) fn upsert_hook_documents(
     session_id: &str,
     documents: Vec<crate::SourceDocument>,
 ) -> anyhow::Result<()> {
-    #[cfg(test)]
-    {
+    upsert_hook_documents_with_backend(
+        root,
+        provider,
+        session_id,
+        documents,
+        MemoryBackend::Resident,
+    )
+}
+
+pub(crate) fn upsert_hook_documents_with_backend(
+    root: &Path,
+    provider: &str,
+    session_id: &str,
+    documents: Vec<crate::SourceDocument>,
+    backend: MemoryBackend,
+) -> anyhow::Result<()> {
+    if !backend.is_resident() {
         let _ = (provider, session_id);
         return MemoryService::with_shared_memory(root, |service| {
             for document in documents {
@@ -389,32 +412,21 @@ pub(crate) fn upsert_hook_documents(
             service.refresh_index()
         });
     }
-    #[cfg(not(test))]
-    {
-        anyhow::ensure!(
-            provider_filter_values().contains(&provider),
-            "invalid provider"
-        );
-        let root = root.canonicalize()?;
-        let (status, body) = post_resident_json(
-            &root,
-            "/provider-memory/mcp/documents/upsert",
-            &json!({
-                "workspace": root,
-                "provider": provider,
-                "session_id": session_id,
-                "user_id": MCP_MEMORY_USER_ID,
-                "documents": documents,
-            }),
-        )?;
-        anyhow::ensure!(
-            status.is_success(),
-            "resident memory server rejected hook capture: {} {}",
-            status,
-            body.get("detail").and_then(Value::as_str).unwrap_or("")
-        );
-        Ok(())
-    }
+    let root = root.canonicalize()?;
+    let client = crate::Memory::new(&root).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    client
+        .publish_capture_documents(
+            &crate::agent::AgentOperationContext {
+                workspace: Some(root.to_string_lossy().into_owned()),
+                provider: provider.to_owned(),
+                session_id: Some(session_id.to_owned()),
+            },
+            session_id,
+            documents,
+            None,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(())
 }
 
 pub(crate) fn replace_hook_documents(
@@ -425,40 +437,47 @@ pub(crate) fn replace_hook_documents(
     value: &str,
     documents: Vec<crate::SourceDocument>,
 ) -> anyhow::Result<()> {
-    #[cfg(test)]
-    {
+    replace_hook_documents_with_backend(
+        root,
+        provider,
+        session_id,
+        key,
+        value,
+        documents,
+        MemoryBackend::Resident,
+    )
+}
+
+pub(crate) fn replace_hook_documents_with_backend(
+    root: &Path,
+    provider: &str,
+    session_id: &str,
+    key: &str,
+    value: &str,
+    documents: Vec<crate::SourceDocument>,
+    backend: MemoryBackend,
+) -> anyhow::Result<()> {
+    if !backend.is_resident() {
         return MemoryService::with_shared_memory(root, |service| {
             service.replace_source_group(key, value, documents)?;
             service.refresh_index()
         });
     }
-    #[cfg(not(test))]
-    {
-        anyhow::ensure!(
-            provider_filter_values().contains(&provider),
-            "invalid provider"
-        );
-        let root = root.canonicalize()?;
-        let (status, body) = post_resident_json(
-            &root,
-            "/provider-memory/mcp/documents/upsert",
-            &json!({
-                "workspace": root,
-                "provider": provider,
-                "session_id": session_id,
-                "user_id": MCP_MEMORY_USER_ID,
-                "replace_group":{"key":key,"value":value},
-                "documents": documents,
-            }),
-        )?;
-        anyhow::ensure!(
-            status.is_success(),
-            "resident memory server rejected hook capture: {} {}",
-            status,
-            body.get("detail").and_then(Value::as_str).unwrap_or("")
-        );
-        Ok(())
-    }
+    let root = root.canonicalize()?;
+    let client = crate::Memory::new(&root).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    client
+        .publish_capture_documents(
+            &crate::agent::AgentOperationContext {
+                workspace: Some(root.to_string_lossy().into_owned()),
+                provider: provider.to_owned(),
+                session_id: Some(session_id.to_owned()),
+            },
+            session_id,
+            documents,
+            Some((key.to_owned(), value.to_owned())),
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(())
 }
 
 /// Search the resident published view for a hook retrieval request.
@@ -469,8 +488,25 @@ pub(crate) fn search_hook_documents(
     query: &str,
     top_k: usize,
 ) -> anyhow::Result<Value> {
-    #[cfg(test)]
-    {
+    search_hook_documents_with_backend(
+        root,
+        provider,
+        session_id,
+        query,
+        top_k,
+        MemoryBackend::Resident,
+    )
+}
+
+pub(crate) fn search_hook_documents_with_backend(
+    root: &Path,
+    provider: &str,
+    session_id: Option<&str>,
+    query: &str,
+    top_k: usize,
+    backend: MemoryBackend,
+) -> anyhow::Result<Value> {
+    if !backend.is_resident() {
         let ignore_paths = [
             "node_modules",
             "target",
@@ -499,32 +535,36 @@ pub(crate) fn search_hook_documents(
             },
         )
         .and_then(|mut service| {
-            let results = service.search_for_hook(query, provider, session_id, top_k)?;
-            Ok(filter_automatic_context_results(search_results_for_query(
-                &service, query, results,
-            )))
+            let (results, comparison_operands) = service
+                .search_for_hook_with_comparison_operands(query, provider, session_id, top_k)?;
+            Ok(filter_automatic_context_results(
+                search_results_for_query_with_comparison_operands(
+                    &service,
+                    query,
+                    results,
+                    &comparison_operands,
+                ),
+            ))
         });
     }
-    #[cfg(not(test))]
-    {
-        let mut arguments = json!({"query":query,"top_k":top_k});
-        if let Some(session_id) = session_id.filter(|session_id| !session_id.trim().is_empty()) {
-            arguments["session_id"] = json!(session_id);
-        }
-        let response = call_resident_tool(None, root, provider, "search", &arguments)?;
-        if let Some(error) = response.error {
-            anyhow::bail!("resident search failed: {}", error.message);
-        }
-        let encoded = response
-            .result
-            .as_ref()
-            .and_then(|result| result.pointer("/content/0/text"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("resident search returned no result payload"))?;
-        Ok(filter_automatic_context_results(serde_json::from_str(
-            encoded,
-        )?))
-    }
+    let root = root.canonicalize()?;
+    let client = crate::Memory::new(&root).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let response = client
+        .workspace_search(
+            &crate::agent::AgentOperationContext {
+                workspace: Some(root.to_string_lossy().into_owned()),
+                provider: provider.to_owned(),
+                session_id: session_id
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_owned),
+            },
+            query,
+            top_k,
+        )
+        .map_err(|error| anyhow::anyhow!("resident search failed: {error}"))?;
+    Ok(filter_automatic_context_results(serde_json::to_value(
+        response,
+    )?))
 }
 
 /// JSON Schema fragment for the optional `provider` search argument.
@@ -645,6 +685,20 @@ pub(crate) fn search_results_for_query(
     format_search_results(service, Some(query), results)
 }
 
+pub(crate) fn search_results_for_query_with_comparison_operands(
+    service: &MemoryService,
+    query: &str,
+    results: Vec<SearchResult>,
+    comparison_operands: &[String],
+) -> Value {
+    format_search_results_with_comparison_operands(
+        service,
+        Some(query),
+        results,
+        comparison_operands,
+    )
+}
+
 fn format_search_results(
     service: &MemoryService,
     query: Option<&str>,
@@ -654,6 +708,15 @@ fn format_search_results(
         .map(|query| service.comparison_operands_for_query(query))
         .filter(|operands| operands.len() == 2)
         .unwrap_or_default();
+    format_search_results_with_comparison_operands(service, query, results, &comparison_operands)
+}
+
+fn format_search_results_with_comparison_operands(
+    service: &MemoryService,
+    query: Option<&str>,
+    results: Vec<SearchResult>,
+    comparison_operands: &[String],
+) -> Value {
     let comparison_coverage = (!comparison_operands.is_empty()).then(|| {
         let sides = comparison_operands
             .iter()
@@ -873,686 +936,452 @@ pub(crate) fn list_memories_tool_definition() -> ToolDefinition {
 // Agent bulletin board tools.
 // ---------------------------------------------------------------------------
 
-/// Tool definitions for the bulletin board. Every content operation takes an
-/// explicit `board_id`; boards are discovered via `board_list` or opened
-/// idempotently via `board_open` with a caller-supplied key.
-pub(crate) fn board_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "board_open".to_string(),
-            description: "Open a shared board by key, creating it if needed. Optionally pass an immutable board_template snapshot from the template owner and structured fields. Membrick stores that exact version and validates structured posts against it without looking up a catalog. Without a board_template, the board remains free-form. Calling board_open twice with the same key and same template returns the same board; a conflicting template is rejected. Share the returned board_id with subagents.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string", "description": "Caller-supplied board key, e.g. \"pr-81-review\". Unique within the workspace. \"default\" is reserved for the current session's board; keys starting with \"session:\" are rejected."},
-                    "title": {"type": "string", "description": "Human-readable board title."},
-                    "type": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$", "description": "Descriptive board type, e.g. project, planning, tasks, milestone, or general. It does not change board behavior."},
-                    "board_template": {"type":"object", "description":"Immutable versioned template and full schema/presentation snapshot from the template owner. The snapshot includes child post_templates.", "required":["contract_version","issuer","template_id","version","content_hash","snapshot"], "properties":{"contract_version":{"type":"integer","const":1},"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object","required":["schema","presentation","post_templates"],"properties":{"schema":{"type":"object"},"presentation":{"type":"object"},"post_templates":{"type":"array","maxItems":100,"items":{"type":"object"}}}}}},
-                    "fields": {"type":"object", "description":"Structured board values matching the pinned template schema. Unknown fields are preserved for forward compatibility."},
-                    "links": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"target": {"type": "string", "minLength": 1, "maxLength": 2048, "description": "Board ID, post ID, https URL, or repo: reference."}, "relation": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Agent-supplied relation label, e.g. contains, plans, tracks, depends_on, evidence_for."}}, "required": ["target", "relation"], "additionalProperties": false}},
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "required": ["key", "title"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "board_list".to_string(),
-            description: "List bulletin boards in this workspace with their IDs, keys, titles, types, and links. Includes the \"default\" entry pointing at the current session's board.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "board_info".to_string(),
-            description: "Show a board's details.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "board_id": {"type": "string", "description": "Board ID from board_open or board_list. Pass \"default\" for the current session's default board."},
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "required": ["board_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "board_post".to_string(),
-            description: "Post an update or structured item to a board. On a templated board, supply a post_template_id and exact post_template_version from the board's pinned snapshot plus fields matching its schema. Narrative content, title, and links remain optional. Unknown field values are preserved. Pass a unique request_id so retries are safe.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "board_id": {"type": "string", "description": "For a shared board, pass the exact board_id returned by board_open or board_post. Omit (or pass \"default\") only for this session's private default board."},
-                    "content": {"type": "string", "description": "Post content, e.g. \"The parser failure comes from the empty input path.\""},
-                    "title": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional short label for this post."},
-                    "post_template_id": {"type": "string", "description": "ID of a post template in the board's pinned board_template snapshot."},
-                    "post_template_version": {"type": "integer", "minimum": 1, "description": "Required on templated boards; exact version of post_template_id."},
-                    "fields": {"type": "object", "description": "Required on templated boards; structured data validated against the selected post template."},
-                    "links": {"type": "array", "maxItems": 100, "items": {"type": "object", "properties": {"target": {"type": "string", "minLength": 1, "maxLength": 2048}, "relation": {"type": "string", "minLength": 1, "maxLength": 64}}, "required": ["target", "relation"], "additionalProperties": false}},
-                    "request_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Unique ID for this post attempt; reuse the same ID and payload when retrying."},
-                    "author_agent_id": {"type": "string", "description": "Your agent ID (e.g. subagent ID). Defaults to the provider name."},
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "required": ["content", "request_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "board_read".to_string(),
-            description: "Read a board's posts in posting order. For reliable readback, pass the same explicit board_id returned by board_open or board_post; omitting it reads only the current session's default board. Pass after_sequence (from the last post you saw) to catch up on new posts only.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "board_id": {"type": "string", "description": "Pass the exact board_id returned by board_open or board_post to read that shared board. Omit (or pass \"default\") only for this session's private default board."},
-                    "after_sequence": {"type": "integer", "minimum": 0, "description": "Only return posts after this sequence number. Omit to read from the start."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "required": [],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "board_get".to_string(),
-            description: "Get one complete board post by ID. Omit board_id for the current session's default board.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "board_id": {"type": "string", "description": "Board ID from board_open or board_list. Omit (or pass \"default\") for the current session's default board."},
-                    "post_id": {"type": "string", "description": "Post ID from board_post or board_read."},
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "required": ["post_id"],
-                "additionalProperties": false
-            }),
-        },
-        ToolDefinition {
-            name: "board_search".to_string(),
-            description: "Search a board's older posts by keyword. Omit board_id to search the current session's default board.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "board_id": {"type": "string", "description": "Board ID from board_open or board_list. Omit (or pass \"default\") for the current session's default board."},
-                    "query": {"type": "string", "description": "Search query."},
-                    "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                    "session_id": {"type": "string", "description": "Conversation session ID. Defaults to the session most recently seen active in this workspace. Only needed to resolve the default board."},
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }),
-        },
-    ]
+/// Tool definitions gathered from all registered extensions.
+pub(crate) fn extension_tool_definitions() -> Vec<ToolDefinition> {
+    crate::extension_host::registry().tool_definitions()
 }
 
-/// Flow tools expose the provider-neutral lifecycle contract stored by
-/// Membrick. They record coordination and action intents; provider hosts are
-/// responsible for launching agents or consuming those intents.
-pub(crate) fn flow_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "flow_list".into(),
-            description: "List Flow runs visible in this workspace in stable ID order. Use flow_get for the event history and full projection.".into(),
-            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: "flow_create".into(),
-            description: "Create a durable Flow run from an existing board and an exact AgentFlow-owned FlowTemplate. Membrick has no FlowTemplate catalog; resolve the immutable definition through AgentFlow and provide it as flow_template. The FlowRun tracks stages and stage handoffs; work items and their progress are board posts. Reuse request_id for retries. Flow creation records coordination state; it does not launch an agent.".into(),
-            input_schema: json!({
-                "type":"object",
-                "properties":{
-                    "board_id":{"type":"string","description":"Existing workspace board that anchors this Flow."},
-                    "flow_template":{"type":"object","description":"Exact FlowTemplate resolved by AgentFlow and used to create this FlowRun. snapshot is the immutable definition, including template_id, version, content_hash, board_template, stages with descriptions, allowed stage transitions, coordinator/review policy, and retry_policy.max_attempts. Work is represented by board posts; task states and task retry states are not part of this contract.","required":["issuer","template_id","version","content_hash","snapshot"],"properties":{"issuer":{"type":"string","minLength":1,"maxLength":128},"template_id":{"type":"string","minLength":1,"maxLength":128},"version":{"type":"integer","minimum":1},"content_hash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"snapshot":{"type":"object"}}},
-                    "goal":{"type":"string","minLength":1},
-                    "references":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["board","post"]},"id":{"type":"string"},"relation":{"type":"string"}},"required":["kind","id","relation"],"additionalProperties":false}},
-                    "created_by":{"type":"string","description":"Agent identity creating the Flow; defaults to the provider identity."},
-                    "request_id":{"type":"string","description":"Unique idempotency key; reuse on retry."}
-                },
-                "required":["board_id","flow_template","goal","request_id"],
-                "additionalProperties":false
-            }),
-        },
-        ToolDefinition {
-            name: "flow_get".into(),
-            description: "Read a Flow's current projection and append-only event history.".into(),
-            input_schema: json!({"type":"object","properties":{"flow_id":{"type":"string"}},"required":["flow_id"],"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: "flow_event_append".into(),
-            description: "Append one validated Flow lifecycle event using expected_revision. Work units are board posts, not Flow tasks. After a subagent reports its post complete and the coordinator verifies it, use stage_changed with data.stage set to the next declared stage. After work in the terminal stage is complete, append stage_completed with data.stage set to that stage ID; Membrick then derives Flow state as completed. Mutations are append-only and idempotent by event_id/request_id. Use coordinator_claimed or coordinator_handed_off events to manage the coordinator fence. This records shared state and never dispatches an agent.".into(),
-            input_schema: json!({
-                "type":"object",
-                "properties":{
-                    "flow_id":{"type":"string"},
-                    "expected_revision":{"type":"integer","minimum":0,"description":"Exact current Flow revision from flow_get; stale revisions return a conflict."},
-                    "coordinator_fence":{"type":"integer","minimum":0,"description":"Current coordinator fencing token for coordinator-owned events."},
-                    "event_id":{"type":"string","description":"Stable unique event identity; reuse unchanged on retry."},
-                    "request_id":{"type":"string","description":"Idempotency key; reuse unchanged on retry."},
-                    "actor":{"type":"string","description":"Caller-supplied agent identity authoring the event. MCP does not authenticate this identity; coordinator checks are cooperative fencing, not participant authorization."},
-                    "kind":{"type":"string","enum":["flow_started","stage_changed","stage_completed","coordinator_claimed","coordinator_handed_off","coordinator_released","flow_cancelled","flow_failed","action_requested","action_consumed","reference_added"]},
-                    "post_id":{"type":"string","description":"Optional existing board post that records the work or evidence associated with this stage transition or outcome."},
-                    "data":{"type":"object","description":"Event-specific structured fields such as the next/current stage ID, failure reason, linked reference, or action name/payload."}
-                },
-                "required":["flow_id","expected_revision","event_id","request_id","actor","kind"],
-                "additionalProperties":false
-            }),
-        },
-        ToolDefinition {
-            name: "flow_pending_actions".into(),
-            description: "List durable pending action intents for a Flow. These are requests for the host/coordinator to act on, not worker launches performed by Membrick.".into(),
-            input_schema: json!({"type":"object","properties":{"flow_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}},"required":["flow_id"],"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: "flow_action_consume".into(),
-            description: "Mark one pending action intent as consumed after the host has handled it. Requires the current revision and coordinator fencing token; use a unique request_id for safe retries.".into(),
-            input_schema: json!({"type":"object","properties":{"flow_id":{"type":"string"},"action_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":0},"coordinator_fence":{"type":"integer","minimum":0},"consumer":{"type":"string","description":"Agent or host identity consuming the intent."},"request_id":{"type":"string"}},"required":["flow_id","action_id","expected_revision","coordinator_fence","consumer","request_id"],"additionalProperties":false}),
-        },
-    ]
+pub(crate) fn is_extension_tool_name(name: &str) -> bool {
+    crate::extension_host::registry().has_tool_name(name)
 }
 
-pub(crate) fn is_flow_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "flow_list"
-            | "flow_create"
-            | "flow_get"
-            | "flow_event_append"
-            | "flow_pending_actions"
-            | "flow_action_consume"
-    )
+pub(crate) fn extension_tool_is_mutating(name: &str) -> bool {
+    crate::extension_host::registry()
+        .tool_is_mutating_name(name)
+        .unwrap_or(false)
 }
 
-pub(crate) fn dispatch_flow_tool(
-    tool: &str,
-    arguments: &Value,
-    service: &mut MemoryService,
-    owner: &str,
-    workspace: &str,
-    provider: &str,
-) -> Result<Value, String> {
-    fn required_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
-        args.get(name)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| format!("missing required argument: {name}"))
-    }
-    let allowed: &[&str] = match tool {
-        "flow_list" => &[],
-        "flow_create" => &[
-            "board_id",
-            "flow_template",
-            "goal",
-            "references",
-            "created_by",
-            "request_id",
-        ],
-        "flow_get" => &["flow_id"],
-        "flow_event_append" => &[
-            "flow_id",
-            "expected_revision",
-            "coordinator_fence",
-            "event_id",
-            "request_id",
-            "actor",
-            "kind",
-            "post_id",
-            "data",
-        ],
-        "flow_pending_actions" => &["flow_id", "limit"],
-        "flow_action_consume" => &[
-            "flow_id",
-            "action_id",
-            "expected_revision",
-            "coordinator_fence",
-            "consumer",
-            "request_id",
-        ],
-        _ => return Err(format!("unknown flow tool: {tool}")),
-    };
-    if let Some(obj) = arguments.as_object() {
-        if let Some(unknown) = obj.keys().find(|key| !allowed.contains(&key.as_str())) {
-            return Err(format!("unknown {tool} argument: {unknown}"));
-        }
-    }
+type SharedExtensionService<'a> = Rc<RefCell<&'a mut MemoryService>>;
 
-    match tool {
-        "flow_list" => {
-            let flows = service
-                .flow_list(owner, workspace)
-                .map_err(|error| format!("{error:#}"))?;
-            Ok(json!({"flows": flows}))
-        }
-        "flow_create" => {
-            let board_id = required_str(arguments, "board_id")?;
-            let flow_template = arguments
-                .get("flow_template")
-                .cloned()
-                .ok_or_else(|| "missing required argument: flow_template".to_string())
-                .and_then(|value| {
-                    serde_json::from_value::<crate::flow::PinnedFlowTemplate>(value)
-                        .map_err(|error| format!("invalid flow_template: {error}"))
-                })?;
-            let goal = required_str(arguments, "goal")?;
-            let references = arguments
-                .get("references")
-                .cloned()
-                .map(serde_json::from_value::<Vec<crate::flow::FlowReference>>)
-                .transpose()
-                .map_err(|error| format!("invalid references: {error}"))?
-                .unwrap_or_default();
-            let created_by = arguments
-                .get("created_by")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(provider);
-            let request_id = required_str(arguments, "request_id")?;
-            let snapshot = service
-                .flow_create(
-                    owner,
-                    workspace,
-                    board_id,
-                    flow_template,
-                    goal,
-                    references,
-                    created_by,
-                    request_id,
-                )
-                .map_err(|error| format!("{error:#}"))?;
-            Ok(json!(snapshot))
-        }
-        "flow_get" => {
-            let flow_id = required_str(arguments, "flow_id")?;
-            let snapshot = service
-                .flow_get(owner, workspace, flow_id)
-                .map_err(|error| format!("{error:#}"))?
-                .ok_or_else(|| format!("unknown flow_id: {flow_id}"))?;
-            Ok(json!(snapshot))
-        }
-        "flow_event_append" => {
-            let mut event_args = arguments.clone();
-            event_args["owner"] = json!(owner);
-            event_args["workspace"] = json!(workspace);
-            if event_args.get("provider").is_none() {
-                event_args["provider"] = json!(provider);
-            }
-            let mut append: crate::flow::FlowEventAppend = serde_json::from_value(event_args)
-                .map_err(|error| format!("invalid Flow event: {error}"))?;
-            append.owner = owner.to_string();
-            append.workspace = workspace.to_string();
-            let snapshot = service
-                .flow_event_append(append)
-                .map_err(|error| format!("{error:#}"))?;
-            Ok(json!(snapshot))
-        }
-        "flow_pending_actions" => {
-            let flow_id = required_str(arguments, "flow_id")?;
-            let limit = arguments
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20)
-                .clamp(1, 100) as usize;
-            let actions = service
-                .flow_pending_actions(owner, workspace, flow_id, limit)
-                .map_err(|error| format!("{error:#}"))?;
-            Ok(json!({"actions": actions}))
-        }
-        "flow_action_consume" => {
-            let flow_id = required_str(arguments, "flow_id")?;
-            let action_id = required_str(arguments, "action_id")?;
-            let expected_revision = arguments
-                .get("expected_revision")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| "expected_revision must be a non-negative integer".to_string())?;
-            let coordinator_fence = arguments
-                .get("coordinator_fence")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| "coordinator_fence must be a non-negative integer".to_string())?;
-            let consumer = required_str(arguments, "consumer")?;
-            let request_id = required_str(arguments, "request_id")?;
-            let snapshot = service
-                .flow_action_consume(
-                    owner,
-                    workspace,
-                    flow_id,
-                    action_id,
-                    expected_revision,
-                    coordinator_fence,
-                    consumer,
-                    provider,
-                    request_id,
-                )
-                .map_err(|error| format!("{error:#}"))?;
-            Ok(json!(snapshot))
-        }
-        _ => Err(format!("unknown flow tool: {tool}")),
-    }
+struct McpExtensionDocuments<'a> {
+    service: SharedExtensionService<'a>,
+    owner: String,
+    workspace: String,
+    extension_id: String,
 }
 
-/// Dispatch a board tool call. Returns the JSON result payload, or an error
-/// string for invalid arguments / unknown boards.
-///
-/// `owner` is the stable memory owner (user_id), `workspace` the canonical
-/// project root, `provider` the calling provider ("claude", "codex").
-/// Every board_id comes from the agent's arguments and is validated
-/// against the store; unknown boards are errors, never implicit creations.
-pub(crate) fn dispatch_board_tool(
-    tool: &str,
-    arguments: &Value,
-    service: &mut MemoryService,
-    owner: &str,
-    workspace: &str,
-    provider: &str,
-) -> Result<Value, String> {
-    use crate::board::BoardPost;
-
-    fn get_str<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
-        args.get(name)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("missing required argument: {name}"))
+impl McpExtensionDocuments<'_> {
+    fn storage_id(&self, id: &str) -> String {
+        format!(
+            "extension:{}:{}:{id}",
+            self.extension_id.len(),
+            self.extension_id
+        )
     }
-    fn parse_links(args: &Value) -> Result<Vec<crate::board::BoardLink>, String> {
-        let Some(value) = args.get("links") else {
-            return Ok(Vec::new());
+
+    fn matches_scope(&self, document: &SourceDocument) -> bool {
+        let filters = &document.filters;
+        filters.get("doc_kind").map(String::as_str) == Some("extension_document")
+            && filters.get("extension_id") == Some(&self.extension_id)
+            && filters.get("extension_owner") == Some(&self.owner)
+            && filters.get("extension_workspace") == Some(&self.workspace)
+    }
+
+    fn decode(
+        document: &SourceDocument,
+        extension_id: &str,
+    ) -> Result<ExtensionDocument, ExtensionError> {
+        let is_generic_extension_document = document
+            .filters
+            .get("doc_kind")
+            .is_some_and(|kind| kind == "extension_document");
+        let kind = document
+            .filters
+            .get("extension_kind")
+            .or_else(|| document.filters.get("doc_kind"))
+            .cloned()
+            .unwrap_or_else(|| document.source.clone());
+        let value = if is_generic_extension_document {
+            serde_json::from_str(document.content.as_ref()).map_err(|error| {
+                ExtensionError::new(format!("invalid stored extension document: {error}"))
+            })?
+        } else {
+            // Preserve the complete legacy record as opaque generic JSON so
+            // its owning extension can migrate its own persisted schema.
+            serde_json::to_value(document).map_err(|error| {
+                ExtensionError::new(format!("failed to encode legacy document: {error}"))
+            })?
         };
-        let items = value
-            .as_array()
-            .ok_or_else(|| "links must be an array".to_string())?;
-        let mut links = Vec::with_capacity(items.len());
-        for item in items {
-            let object = item
-                .as_object()
-                .ok_or_else(|| "each link must be an object".to_string())?;
-            if object
-                .keys()
-                .any(|key| key != "target" && key != "relation")
-            {
-                return Err("link objects accept only target and relation".to_string());
-            }
-            links.push(
-                serde_json::from_value(item.clone())
-                    .map_err(|error| format!("invalid board link: {error}"))?,
-            );
-        }
-        Ok(links)
-    }
-    fn board_json(board: &crate::board::Board) -> Value {
-        json!({
-            "board_id": board.board_id,
-            "key": board.key,
-            "title": board.title,
-            "type": board.board_type,
-            "board_template": board.board_template,
-            "fields": board.fields,
-            "links": board.links,
-            "owner": board.owner,
-            "workspace": board.workspace,
-            "created_at": board.created_at,
+        Ok(ExtensionDocument {
+            id: document
+                .doc_id
+                .strip_prefix(&format!(
+                    "extension:{}:{}:",
+                    extension_id.len(),
+                    extension_id
+                ))
+                .unwrap_or(&document.doc_id)
+                .to_string(),
+            kind,
+            value,
         })
     }
-    fn post_json(post: &BoardPost) -> Value {
-        json!({
-            "post_id": post.post_id,
-            "board_id": post.board_id,
-            "author_agent_id": post.author_agent_id,
-            "provider": post.provider,
-            "title": post.title,
-            "session_key": post.session_key,
-            "content": post.content,
-            "links": post.links,
-            "post_template_id": post.post_template_id,
-            "post_template_version": post.post_template_version,
-            "fields": post.fields,
-            "sequence": post.sequence,
-            "created_at": post.created_at,
-        })
-    }
-    // Reject unknown arguments per tool.
-    let allowed: &[&str] = match tool {
-        "board_open" => &[
-            "key",
-            "title",
-            "type",
-            "board_template",
-            "fields",
-            "links",
-            "session_id",
-        ],
-        "board_list" => &["session_id"],
-        "board_info" => &["board_id", "session_id"],
-        "board_post" => &[
-            "board_id",
-            "content",
-            "request_id",
-            "author_agent_id",
-            "title",
-            "post_template_id",
-            "post_template_version",
-            "fields",
-            "links",
-            "session_id",
-        ],
-        "board_read" => &["board_id", "after_sequence", "limit", "session_id"],
-        "board_get" => &["board_id", "post_id", "session_id"],
-        "board_search" => &["board_id", "query", "top_k", "session_id"],
-        _ => return Err(format!("unknown board tool: {tool}")),
-    };
-    if let Some(obj) = arguments.as_object() {
-        if let Some(unknown) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(format!("unknown {tool} argument: {unknown}"));
-        }
-    }
-    // Optional board_id: omitted (or the "default" alias) means the
-    // current session's board.
-    let opt_board_id = arguments
-        .get("board_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    // Session for default-board resolution: explicit `session_id` arg,
-    // else the session most recently seen active in this workspace
-    // (hook-tracked, same as search).
+}
 
-    match tool {
-        "board_open" => {
-            let key = get_str(arguments, "key")?;
-            let title = get_str(arguments, "title")?;
-            let board_type = match arguments.get("type") {
-                Some(value) => value
-                    .as_str()
-                    .ok_or_else(|| "type must be a string".to_string())?,
-                None => crate::board::DEFAULT_BOARD_TYPE,
-            };
-            let links = parse_links(arguments)?;
-            let board_template = arguments
-                .get("board_template")
-                .cloned()
-                .map(serde_json::from_value::<crate::board::PinnedBoardTemplate>)
-                .transpose()
-                .map_err(|error| format!("invalid board_template: {error}"))?;
-            let fields = arguments.get("fields");
-            // The "default" key is an alias for the current session's
-            // board, not a separate board.
-            let board = if crate::board::is_default_alias(key) {
-                if board_type != crate::board::DEFAULT_BOARD_TYPE
-                    || !links.is_empty()
-                    || board_template.is_some()
-                    || fields.is_some()
-                {
-                    return Err(
-                        "the session default board cannot be typed or linked; open a named board"
-                            .to_string(),
-                    );
-                }
-                let session_id = resolve_search_session_id(arguments, &*service, provider)?
-                    .ok_or_else(|| {
-                        "no active session: pass session_id to board_open \"default\"".to_string()
-                    })?;
-                service
-                    .board_open_session(owner, workspace, &session_id, title)
-                    .map_err(|e| e.to_string())?
-            } else {
-                service
-                    .board_open_or_create(
-                        owner,
-                        workspace,
-                        key,
-                        title,
-                        board_type,
-                        &links,
-                        board_template.as_ref(),
-                        fields,
-                    )
-                    .map_err(|e| e.to_string())?
-            };
-            Ok(board_json(&board))
+impl ScopedDocumentStore for McpExtensionDocuments<'_> {
+    fn get(&self, id: &str) -> Result<Option<ExtensionDocument>, ExtensionError> {
+        let storage_id = self.storage_id(id);
+        let service = self.service.borrow();
+        let found = service
+            .source_documents()
+            .into_iter()
+            .find(|document| document.doc_id == storage_id && self.matches_scope(document));
+        found
+            .map(|document| Self::decode(document, &self.extension_id))
+            .transpose()
+    }
+
+    fn list(&self, kind: Option<&str>) -> Result<Vec<ExtensionDocument>, ExtensionError> {
+        let service = self.service.borrow();
+        service
+            .source_documents()
+            .into_iter()
+            .filter(|document| {
+                self.matches_scope(document)
+                    && kind.is_none_or(|kind| {
+                        document.filters.get("extension_kind").map(String::as_str) == Some(kind)
+                    })
+            })
+            .map(|document| Self::decode(document, &self.extension_id))
+            .collect()
+    }
+
+    fn search(&self, query: &DocumentQuery) -> Result<Vec<ExtensionDocument>, ExtensionError> {
+        if query.limit == 0 {
+            return Ok(Vec::new());
         }
-        "board_list" => {
-            let session_id = resolve_search_session_id(arguments, &*service, provider)?;
-            let boards = service
-                .board_list(owner, workspace, session_id.as_deref())
-                .map_err(|e| e.to_string())?;
-            Ok(json!({ "boards": boards.iter().map(board_json).collect::<Vec<_>>() }))
-        }
-        "board_info" => {
-            let board_id = get_str(arguments, "board_id")?;
-            let session_id = resolve_search_session_id(arguments, &*service, provider)?;
-            match service
-                .board_info(board_id, owner, workspace, session_id.as_deref())
-                .map_err(|e| e.to_string())?
-            {
-                Some(board) => Ok(board_json(&board)),
-                None => Err(format!("unknown board_id: {board_id}")),
-            }
-        }
-        "board_post" => {
-            let content = get_str(arguments, "content")?;
-            let request_id = get_str(arguments, "request_id")?;
-            let session_id = resolve_search_session_id(arguments, &*service, provider)?;
-            let author_agent_id = arguments
-                .get("author_agent_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(provider);
-            let title = match arguments.get("title") {
-                Some(value) => Some(
-                    value
-                        .as_str()
-                        .ok_or_else(|| "title must be a string".to_string())?,
-                ),
-                None => None,
-            };
-            let links = parse_links(arguments)?;
-            let post_template_id = arguments
-                .get("post_template_id")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .ok_or_else(|| "post_template_id must be a string".to_string())
-                })
-                .transpose()?;
-            let post_template_version = arguments
-                .get("post_template_version")
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .and_then(|v| u32::try_from(v).ok())
-                        .filter(|v| *v > 0)
-                        .ok_or_else(|| {
-                            "post_template_version must be a positive integer".to_string()
+        let text = query.text.as_deref().map(str::to_lowercase);
+        let mut documents = self
+            .service
+            .borrow()
+            .source_documents()
+            .into_iter()
+            .filter(|document| self.matches_scope(document))
+            .map(|document| Self::decode(&document, &self.extension_id))
+            .filter(|document| {
+                document.as_ref().is_ok_and(|document| {
+                    query
+                        .kind
+                        .as_deref()
+                        .is_none_or(|kind| document.kind == kind)
+                        && query
+                            .id_prefix
+                            .as_deref()
+                            .is_none_or(|prefix| document.id.starts_with(prefix))
+                        && text.as_deref().is_none_or(|needle| {
+                            document.id.to_lowercase().contains(needle)
+                                || document.kind.to_lowercase().contains(needle)
+                                || document.value.to_string().to_lowercase().contains(needle)
                         })
                 })
-                .transpose()?;
-            let fields = arguments.get("fields");
-            let post = service
-                .board_post_structured(
-                    opt_board_id,
-                    owner,
-                    workspace,
-                    session_id.as_deref(),
-                    author_agent_id,
-                    provider,
-                    title,
-                    content,
-                    &links,
-                    post_template_id,
-                    post_template_version,
-                    fields,
-                    request_id,
-                )
-                .map_err(|e| e.to_string())?;
-            Ok(post_json(&post))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        documents.sort_by(|left, right| left.id.cmp(&right.id));
+        documents.truncate(query.limit);
+        Ok(documents)
+    }
+
+    fn put_batch(&mut self, documents: Vec<ExtensionDocument>) -> Result<(), ExtensionError> {
+        let mut ids = std::collections::HashSet::new();
+        if documents.iter().any(|document| {
+            document.id.trim().is_empty()
+                || document.kind.trim().is_empty()
+                || !ids.insert(document.id.clone())
+        }) {
+            return Err(ExtensionError::new(
+                "extension document IDs and kinds must be nonempty and IDs unique",
+            ));
         }
-        "board_read" => {
-            let after_sequence = arguments.get("after_sequence").and_then(Value::as_u64);
-            let limit = arguments
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(20)
-                .clamp(1, 100) as usize;
-            let session_id = resolve_search_session_id(arguments, &*service, provider)?;
-            let posts = service
-                .board_read(
-                    opt_board_id,
-                    owner,
-                    workspace,
-                    session_id.as_deref(),
-                    after_sequence,
-                    limit,
-                )
-                .map_err(|e| e.to_string())?;
-            Ok(json!({ "posts": posts.iter().map(post_json).collect::<Vec<_>>() }))
+        let mut service = self.service.borrow_mut();
+        let existing = service.source_documents();
+        if documents.iter().any(|document| {
+            let storage_id = self.storage_id(&document.id);
+            existing
+                .iter()
+                .any(|stored| stored.doc_id == storage_id && !self.matches_scope(stored))
+        }) {
+            return Err(ExtensionError::new(
+                "extension document ID conflicts with a document outside its scope",
+            ));
         }
-        "board_get" => {
-            let post_id = get_str(arguments, "post_id")?;
-            let session_id = resolve_search_session_id(arguments, &*service, provider)?;
-            match service
-                .board_get(
-                    opt_board_id,
-                    owner,
-                    workspace,
-                    session_id.as_deref(),
-                    post_id,
-                )
-                .map_err(|e| e.to_string())?
-            {
-                Some(post) => Ok(post_json(&post)),
-                None => Err(format!("post not found: {post_id}")),
+        let source_documents = documents
+            .into_iter()
+            .map(|document| {
+                let mut filters = HashMap::new();
+                filters.insert("doc_kind".to_string(), "extension_document".to_string());
+                filters.insert("extension_owner".to_string(), self.owner.clone());
+                filters.insert("extension_workspace".to_string(), self.workspace.clone());
+                filters.insert("extension_id".to_string(), self.extension_id.clone());
+                filters.insert("extension_kind".to_string(), document.kind.clone());
+                let storage_id = self.storage_id(&document.id);
+                let content = serde_json::to_string(&document.value).map_err(|error| {
+                    ExtensionError::new(format!("failed to encode extension document: {error}"))
+                })?;
+                Ok(SourceDocument {
+                    doc_id: storage_id,
+                    source: format!("extension:{}", document.kind),
+                    content: content.into(),
+                    concept: document.kind,
+                    group_id: None,
+                    headings: vec![],
+                    links: vec![],
+                    timestamp: None,
+                    doc_length: 0,
+                    author_agent: None,
+                    filters: filters.into_iter().collect(),
+                    key_phrases: vec![],
+                    key_phrase_extraction_hash: String::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, ExtensionError>>()?;
+        service
+            .stage_upsert_batch(source_documents)
+            .map_err(|error| {
+                ExtensionError::new(format!("failed to persist extension documents: {error:#}"))
+            })?;
+        Ok(())
+    }
+}
+
+/// Outcome of moving records stored before an extension owned them into
+/// that extension's scoped storage.
+#[derive(Debug, Default)]
+pub(crate) struct LegacyAdoption {
+    pub(crate) adopted: usize,
+    pub(crate) left_in_place: usize,
+    pub(crate) backup: Option<std::path::PathBuf>,
+}
+
+/// Move records this workspace stored before an extension owned them into
+/// the extension's scoped storage, then remove the originals.
+///
+/// Each extension decides which of its legacy kinds are in scope and how to
+/// convert them. The originals are written to a JSON Lines file in
+/// `backup_dir` first and removed only after every converted document reads
+/// back unchanged. A record its extension declines or cannot convert stays in
+/// place. Running again is harmless: adopted originals are gone, and writing
+/// a converted document again is an idempotent upsert.
+pub(crate) fn adopt_legacy_extension_records(
+    service: &mut MemoryService,
+    owner: &str,
+    workspace: &str,
+    backup_dir: &Path,
+) -> anyhow::Result<LegacyAdoption> {
+    let adopters = crate::extension_host::registry()
+        .legacy_record_adopters()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let mut report = LegacyAdoption::default();
+    if adopters.is_empty() {
+        return Ok(report);
+    }
+    let legacy = service
+        .source_documents()
+        .into_iter()
+        .filter(|document| {
+            document
+                .filters
+                .get("doc_kind")
+                .is_some_and(|kind| adopters.contains_key(kind.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut adopted = BTreeMap::<String, Vec<(SourceDocument, ExtensionDocument)>>::new();
+    for document in legacy {
+        let registration = adopters[document.filters["doc_kind"].as_str()];
+        let record = serde_json::to_value(&document)?;
+        match registration
+            .handler
+            .adopt_legacy_record(owner, workspace, &record)
+        {
+            Ok(Some(converted)) => adopted
+                .entry(registration.descriptor.id.to_string())
+                .or_default()
+                .push((document, converted)),
+            Ok(None) => report.left_in_place += 1,
+            Err(error) => {
+                tracing::warn!(
+                    doc_id = %document.doc_id,
+                    "could not adopt legacy extension record: {error}"
+                );
+                report.left_in_place += 1;
             }
         }
-        "board_search" => {
-            let query = get_str(arguments, "query")?;
-            let top_k = arguments
-                .get("top_k")
-                .and_then(Value::as_u64)
-                .unwrap_or(10)
-                .clamp(1, 50) as usize;
-            let session_id = resolve_search_session_id(arguments, &*service, provider)?;
-            let posts = service
-                .board_search(
-                    opt_board_id,
-                    owner,
-                    workspace,
-                    session_id.as_deref(),
-                    query,
-                    top_k,
-                )
-                .map_err(|e| e.to_string())?;
-            Ok(json!({ "posts": posts.iter().map(post_json).collect::<Vec<_>>() }))
-        }
-        _ => Err(format!("unknown board tool: {tool}")),
     }
+    if adopted.is_empty() {
+        return Ok(report);
+    }
+
+    std::fs::create_dir_all(backup_dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let backup = backup_dir.join(format!("legacy-extension-records-{stamp}.jsonl"));
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create_new(&backup)?;
+        for (original, _) in adopted.values().flatten() {
+            serde_json::to_writer(&mut file, original)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+    }
+    report.backup = Some(backup);
+
+    let shared = Rc::new(RefCell::new(service));
+    for (extension_id, documents) in &adopted {
+        let mut store = McpExtensionDocuments {
+            service: Rc::clone(&shared),
+            owner: owner.to_string(),
+            workspace: workspace.to_string(),
+            extension_id: extension_id.clone(),
+        };
+        store
+            .put_batch(
+                documents
+                    .iter()
+                    .map(|(_, converted)| converted.clone())
+                    .collect(),
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        for (_, converted) in documents {
+            let stored = store
+                .get(&converted.id)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            anyhow::ensure!(
+                stored.as_ref() == Some(converted),
+                "adopted extension document {} did not read back unchanged",
+                converted.id
+            );
+        }
+    }
+    let mut service = shared.borrow_mut();
+    for (original, _) in adopted.values().flatten() {
+        service.remove(&original.doc_id);
+        report.adopted += 1;
+    }
+    service.flush()?;
+    Ok(report)
+}
+
+struct McpExtensionContext<'a> {
+    service: SharedExtensionService<'a>,
+    owner: String,
+    workspace: String,
+    provider: String,
+    session_id: Option<String>,
+    documents: McpExtensionDocuments<'a>,
+}
+
+impl ExtensionContext for McpExtensionContext<'_> {
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    fn documents(&mut self) -> &mut dyn ScopedDocumentStore {
+        &mut self.documents
+    }
+
+    fn scoped_documents(
+        &mut self,
+        scope: &membrick_extension_api::ExtensionScope,
+    ) -> &mut dyn ScopedDocumentStore {
+        self.documents.extension_id = scope.extension_id().as_str().to_owned();
+        &mut self.documents
+    }
+
+    fn invoke(
+        &mut self,
+        capability: CapabilityId,
+        operation: &str,
+        input: Value,
+    ) -> Result<Value, ExtensionError> {
+        let registry = crate::extension_host::registry();
+        registry.invoke(self, capability, operation, input)
+    }
+
+    fn invocation_identity(&self) -> InvocationIdentity<'_> {
+        InvocationIdentity {
+            provider: &self.provider,
+            principal: None,
+            caller_extension: None,
+        }
+    }
+}
+
+pub(crate) fn dispatch_extension_tool(
+    tool: &str,
+    arguments: &Value,
+    service: &mut MemoryService,
+    owner: &str,
+    workspace: &str,
+    provider: &str,
+) -> Result<Value, String> {
+    dispatch_extension_tool_with_session(tool, arguments, service, owner, workspace, provider, None)
+}
+
+pub(crate) fn dispatch_extension_tool_with_session(
+    tool: &str,
+    arguments: &Value,
+    service: &mut MemoryService,
+    owner: &str,
+    workspace: &str,
+    provider: &str,
+    session_id: Option<&str>,
+) -> Result<Value, String> {
+    let service = Rc::new(RefCell::new(service));
+    let mut context = McpExtensionContext {
+        service: Rc::clone(&service),
+        owner: owner.to_string(),
+        workspace: workspace.to_string(),
+        provider: provider.to_string(),
+        session_id: session_id.map(str::to_string),
+        documents: McpExtensionDocuments {
+            service,
+            owner: owner.to_string(),
+            workspace: workspace.to_string(),
+            extension_id: String::new(),
+        },
+    };
+    crate::extension_host::registry()
+        .call_named(&mut context, tool, arguments.clone())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn dispatch_extension_http_route(
+    route: &ExtensionRouteMatch,
+    request: ExtensionHttpRequest,
+    service: &mut MemoryService,
+    owner: &str,
+    workspace: &str,
+    provider: &str,
+) -> Result<ExtensionHttpResponse, ExtensionError> {
+    let service = Rc::new(RefCell::new(service));
+    let mut context = McpExtensionContext {
+        service: Rc::clone(&service),
+        owner: owner.to_string(),
+        workspace: workspace.to_string(),
+        provider: provider.to_string(),
+        session_id: None,
+        documents: McpExtensionDocuments {
+            service,
+            owner: owner.to_string(),
+            workspace: workspace.to_string(),
+            extension_id: String::new(),
+        },
+    };
+    crate::extension_host::registry().call_http_route(&mut context, route, request)
 }
 
 /// Stable memory owner for agent-added memories over MCP.
-const MCP_MEMORY_USER_ID: &str = "mcp";
+use crate::MCP_MEMORY_USER_ID;
 
 /// MCP tool definitions for direct memory writes and reads.
 pub(crate) fn memory_tool_definitions() -> Vec<ToolDefinition> {
@@ -1801,23 +1630,21 @@ pub(crate) fn build_add_memory_request(
 }
 
 // ---------------------------------------------------------------------------
-// Shared tools/call dispatch for the bulletin-board tools and add_memory /
-// get_memory, used by every MCP adapter that opts in (claude_code, codex,
-// and the gemini_cli-based adapters: gemini, agy, openclaw).
+// Shared tools/call dispatch for registered extension tools and Membrick's
+// memory tools, used by every MCP adapter that opts in.
 // ---------------------------------------------------------------------------
 
-/// Route one `tools/call` invocation for the bulletin-board tools or
-/// `add_memory` / `get_memory`, and wrap the payload in the standard MCP
+/// Route one `tools/call` invocation for a registered extension or a
+/// Membrick memory tool, then wrap the payload in the standard MCP
 /// text-content envelope (or a `-32602` JSON-RPC error). `service` must be an
 /// initialized memory service; this syncs the shared memory store first.
-/// Boards are scoped to the workspace root with the stable `"mcp"` owner,
-/// exactly as the claude_code/codex adapters did before consolidation.
 ///
-/// Write tools (`board_open`, `board_post`, `add_memory`) run against the
-/// persistent shared store under the cross-process write lock — the composed
+/// Extension and memory write tools run against the persistent shared store
+/// under the cross-process write lock — the composed
 /// view is in-memory only, so view writes would vanish on process exit and
 /// stay invisible to hooks and other providers. Reads stay on the view.
-pub(crate) fn call_board_or_memory_tool(
+#[cfg(test)]
+pub(crate) fn call_mcp_tool(
     tool_name: &str,
     id: Option<Value>,
     arguments: &Value,
@@ -1825,32 +1652,52 @@ pub(crate) fn call_board_or_memory_tool(
     root: &Path,
     provider: &str,
 ) -> anyhow::Result<JsonRpcResponse> {
+    call_mcp_tool_with_backend(
+        tool_name,
+        id,
+        arguments,
+        service,
+        root,
+        provider,
+        MemoryBackend::InProcess,
+    )
+}
+
+pub(crate) fn call_mcp_tool_with_backend(
+    tool_name: &str,
+    id: Option<Value>,
+    arguments: &Value,
+    service: &mut MemoryService,
+    root: &Path,
+    provider: &str,
+    backend: MemoryBackend,
+) -> anyhow::Result<JsonRpcResponse> {
     #[cfg(test)]
-    if tool_name != "enrich_doc" {
+    if !backend.is_resident() && tool_name != "enrich_doc" {
         service.sync_shared_memory(&crate::integrations::mcp_index::shared_memory_root(root))?;
     }
-    // Board owner/workspace: the workspace root scopes boards;
-    // "mcp" is the stable owner for agent-posted boards.
+    #[cfg(not(test))]
+    let _ = backend;
+    // Workspace-scoped extension documents use the stable MCP owner.
     let workspace = root.to_string_lossy().to_string();
-    let is_write = matches!(
-        tool_name,
-        "board_open"
-            | "board_post"
-            | "add_memory"
-            | "delete_memory"
-            | "search_feedback"
-            | "enrich_doc"
-    ) || is_flow_tool_name(tool_name);
+    let is_write = extension_tool_is_mutating(tool_name)
+        || matches!(
+            tool_name,
+            "add_memory" | "delete_memory" | "search_feedback" | "enrich_doc"
+        );
     let result: Result<Value, String> = if is_write {
         // Resolve the session from the composed service, which tracks hook
         // activity, then run the write against the persistent shared-memory
         // service (a fresh service never sees hook-tracked sessions).
         let mut write_arguments = arguments.clone();
-        if write_arguments.get("session_id").is_none() {
-            if let Some(session_id) = resolve_search_session_id(&write_arguments, service, provider)
-                .map_err(anyhow::Error::msg)?
-            {
-                write_arguments["session_id"] = json!(session_id);
+        let invocation_session_id = service.current_session_id(provider);
+        if !is_extension_tool_name(tool_name) {
+            let resolved_session_id = resolve_search_session_id(arguments, service, provider)
+                .map_err(anyhow::Error::msg)?;
+            if write_arguments.get("session_id").is_none() {
+                if let Some(session_id) = resolved_session_id.as_deref() {
+                    write_arguments["session_id"] = json!(session_id);
+                }
             }
         }
         if tool_name == "search_feedback" {
@@ -1863,16 +1710,20 @@ pub(crate) fn call_board_or_memory_tool(
                 .map_err(|error| format!("{error:#}"))
         } else {
             match crate::memory_api::MemoryService::with_shared_memory(root, |store| {
-                dispatch_write_tool(
-                    tool_name,
-                    &write_arguments,
-                    store,
-                    "mcp",
-                    &workspace,
-                    provider,
-                    root,
-                )
-                .map_err(anyhow::Error::msg)
+                let result = if is_extension_tool_name(tool_name) {
+                    dispatch_extension_tool_with_session(
+                        tool_name,
+                        arguments,
+                        store,
+                        "mcp",
+                        &workspace,
+                        provider,
+                        invocation_session_id.as_deref(),
+                    )
+                } else {
+                    dispatch_core_write_tool(tool_name, &write_arguments, store, provider, root)
+                };
+                result.map_err(anyhow::Error::msg)
             }) {
                 Ok(value) => Ok(value),
                 Err(error) => Err(format!("{error:#}")),
@@ -1880,9 +1731,17 @@ pub(crate) fn call_board_or_memory_tool(
         }
     } else {
         match tool_name {
-            "board_open" | "board_list" | "board_info" | "board_post" | "board_read"
-            | "board_get" | "board_search" => {
-                dispatch_board_tool(tool_name, arguments, service, "mcp", &workspace, provider)
+            name if is_extension_tool_name(name) => {
+                let session_id = service.current_session_id(provider);
+                dispatch_extension_tool_with_session(
+                    tool_name,
+                    arguments,
+                    service,
+                    "mcp",
+                    &workspace,
+                    provider,
+                    session_id.as_deref(),
+                )
             }
             "add_memory" | "get_memory" | "delete_memory" => {
                 dispatch_memory_tool(tool_name, arguments, service, provider)
@@ -1921,28 +1780,18 @@ pub(crate) fn call_board_or_memory_tool(
     }
 }
 
-/// Dispatch one of the write tools (`board_open`, `board_post`, `add_memory`, `delete_memory`)
-/// against an explicitly passed service. Separated from
-/// [`call_board_or_memory_tool`] so the write path can target the persistent
-/// shared store while reads stay on the composed in-memory view.
-fn dispatch_write_tool(
+/// Dispatch a host-owned write tool against an explicitly passed service.
+/// Registered extension writes use `dispatch_extension_tool` directly.
+fn dispatch_core_write_tool(
     tool_name: &str,
     arguments: &Value,
     service: &mut MemoryService,
-    owner: &str,
-    workspace: &str,
     provider: &str,
     root: &Path,
 ) -> Result<Value, String> {
     match tool_name {
-        "board_open" | "board_post" => {
-            dispatch_board_tool(tool_name, arguments, service, owner, workspace, provider)
-        }
         "add_memory" => dispatch_memory_tool(tool_name, arguments, service, provider),
         "delete_memory" => dispatch_memory_tool(tool_name, arguments, service, provider),
-        name if is_flow_tool_name(name) => {
-            dispatch_flow_tool(name, arguments, service, owner, workspace, provider)
-        }
         "search_feedback" => service
             .search_feedback_mcp(root, arguments)
             .map_err(|error| format!("{error:#}")),
@@ -2017,45 +1866,58 @@ mod tests {
     }
 
     #[test]
-    fn board_open_default_alias_redirects_to_session_board() {
+    fn extension_document_namespaces_isolate_sibling_extensions() {
         let mut service = memory_service();
-        // board_open(key="default") goes to the session board, not a
-        // literal "default" board.
-        let opened = dispatch_board_tool(
-            "board_open",
-            &json!({"key": "default", "title": "T", "session_id": "sess-9"}),
-            &mut service,
-            "mcp",
-            "/tmp/ws-board-dispatch",
-            "claude",
-        )
+        let shared = Rc::new(RefCell::new(&mut service));
+        let mut alpha = McpExtensionDocuments {
+            service: Rc::clone(&shared),
+            owner: "owner".into(),
+            workspace: "/workspace".into(),
+            extension_id: "alpha".into(),
+        };
+        let mut beta = McpExtensionDocuments {
+            service: Rc::clone(&shared),
+            owner: "owner".into(),
+            workspace: "/workspace".into(),
+            extension_id: "beta".into(),
+        };
+        alpha
+            .put_batch(vec![ExtensionDocument {
+                id: "shared-id".into(),
+                kind: "record".into(),
+                value: json!({"value":"alpha secret"}),
+            }])
+            .unwrap();
+        assert!(beta.get("shared-id").unwrap().is_none());
+        beta.put_batch(vec![ExtensionDocument {
+            id: "shared-id".into(),
+            kind: "record".into(),
+            value: json!({"value":"beta secret"}),
+        }])
         .unwrap();
-        let expected = crate::board::default_board_id("mcp", "/tmp/ws-board-dispatch", "sess-9");
-        assert_eq!(opened["board_id"], json!(expected));
-        // Omitting board_id on post lands on the same board.
-        let posted = dispatch_board_tool(
-            "board_post",
-            &json!({"content": "hi", "request_id": "r1", "session_id": "sess-9"}),
-            &mut service,
-            "mcp",
-            "/tmp/ws-board-dispatch",
-            "claude",
-        )
-        .unwrap();
-        assert_eq!(posted["board_id"], json!(expected));
-        // And an explicit "default" board_id agrees too.
-        let posted_alias = dispatch_board_tool(
-            "board_post",
-            &json!({"board_id": "default", "content": "yo", "request_id": "r2",
-                    "session_id": "sess-9"}),
-            &mut service,
-            "mcp",
-            "/tmp/ws-board-dispatch",
-            "claude",
-        )
-        .unwrap();
-        assert_eq!(posted_alias["board_id"], json!(expected));
-        assert_eq!(posted_alias["sequence"], json!(2));
+        assert_eq!(
+            alpha.get("shared-id").unwrap().unwrap().value["value"],
+            "alpha secret"
+        );
+        assert_eq!(
+            beta.get("shared-id").unwrap().unwrap().value["value"],
+            "beta secret"
+        );
+        assert_eq!(alpha.list(None).unwrap().len(), 1);
+        assert_eq!(beta.list(None).unwrap().len(), 1);
+
+        let service = shared.borrow();
+        let stored = service.source_documents();
+        assert!(stored.iter().any(|doc| {
+            doc.doc_id == "extension:5:alpha:shared-id"
+                && doc.filters.get("extension_id").map(String::as_str) == Some("alpha")
+                && doc.filters.get("extension_owner").map(String::as_str) == Some("owner")
+                && doc.filters.get("extension_workspace").map(String::as_str) == Some("/workspace")
+        }));
+        assert!(stored.iter().any(|doc| {
+            doc.doc_id == "extension:4:beta:shared-id"
+                && doc.filters.get("extension_id").map(String::as_str) == Some("beta")
+        }));
     }
 
     #[test]
@@ -2124,7 +1986,7 @@ mod tests {
         let mut service = memory_service();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let page = loop {
-            let page = call_board_or_memory_tool(
+            let page = call_mcp_tool(
                 "review_search",
                 Some(json!(92)),
                 &json!({"page_size":10}),
@@ -2160,7 +2022,7 @@ mod tests {
             "how are document changes published?"
         );
 
-        let exact = call_board_or_memory_tool(
+        let exact = call_mcp_tool(
             "review_search",
             Some(json!(93)),
             &json!({"search_id":search_id}),
@@ -2182,7 +2044,7 @@ mod tests {
         );
         assert_eq!(exact_body["result"]["results"][0]["id"], "review-doc");
 
-        let feedback = call_board_or_memory_tool(
+        let feedback = call_mcp_tool(
             "search_feedback",
             Some(json!(94)),
             &json!({
@@ -2210,7 +2072,7 @@ mod tests {
         assert_eq!(feedback_body["status"], "reviewed");
         assert_eq!(feedback_body["search_id"], search_id);
 
-        let reviewed = call_board_or_memory_tool(
+        let reviewed = call_mcp_tool(
             "review_search",
             Some(json!(95)),
             &json!({"search_id":search_id}),
@@ -2275,7 +2137,7 @@ mod tests {
                 ))
             })
             .unwrap();
-        let enriched = call_board_or_memory_tool(
+        let enriched = call_mcp_tool(
             "enrich_doc",
             Some(json!(96)),
             &json!({
@@ -2585,6 +2447,141 @@ mod tests {
             search_provider_filters(&json!({"query": "x", "provider": "clippy"})).unwrap_err();
         assert!(error.contains("unknown provider"), "{error}");
         assert!(error.contains("codex"), "{error}");
+    }
+
+    const LEGACY_NOTE_KIND: &str = "test_legacy_note";
+    const LEGACY_NOTE_EXTENSION: &str = "membrick-test-legacy-notes";
+
+    /// Test-only extension that adopts `test_legacy_note` records whose
+    /// `note_workspace` filter matches the workspace being opened.
+    struct LegacyNoteExtension;
+
+    impl membrick_extension_api::ExtensionHandler for LegacyNoteExtension {
+        fn legacy_record_kinds(&self) -> &'static [&'static str] {
+            &[LEGACY_NOTE_KIND]
+        }
+
+        fn adopt_legacy_record(
+            &self,
+            _owner: &str,
+            workspace: &str,
+            record: &Value,
+        ) -> Result<Option<ExtensionDocument>, membrick_extension_api::ExtensionError> {
+            if record["filters"]["note_workspace"].as_str() != Some(workspace) {
+                return Ok(None);
+            }
+            Ok(Some(ExtensionDocument {
+                id: record["doc_id"].as_str().unwrap_or_default().to_string(),
+                kind: "note".to_string(),
+                value: json!({"text": record["content"]}),
+            }))
+        }
+
+        fn call(
+            &self,
+            _context: &mut dyn membrick_extension_api::ExtensionContext,
+            _tool: membrick_extension_api::ToolId,
+            _input: Value,
+        ) -> Result<Value, membrick_extension_api::ExtensionError> {
+            Err(membrick_extension_api::ExtensionError::new(
+                "the legacy note test extension has no tools",
+            ))
+        }
+    }
+
+    static LEGACY_NOTE_DESCRIPTOR: membrick_extension_api::ExtensionDescriptor =
+        membrick_extension_api::ExtensionDescriptor {
+            id: membrick_extension_api::ExtensionId::new(LEGACY_NOTE_EXTENSION),
+            provides: &[membrick_extension_api::CapabilityId::new(
+                "test-legacy-notes",
+            )],
+            requires: &[],
+            tools: &[],
+        };
+    static LEGACY_NOTE_HANDLER: LegacyNoteExtension = LegacyNoteExtension;
+
+    #[membrick_extension_api::distributed_slice(membrick_extension_api::EXTENSIONS)]
+    static LEGACY_NOTE_REGISTRATION: membrick_extension_api::ExtensionRegistration =
+        membrick_extension_api::ExtensionRegistration {
+            descriptor: &LEGACY_NOTE_DESCRIPTOR,
+            handler: &LEGACY_NOTE_HANDLER,
+        };
+
+    #[test]
+    fn legacy_records_move_into_their_extension_once() {
+        fn note(doc_id: &str, text: &str, workspace: &str) -> SourceDocument {
+            SourceDocument {
+                doc_id: doc_id.to_string(),
+                source: "legacy-notes".to_string(),
+                doc_length: text.len(),
+                content: text.into(),
+                concept: "legacy record".to_string(),
+                group_id: None,
+                filters: [
+                    ("doc_kind".to_string(), LEGACY_NOTE_KIND.to_string()),
+                    ("note_workspace".to_string(), workspace.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                headings: vec![],
+                links: vec![],
+                timestamp: Some("2026-10-20T00:00:00Z".to_string()),
+                author_agent: Some("codex".to_string()),
+                key_phrases: Vec::new(),
+                key_phrase_extraction_hash: String::new(),
+            }
+        }
+
+        let workspace = "/legacy/workspace";
+        let first = note("legacy-note:1", "First step done.", workspace);
+        let second = note("legacy-note:2", "Second step done.", workspace);
+        let foreign = note("legacy-note:3", "Elsewhere.", "/other/workspace");
+        let mut service = memory_service();
+        service
+            .stage_upsert_batch(vec![first.clone(), second.clone(), foreign.clone()])
+            .unwrap();
+        let backup_dir = std::env::temp_dir().join(format!(
+            "membrick-legacy-adoption-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let adoption =
+            adopt_legacy_extension_records(&mut service, "mcp", workspace, &backup_dir).unwrap();
+        assert_eq!(adoption.adopted, 2);
+        assert_eq!(adoption.left_in_place, 1);
+        let backup = std::fs::read_to_string(adoption.backup.unwrap()).unwrap();
+        assert_eq!(backup.lines().count(), 2);
+
+        {
+            let store = McpExtensionDocuments {
+                service: Rc::new(RefCell::new(&mut service)),
+                owner: "mcp".to_string(),
+                workspace: workspace.to_string(),
+                extension_id: LEGACY_NOTE_EXTENSION.to_string(),
+            };
+            let adopted = store.get(&first.doc_id).unwrap().unwrap();
+            assert_eq!(adopted.kind, "note");
+            assert_eq!(adopted.value, json!({"text": "First step done."}));
+        }
+
+        let remaining = service
+            .source_documents()
+            .into_iter()
+            .map(|document| document.doc_id.clone())
+            .collect::<Vec<_>>();
+        assert!(!remaining.contains(&first.doc_id));
+        assert!(!remaining.contains(&second.doc_id));
+        assert!(remaining.contains(&foreign.doc_id));
+
+        let again =
+            adopt_legacy_extension_records(&mut service, "mcp", workspace, &backup_dir).unwrap();
+        assert_eq!(again.adopted, 0);
+        assert!(again.backup.is_none());
+        let _ = std::fs::remove_dir_all(backup_dir);
     }
 
     #[test]
@@ -2953,6 +2950,7 @@ mod tests {
     /// and `add_memory` through the shared dispatch, drops the view entirely
     /// (simulating process exit), then reopens the shared store fresh and
     /// requires the board, post, and memory to be present and readable.
+    #[cfg(feature = "flowboard-tests")]
     #[test]
     fn board_and_memory_writes_survive_reopen() {
         use crate::integrations::mcp_index;
@@ -2968,7 +2966,7 @@ mod tests {
         let workspace = root.to_string_lossy().to_string();
 
         let opened = tool_payload(
-            &call_board_or_memory_tool(
+            &call_mcp_tool(
                 "board_open",
                 None,
                 &json!({"key": "k1", "title": "Board", "session_id": "sess-p1"}),
@@ -2984,7 +2982,7 @@ mod tests {
             .to_string();
 
         let posted = tool_payload(
-            &call_board_or_memory_tool(
+            &call_mcp_tool(
                 "board_post",
                 None,
                 &json!({"board_id": board_id, "content": "hello board",
@@ -2998,7 +2996,7 @@ mod tests {
         assert_eq!(posted["content"], json!("hello board"));
 
         let added = tool_payload(
-            &call_board_or_memory_tool(
+            &call_mcp_tool(
                 "add_memory",
                 None,
                 &json!({"content": "The API rate limit is 100 requests per minute.",
@@ -3021,7 +3019,7 @@ mod tests {
         )
         .expect("shared store reopens");
 
-        let boards = dispatch_board_tool(
+        let boards = dispatch_extension_tool(
             "board_list",
             &json!({"session_id": "sess-p1"}),
             &mut store,
@@ -3038,7 +3036,7 @@ mod tests {
                 .any(|board| board["board_id"] == board_id),
             "board missing after reopen: {boards}"
         );
-        let posts = dispatch_board_tool(
+        let posts = dispatch_extension_tool(
             "board_read",
             &json!({"board_id": board_id, "session_id": "sess-p1"}),
             &mut store,

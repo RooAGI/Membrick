@@ -1,58 +1,45 @@
-# Tier 0: Ingestion Only
+# Tier0 scan metadata
 
-## Goal
-Collect a stable, low-cost record for every processed document.
+Tier0 is the lightweight metadata collected while Membrick scans Markdown
+files. It is a helper stage for project graph and export workflows. The
+resident's searchable store uses `SourceDocument` and derived `DocRecord`
+values; `Tier0Record` is not the persistent memory API or the full search
+record.
 
-Tier 0 does not perform semantic reasoning. It only captures ingestion metadata that later tiers can build on.
+## Current record
 
-## Required Fields Per Document
-- `id`
-- `source`
-- `timestamp`
-- `author/agent`
-- `doc_length`
-- `basic metadata`
+The internal `Tier0Record` in `src/graph.rs` contains:
 
-## Current Record Shape
-`Tier0Record` includes:
-- `id`: stable document identifier (currently relative path)
-- `source`: source document path (relative to scan root)
-- `timestamp`: last modified time (unix seconds string, when available)
-- `author_agent`: extracted from frontmatter fields such as `author`, `agent`, `author_agent`, `created_by`
-- `doc_length`: document size in bytes
-- `metadata`: lightweight document metadata map
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable scan ID, currently the path relative to the scan root |
+| `source` | Relative source path |
+| `timestamp` | Source modified time, normalized to a Unix-seconds timestamp when available |
+| `author_agent` | Author or agent found in supported frontmatter keys |
+| `doc_length` | Source content length in bytes |
+| `metadata` | Lightweight derived values such as concept, extension, heading and link counts, file size, and frontmatter flags |
 
-### Basic Metadata (Current)
-- `concept`
-- `raw_concept`
-- `file_ext`
-- `heading_count`
-- `outbound_link_count`
-- `path`
-- `file_size_bytes`
-- frontmatter presence flags (when present)
+Records are joined to parsed Markdown pages by their relative source path.
+Ignored pages are removed together with their Tier0 records. The current
+filesystem adapter scans Markdown; other file types are not indexed through
+this adapter today.
 
-## Linking Metadata to Documents
-Tier 0 links metadata to documents through `id` and `source`.
-Both map back to the processed document path.
+## Build the searchable project index
 
-## Persistent Index
-Build or refresh the project's persistent index with the current CLI:
+Use the project command to build or refresh the persistent search index:
 
 ```bash
-membrick index /path/to/repo
+membrick index /path/to/project
 ```
 
-The current CLI stores index data under the project's `.membrick` directory.
-The older `--tier0-index-out` JSON export switch is hidden for compatibility
-and is not part of the supported command-line workflow.
+The search store is maintained under `.membrick`. For applications that
+submit or update documents directly, use the [Memory client](memory-client-architecture.md)
+or the Rust [`MemoryService`](memory-service-api.md) API rather than treating
+Tier0 export as the index format.
 
-## Legacy Tier 0 export format
-Older standalone Tier 0 JSON exports include:
-- `tier`
-- `generated_at_unix`
-- `path`
-- `document_count`
-- `documents_by_id` (`id -> Tier0Record`)
+## Legacy export
 
-This provides a stable lookup table for Tier 1+ pipelines.
+The hidden `--tier0-index-out` option remains for older scripts. It writes a
+standalone JSON summary with fields such as `tier`, `generated_at_unix`,
+`document_count`, and `documents_by_id`. This compatibility export is not the
+resident store format and is not required for normal indexing or search.

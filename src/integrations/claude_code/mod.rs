@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const SERVER_NAME: &str = "membrick";
-const MANAGER_SERVER_NAME: &str = "membrick_manager";
+/// Older setups registered the project manager under its own server name.
+/// The manager now shares `SERVER_NAME`; this name is only cleaned up.
+const LEGACY_MANAGER_SERVER_NAME: &str = "membrick_manager";
+const MANAGER_SERVE_ARG: &str = "--manager-serve";
 const DEFAULT_QUERY_TOP_K: usize = 5;
 const HOOK_MARKER: &str = "--claude-code-hook";
 const HOOK_EVENTS: &[(&str, &str)] = &[
@@ -63,6 +66,7 @@ struct ClaudeConfig {
 }
 
 struct ClaudeMcp {
+    backend: mcp_tools::MemoryBackend,
     root: PathBuf,
     max_bytes: usize,
     max_files: usize,
@@ -102,6 +106,18 @@ pub fn install_local_config(root: &Path, config_path: Option<&Path>) -> Result<P
             config.mcp_servers.remove(server_name);
         }
     }
+    // The manager now lives at user scope under the same name as the project
+    // entry, which Claude's local scope overrides inside this project. Refresh
+    // its executable path to match this project install when it already exists.
+    if config
+        .mcp_servers
+        .get(SERVER_NAME)
+        .is_some_and(is_manager_entry)
+    {
+        refresh_manager_entry(&mut config, &executable);
+    } else {
+        migrate_legacy_manager_entry(&mut config, &executable);
+    }
 
     let projects = config
         .extra
@@ -137,6 +153,15 @@ pub fn install_local_config(root: &Path, config_path: Option<&Path>) -> Result<P
 }
 
 /// Add the user-global setup MCP server without registering project memory.
+///
+/// The manager is registered at user scope as `membrick`, the same name the
+/// project install uses at local scope. Claude prefers the local-scope entry,
+/// so installed projects see memory tools and every other directory sees the
+/// manager. An older unpinned `--claude-code-serve` entry (no root, or a
+/// relative root such as `.`) is replaced by the manager. Any other non-manager
+/// `membrick` entry (for example an older `--claude-code-serve <root>`
+/// install) is left untouched, and the legacy `membrick_manager` entry is kept
+/// so setup tools stay available.
 pub fn install_manager_config(config_path: Option<&Path>) -> Result<PathBuf> {
     let config_path = config_path
         .map(Path::to_path_buf)
@@ -146,12 +171,98 @@ pub fn install_manager_config(config_path: Option<&Path>) -> Result<PathBuf> {
         .to_string_lossy()
         .into_owned();
     let mut config = read_claude_config(&config_path)?;
-    config.mcp_servers.insert(
-        MANAGER_SERVER_NAME.to_string(),
-        json!({"command": executable, "args": ["--manager-serve"]}),
-    );
+    if user_server_slot_is_free(&config) {
+        install_user_manager_entry(&mut config, &executable);
+    } else {
+        eprintln!(
+            "Left the user-scope Claude MCP server '{SERVER_NAME}' in {} unchanged because it \
+             is not a Membrick manager entry. If it is an older project install, run \
+             `membrick install claude <PATH>` for that project to move it to project scope, \
+             then run `membrick` again.",
+            config_path.display()
+        );
+    }
     write_claude_config(&config_path, &config)?;
     Ok(config_path)
+}
+
+fn manager_entry(executable: &str) -> Value {
+    json!({"command": executable, "args": [MANAGER_SERVE_ARG]})
+}
+
+fn is_manager_entry(entry: &Value) -> bool {
+    entry
+        .get("args")
+        .and_then(Value::as_array)
+        .and_then(|args| args.first())
+        .and_then(Value::as_str)
+        == Some(MANAGER_SERVE_ARG)
+}
+
+/// An older `--claude-code-serve` entry with no root or a relative root such
+/// as `.`. It serves whatever directory Claude starts in rather than one
+/// project, so no project install can claim it.
+fn is_unpinned_memory_entry(entry: &Value) -> bool {
+    let Some(args) = entry.get("args").and_then(Value::as_array) else {
+        return false;
+    };
+    args.first().and_then(Value::as_str) == Some("--claude-code-serve")
+        && args
+            .get(1)
+            .and_then(Value::as_str)
+            .is_none_or(|root| Path::new(root).is_relative())
+}
+
+/// The user-scope `membrick` name may hold the manager when it is empty,
+/// already holds a manager entry, or holds an unpinned memory entry. An entry
+/// pinned to a project root is left for that project's install to move.
+fn user_server_slot_is_free(config: &ClaudeConfig) -> bool {
+    config
+        .mcp_servers
+        .get(SERVER_NAME)
+        .is_none_or(|entry| is_manager_entry(entry) || is_unpinned_memory_entry(entry))
+}
+
+/// Make the user-scope `membrick` entry the manager and drop the legacy
+/// `membrick_manager` entry. Callers check `user_server_slot_is_free` first.
+fn install_user_manager_entry(config: &mut ClaudeConfig, executable: &str) {
+    if config
+        .mcp_servers
+        .get(SERVER_NAME)
+        .is_some_and(is_unpinned_memory_entry)
+    {
+        eprintln!(
+            "Replaced the user-scope Claude MCP server '{SERVER_NAME}', which served memory in \
+             whatever directory Claude started, with the Membrick project manager. Run \
+             `membrick install claude <PATH>` for each project that should keep memory tools."
+        );
+    }
+    config.mcp_servers.remove(LEGACY_MANAGER_SERVER_NAME);
+    refresh_manager_entry(config, executable);
+}
+
+fn refresh_manager_entry(config: &mut ClaudeConfig, executable: &str) {
+    let entry = config
+        .mcp_servers
+        .entry(SERVER_NAME.to_string())
+        .or_insert_with(|| manager_entry(executable));
+    let object = entry
+        .as_object_mut()
+        .expect("a replaceable Claude MCP entry is a JSON object");
+    object.insert("command".to_string(), json!(executable));
+    object.insert("args".to_string(), json!([MANAGER_SERVE_ARG]));
+}
+
+/// Move a legacy user-scope `membrick_manager` entry to `membrick` when that
+/// name is free. Returns whether the config changed.
+fn migrate_legacy_manager_entry(config: &mut ClaudeConfig, executable: &str) -> bool {
+    if !config.mcp_servers.contains_key(LEGACY_MANAGER_SERVER_NAME)
+        || !user_server_slot_is_free(config)
+    {
+        return false;
+    }
+    install_user_manager_entry(config, executable);
+    true
 }
 
 pub fn install_memory_skill(root: &Path) -> Result<PathBuf> {
@@ -217,6 +328,8 @@ pub fn uninstall(
         }
 
         // Clean up only the legacy global entries that point at this project.
+        // claude_entry_targets_root requires `--claude-code-serve <root>`, so
+        // the user-scope `--manager-serve` entry is never removed here.
         for server_name in [SERVER_NAME, "lint-ai"] {
             if config
                 .mcp_servers
@@ -492,23 +605,19 @@ pub fn run_status_line() -> Result<()> {
 }
 
 pub fn run_server(root: &Path, options: ClaudeCodeServerOptions<'_>) -> Result<()> {
+    let _resident_lease =
+        crate::integrations::provider_lifecycle::ResidentConnectionLease::start(root, "claude")?;
     crate::local_ipc::ensure_provider_resident(root, "claude")?;
     tracing::debug!("MCP server starting");
     let mcp = ClaudeMcp {
+        backend: mcp_tools::MemoryBackend::Resident,
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
         max_files: options.max_files,
         max_depth: options.max_depth,
         max_total_bytes: options.max_total_bytes,
         ignore_paths: options.ignore_paths.to_vec(),
-        workspace_watcher: if cfg!(test) {
-            Some(mcp_index::WorkspaceWatcher::new(
-                root,
-                options.ignore_paths,
-            )?)
-        } else {
-            None
-        },
+        workspace_watcher: None,
         store: Mutex::new(None),
     };
     mcp.serve()
@@ -521,7 +630,7 @@ impl ClaudeMcp {
             .lock()
             .map_err(|_| anyhow::anyhow!("MCP index lock poisoned"))?;
         anyhow::ensure!(
-            !mcp_tools::resident_backend_enabled(),
+            !self.backend.is_resident(),
             "MCP memory indexes are owned by the resident Membrick server"
         );
         let file_changes = self
@@ -538,6 +647,7 @@ impl ClaudeMcp {
                     RecordingProvider::Claude,
                     &self.root,
                     file_changes,
+                    self.backend,
                 )
             {
                 tracing::warn!("failed to save workspace file changes: {error:#}");
@@ -677,20 +787,13 @@ impl ClaudeMcp {
             return mcp_tools::call_update_tool(id, &arguments);
         }
 
-        if crate::integrations::mcp_tools::resident_backend_enabled()
-            && (crate::integrations::mcp_tools::is_flow_tool_name(tool_name)
+        if self.backend.is_resident()
+            && (crate::integrations::mcp_tools::is_extension_tool_name(tool_name)
                 || matches!(
                     tool_name,
                     "search"
                         | "info"
                         | "list_memories"
-                        | "board_open"
-                        | "board_list"
-                        | "board_info"
-                        | "board_post"
-                        | "board_read"
-                        | "board_get"
-                        | "board_search"
                         | "add_memory"
                         | "get_memory"
                         | "delete_memory"
@@ -751,7 +854,7 @@ impl ClaudeMcp {
                     Err(message) => return Ok(error_response(id, -32602, &message)),
                 };
                 let started = std::time::Instant::now();
-                let results = service.search_with_filters(
+                let results = service.search_with_filters_and_comparison_operands(
                     query,
                     crate::integrations::session_recording::RecordingProvider::Claude.as_str(),
                     session_id.as_deref(),
@@ -763,10 +866,16 @@ impl ClaudeMcp {
                     &self.root,
                     started.elapsed().as_millis() as u64,
                     results.is_err(),
-                    results.as_ref().is_ok_and(Vec::is_empty),
+                    results
+                        .as_ref()
+                        .is_ok_and(|(results, _)| results.is_empty()),
                 );
-                let results = results?;
-                let payload = service.search_results_payload(query, results);
+                let (results, comparison_operands) = results?;
+                let payload = service.search_results_payload_with_comparison_operands(
+                    query,
+                    results,
+                    &comparison_operands,
+                );
                 Ok(JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
@@ -913,67 +1022,16 @@ impl ClaudeMcp {
                     error: None,
                 })
             }
-            "board_open" | "board_list" | "board_info" | "board_post" | "board_read"
-            | "board_get" | "board_search" => {
+            name if mcp_tools::is_extension_tool_name(name) => {
                 let mut service = self.store()?;
-                let service = service.as_mut().expect("MCP store initialized");
-                #[cfg(test)]
-                service.sync_shared_memory(&mcp_index::shared_memory_root(&self.root))?;
-                // Resolve the session from the composed service, which tracks
-                // hook activity, then perform board operations against the
-                // persistent shared-memory service. Do not mutate the
-                // composed in-memory search view for board writes.
-                let mut board_arguments = arguments.clone();
-                if board_arguments.get("session_id").is_none() {
-                    if let Some(session_id) =
-                        mcp_tools::resolve_search_session_id(&board_arguments, service, "claude")
-                            .map_err(anyhow::Error::msg)?
-                    {
-                        board_arguments["session_id"] = json!(session_id);
-                    }
-                }
-                // Board owner/workspace: the workspace root scopes boards;
-                // "mcp" is the stable owner for agent-posted boards.
-                let workspace = self.root.to_string_lossy().to_string();
-                let result = crate::memory_api::MemoryService::with_shared_memory(
-                    &self.root,
-                    |board_service| {
-                        mcp_tools::dispatch_board_tool(
-                            tool_name,
-                            &board_arguments,
-                            board_service,
-                            "mcp",
-                            &workspace,
-                            RecordingProvider::Claude.as_str(),
-                        )
-                        .map_err(anyhow::Error::msg)
-                    },
-                )
-                .map_err(|error| error.to_string());
-                match result {
-                    Ok(payload) => Ok(JsonRpcResponse {
-                        jsonrpc: "2.0",
-                        id,
-                        result: Some(json!({
-                            "content": [{
-                                "type": "text",
-                                "text": serde_json::to_string_pretty(&payload)?,
-                            }]
-                        })),
-                        error: None,
-                    }),
-                    Err(message) => Ok(error_response(id, -32602, &message)),
-                }
-            }
-            name if mcp_tools::is_flow_tool_name(name) => {
-                let mut service = self.store()?;
-                mcp_tools::call_board_or_memory_tool(
+                mcp_tools::call_mcp_tool_with_backend(
                     name,
                     id,
                     &arguments,
                     service.as_mut().expect("initialized"),
                     &self.root,
                     "claude",
+                    self.backend,
                 )
             }
             "add_memory" | "get_memory" | "delete_memory" => {
@@ -1100,8 +1158,7 @@ impl ClaudeMcp {
             },
         ]
         .into_iter()
-        .chain(mcp_tools::board_tool_definitions())
-        .chain(mcp_tools::flow_tool_definitions())
+        .chain(mcp_tools::extension_tool_definitions())
         .chain(mcp_tools::memory_tool_definitions())
         .chain(std::iter::once(mcp_tools::update_tool_definition()))
         .collect()
@@ -1248,15 +1305,183 @@ mod tests {
         install_manager_config(Some(&path)).unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
-            value["mcpServers"][MANAGER_SERVER_NAME]["args"][0],
+            value["mcpServers"][SERVER_NAME]["args"][0],
             "--manager-serve"
         );
-        assert!(value["mcpServers"][MANAGER_SERVER_NAME]
-            .get("cwd")
-            .is_none());
+        assert!(value["mcpServers"][SERVER_NAME].get("cwd").is_none());
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["mcpServers"]["other"]["command"], "other");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn global_manager_config_replaces_legacy_manager_name() {
+        let path = temp_path("claude-global-manager-legacy");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"membrick_manager":{"command":"old","args":["--manager-serve"]},"membrick":{"command":"old","args":["--manager-serve"]}}}"#,
+        )
+        .unwrap();
+        install_manager_config(Some(&path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let servers = value["mcpServers"].as_object().unwrap();
+        assert!(!servers.contains_key(LEGACY_MANAGER_SERVER_NAME));
+        assert_eq!(servers[SERVER_NAME]["args"], json!(["--manager-serve"]));
+        assert_eq!(
+            servers[SERVER_NAME]["command"].as_str(),
+            Some(env::current_exe().unwrap().to_string_lossy().as_ref())
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn global_manager_config_keeps_legacy_project_entry() {
+        let path = temp_path("claude-global-manager-project");
+        let original =
+            json!({"command": "membrick", "args": ["--claude-code-serve", "/some/project"]});
+        fs::write(
+            &path,
+            json!({"mcpServers": {
+                "membrick": original,
+                "membrick_manager": {"command": "old", "args": ["--manager-serve"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        install_manager_config(Some(&path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["mcpServers"][SERVER_NAME], original);
+        // The legacy manager stays so setup tools remain reachable.
+        assert_eq!(
+            value["mcpServers"][LEGACY_MANAGER_SERVER_NAME]["args"][0],
+            "--manager-serve"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn global_manager_config_replaces_unpinned_memory_entry() {
+        for args in [
+            json!(["--claude-code-serve", "."]),
+            json!(["--claude-code-serve"]),
+        ] {
+            let path = temp_path("claude-global-manager-unpinned");
+            fs::write(
+                &path,
+                json!({"mcpServers": {
+                    "membrick": {"command": "membrick", "args": args},
+                    "membrick_manager": {"command": "old", "args": ["--manager-serve"]}
+                }})
+                .to_string(),
+            )
+            .unwrap();
+            install_manager_config(Some(&path)).unwrap();
+            let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let servers = value["mcpServers"].as_object().unwrap();
+            assert!(!servers.contains_key(LEGACY_MANAGER_SERVER_NAME));
+            assert_eq!(servers[SERVER_NAME]["args"], json!(["--manager-serve"]));
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn project_install_replaces_unpinned_memory_entry_with_manager() {
+        let config_path = temp_path("claude-manager-unpinned-install");
+        let root = temp_dir("claude-manager-unpinned-install-root");
+        fs::write(
+            &config_path,
+            json!({"mcpServers": {
+                "membrick": {"command": "membrick", "args": ["--claude-code-serve", "."]},
+                "membrick_manager": {"command": "old", "args": ["--manager-serve"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        install_local_config(&root, Some(&config_path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let project_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(value["mcpServers"]
+            .get(LEGACY_MANAGER_SERVER_NAME)
+            .is_none());
+        assert_eq!(
+            value["mcpServers"][SERVER_NAME]["args"],
+            json!(["--manager-serve"])
+        );
+        assert_eq!(
+            value["projects"][&project_key]["mcpServers"][SERVER_NAME]["args"],
+            json!(["--claude-code-serve", project_key])
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_install_migrates_legacy_manager_and_uninstall_keeps_it() {
+        let config_path = temp_path("claude-manager-project-cycle");
+        let settings_path = temp_path("claude-manager-project-settings");
+        let root = temp_dir("claude-manager-project-root");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"membrick_manager":{"command":"old","args":["--manager-serve"]}}}"#,
+        )
+        .unwrap();
+
+        install_local_config(&root, Some(&config_path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let project_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(value["mcpServers"]
+            .get(LEGACY_MANAGER_SERVER_NAME)
+            .is_none());
+        assert_eq!(
+            value["mcpServers"][SERVER_NAME]["args"],
+            json!(["--manager-serve"])
+        );
+        assert_eq!(
+            value["projects"][&project_key]["mcpServers"][SERVER_NAME]["args"][0],
+            "--claude-code-serve"
+        );
+
+        uninstall(&root, Some(&config_path), Some(&settings_path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert!(value["projects"][&project_key].get("mcpServers").is_none());
+        assert_eq!(
+            value["mcpServers"][SERVER_NAME]["args"],
+            json!(["--manager-serve"])
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_install_replaces_own_legacy_user_entry_with_manager() {
+        let config_path = temp_path("claude-manager-own-legacy");
+        let root = temp_dir("claude-manager-own-legacy-root");
+        let canonical = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        fs::write(
+            &config_path,
+            json!({"mcpServers": {
+                "membrick": {"command": "old", "args": ["--claude-code-serve", canonical]},
+                "membrick_manager": {"command": "old", "args": ["--manager-serve"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        install_local_config(&root, Some(&config_path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert!(value["mcpServers"]
+            .get(LEGACY_MANAGER_SERVER_NAME)
+            .is_none());
+        assert_eq!(
+            value["mcpServers"][SERVER_NAME]["args"],
+            json!(["--manager-serve"])
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1302,6 +1527,7 @@ mod tests {
         }
         store.refresh().unwrap();
         ClaudeMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             root,
             max_bytes: 0,
             max_files: 0,
@@ -1368,6 +1594,48 @@ mod tests {
                 .unwrap(),
             vec!["--claude-code-serve", root.to_string_lossy().as_ref()]
         );
+    }
+
+    #[test]
+    fn project_install_refreshes_existing_global_manager_executable_path() {
+        let config_path = temp_path("claude-install-refreshes-manager-path");
+        let root = temp_dir("claude-install-refreshes-manager-root");
+        fs::write(
+            &config_path,
+            json!({"mcpServers": {
+                "membrick": {
+                    "command": "old-membrick",
+                    "args": ["--manager-serve"],
+                    "custom": "keep"
+                },
+                "other": {"command": "other-tool"}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        install_local_config(&root, Some(&config_path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let executable = env::current_exe().unwrap().to_string_lossy().into_owned();
+        let project_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(value["mcpServers"][SERVER_NAME]["command"], executable);
+        assert_eq!(
+            value["mcpServers"][SERVER_NAME]["args"],
+            json!(["--manager-serve"])
+        );
+        assert_eq!(value["mcpServers"][SERVER_NAME]["custom"], "keep");
+        assert_eq!(value["mcpServers"]["other"]["command"], "other-tool");
+        assert_eq!(
+            value["projects"][&project_key]["mcpServers"][SERVER_NAME]["command"],
+            executable
+        );
+        assert_eq!(
+            value["projects"][&project_key]["mcpServers"][SERVER_NAME]["args"],
+            json!(["--claude-code-serve", project_key])
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1468,6 +1736,7 @@ mod tests {
         let _ = fs::remove_file(settings_path);
     }
 
+    #[cfg(feature = "flowboard-tests")]
     #[test]
     fn tools_list_exposes_search_info_and_recording() {
         let root = temp_dir("mcp-tools");
@@ -1485,6 +1754,8 @@ mod tests {
             .unwrap()
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_string())
+            // The server tests link a test-only extension into this binary.
+            .filter(|name| !name.starts_with("test_serialization_"))
             .collect::<Vec<_>>();
         assert_eq!(
             names,
@@ -1500,6 +1771,7 @@ mod tests {
                 "board_list".to_string(),
                 "board_info".to_string(),
                 "board_post".to_string(),
+                "board_post_edit".to_string(),
                 "board_read".to_string(),
                 "board_get".to_string(),
                 "board_search".to_string(),
@@ -1575,6 +1847,7 @@ mod tests {
     fn tools_list_does_not_initialize_store() {
         let root = temp_dir("mcp-lazy-store");
         let mcp = ClaudeMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             root: root.clone(),
             max_bytes: 1_000_000,
             max_files: 100,

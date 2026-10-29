@@ -498,6 +498,7 @@ pub fn promote_recorded_session(
     project_root: &Path,
     archive_override: Option<&Path>,
     session_id: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<SessionImportReport> {
     let archive_root = archive_override
         .map(Path::to_path_buf)
@@ -565,11 +566,12 @@ pub fn promote_recorded_session(
         imported_document_ids.push(doc_id);
     }
     if !documents.is_empty() {
-        crate::integrations::mcp_tools::upsert_hook_documents(
+        crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
             project_root,
             provider.as_str(),
             session_id,
             documents,
+            backend,
         )?;
     }
     Ok(SessionImportReport {
@@ -673,6 +675,7 @@ pub(crate) fn capture_workspace_file_changes(
     provider: RecordingProvider,
     project_root: &Path,
     changes: Vec<crate::pipeline::WorkspaceChangeEvent>,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<()> {
     if changes.is_empty() || !membrick_enabled(provider, project_root)? {
         return Ok(());
@@ -739,11 +742,12 @@ pub(crate) fn capture_workspace_file_changes(
         return Ok(());
     }
     let session_id = format!("{}:workspace-watcher", provider.as_str());
-    crate::integrations::mcp_tools::upsert_hook_documents(
+    crate::integrations::mcp_tools::upsert_hook_documents_with_backend(
         project_root,
         provider.as_str(),
         &session_id,
         documents,
+        backend,
     )
 }
 
@@ -1523,7 +1527,7 @@ mod tests {
             event: "file_modify".into(), file_path: "config.json".into(), timestamp_ms: 123,
             before: Some("{\"password\":\"old-private-value\"}\nnormal setting\n".into()),
             after: Some("{\"password\":\"new-private-value\"}\nghp_123456789012345678901234567890\nnormal setting updated\n".into()),
-        }]).unwrap();
+        }], crate::integrations::mcp_tools::MemoryBackend::InProcess).unwrap();
         MemoryService::with_shared_memory(&root, |service| {
             let documents = service.source_documents();
             assert_eq!(documents.len(), 1);
@@ -1569,6 +1573,7 @@ mod tests {
                 before: None,
                 after: Some("PASSWORD=private-value\n".into()),
             }],
+            crate::integrations::mcp_tools::MemoryBackend::InProcess,
         )
         .unwrap();
         MemoryService::with_shared_memory(&root, |service| {
@@ -2167,6 +2172,7 @@ mod tests {
             &project_root,
             Some(&archive_root),
             "baseline",
+            crate::integrations::mcp_tools::MemoryBackend::InProcess,
         )
         .unwrap();
         assert_eq!(report.session_id, "baseline");

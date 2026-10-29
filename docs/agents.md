@@ -234,8 +234,8 @@ for replay and inspection and is intentionally independent from searchable
 memory and context injection.
 
 The provider MCP tools and their request semantics are documented in the
-[MCP interface guide](mcp.md). For onboarding, see the Get started entries for
-the [HTTP server](server.md) and [MCP interface](mcp.md).
+[MCP tools](connect-agent.md#mcp-tools). For onboarding, see the Get started entries for
+the [HTTP server](server.md) and [MCP tools](connect-agent.md#mcp-tools).
 
 ## Durable Claude and Codex transcript capture
 

@@ -487,7 +487,7 @@ fn legacy_memory_retry_keeps_stored_id_after_reopening() {
             .insert("request_id".into(), request.request_id.clone());
         legacy.filters.insert(
             "request_fingerprint".into(),
-            request_fingerprint(&request.session_id, &request.messages).unwrap(),
+            request_fingerprint(&request.session_id, &request.messages, &BTreeMap::new()).unwrap(),
         );
         service.upsert(legacy);
         service.refresh().unwrap();
@@ -575,6 +575,29 @@ fn canonical_temp_dir(name: &str) -> std::path::PathBuf {
         .canonicalize()
         .unwrap_or_else(|_| std::env::temp_dir());
     base.join(format!("membrick-{name}-{}", std::process::id()))
+}
+
+#[test]
+fn at_path_shares_project_owner_lock_with_resident() {
+    let root = canonical_temp_dir("service-owner-lock");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    crate::state_paths::record_install_settings(&root).unwrap();
+    let store_path = root.join(".membrick/memory");
+
+    let resident_owner = crate::state_paths::ProjectOwnerLock::acquire(&root).unwrap();
+    let error = MemoryService::at_path(&store_path, PipelineOptions::default())
+        .err()
+        .expect("standalone service must not open a resident-owned project store");
+    assert!(error.to_string().contains("resident owns the workspace"));
+    assert!(error.to_string().contains("project resident client"));
+    drop(resident_owner);
+
+    let service = MemoryService::at_path(&store_path, PipelineOptions::default()).unwrap();
+    assert!(crate::state_paths::ProjectOwnerLock::acquire(&root).is_err());
+    drop(service);
+    assert!(crate::state_paths::ProjectOwnerLock::acquire(&root).is_ok());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 fn bare_search_result(doc_id: &str, score: f32) -> crate::SearchResult {
@@ -873,6 +896,101 @@ fn identical_request_ids_are_isolated_between_users() {
     assert_eq!(b.data.len(), 1);
     assert!(a.data[0].content.contains("alpha"));
     assert!(b.data[0].content.contains("beta"));
+}
+
+#[test]
+fn omitted_session_retry_after_upgrade_recovers_the_legacy_session() {
+    let dir = canonical_temp_dir("retry-session-upgrade-recovery");
+    let options = PipelineOptions::default();
+    let messages = vec![Message {
+        role: "user".into(),
+        content: "A durable preference written before upgrade".into(),
+        timestamp: None,
+        expires_at_ms: None,
+        supersedes_id: None,
+    }];
+    let user_id = "alice";
+    let request_id = "upgrade-retry-key";
+    let legacy_session = "legacy-random-session-7f9c";
+
+    // Model the old client, which sent the same request ID with a newly
+    // generated session. The response is lost before the caller learns it.
+    {
+        let mut service = MemoryService::at_path(&dir, options.clone()).unwrap();
+        service
+            .add_with_metadata(AddRequestWithMetadata {
+                request: AddRequest {
+                    request_id: request_id.into(),
+                    messages: messages.clone(),
+                    user_id: user_id.into(),
+                    session_id: legacy_session.into(),
+                },
+                metadata: BTreeMap::new(),
+            })
+            .unwrap();
+        service.refresh().unwrap();
+    }
+
+    // A new client retries after restart with the current deterministic
+    // omitted-session identity. Exact payload proof recovers the old session.
+    let retry_session = crate::memory_client::retry_session_id(user_id, request_id);
+    let mut service = MemoryService::at_path(&dir, options).unwrap();
+    let retry = || AddRequestContext {
+        request: AddRequestWithMetadata {
+            request: AddRequest {
+                request_id: request_id.into(),
+                messages: messages.clone(),
+                user_id: user_id.into(),
+                session_id: retry_session.clone(),
+            },
+            metadata: BTreeMap::new(),
+        },
+        session_id_was_omitted: true,
+    };
+    let response = service.add_with_metadata_context(retry()).unwrap();
+    assert_eq!(response.session_id, legacy_session);
+    assert_eq!(service.store.source_documents().len(), 1);
+    let second_retry = service.add_with_metadata_context(retry()).unwrap();
+    assert_eq!(second_retry.session_id, legacy_session);
+    assert_eq!(service.store.source_documents().len(), 1);
+
+    let explicit_canonical_session = AddRequestWithMetadata {
+        request: AddRequest {
+            request_id: request_id.into(),
+            messages: messages.clone(),
+            user_id: user_id.into(),
+            session_id: retry_session.clone(),
+        },
+        metadata: BTreeMap::new(),
+    };
+    assert!(service
+        .add_with_metadata(explicit_canonical_session)
+        .is_err());
+    let arbitrary_session = AddRequest {
+        request_id: request_id.into(),
+        messages: messages.clone(),
+        user_id: user_id.into(),
+        session_id: "caller-selected-different-session".into(),
+    };
+    assert!(service.add(arbitrary_session).is_err());
+    assert_eq!(service.store.source_documents().len(), 1);
+
+    let changed = AddRequest {
+        request_id: request_id.into(),
+        messages: vec![Message {
+            role: "user".into(),
+            content: "A changed payload must still conflict".into(),
+            timestamp: None,
+            expires_at_ms: None,
+            supersedes_id: None,
+        }],
+        user_id: user_id.into(),
+        session_id: retry_session,
+    };
+    assert!(service.add(changed).is_err());
+    assert_eq!(service.store.source_documents().len(), 1);
+    drop(service);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2651,6 +2769,97 @@ fn structured_results_return_evidence_hits() {
         assert_eq!(r.relation_evidence, vec!["shared relation: Rome"]);
         assert!(r.relation_confidence.is_some());
     }
+}
+
+#[test]
+fn mem0_search_filters_also_constrain_structured_fact_hits() {
+    let mut docs = vec![
+        structured_doc("d1", "Gina: went to Rome", "u1", &[]),
+        structured_doc("d2", "Jon: went to Rome", "u1", &[]),
+    ];
+    docs[0].filters.insert(
+        "segment".into(),
+        encode_metadata_value(&serde_json::json!("allowed")).unwrap(),
+    );
+    docs[1].filters.insert(
+        "segment".into(),
+        encode_metadata_value(&serde_json::json!("excluded")).unwrap(),
+    );
+    let refs: Vec<&SourceDocument> = docs.iter().collect();
+    let mut service = service();
+    service.store = structured_store(&docs, PipelineOptions::default());
+    service.relations_cache = seeded_cache("u1", &refs, rome_index());
+
+    let ast = Mem0FilterExpr::from_platform_value(serde_json::json!({
+        "segment": "allowed"
+    }))
+    .unwrap();
+    let response = service
+        .search_with_filter_ast(
+            fact_request("Which city have both Gina and Jon visited?", "u1"),
+            &ast,
+        )
+        .unwrap();
+    assert_eq!(
+        response
+            .data
+            .iter()
+            .map(|hit| hit.id.as_str())
+            .collect::<Vec<_>>(),
+        ["d1"],
+        "structured retrieval must obey the AST allow-list before blending"
+    );
+}
+
+#[test]
+fn mem0_filters_and_metadata_hide_internal_fields() {
+    let internal_filter = Mem0FilterExpr::from_platform_value(serde_json::json!({
+        "membrick_last_enrichment_search_id": "private"
+    }))
+    .unwrap();
+    assert!(internal_filter.validate_mem0_fields().is_err());
+
+    let mut service = service();
+    assert!(service
+        .search_with_filter_ast(fact_request("private", "u1"), &internal_filter,)
+        .is_err());
+    assert!(service
+        .list_with_filter_ast(
+            ListRequest {
+                user_id: "u1".into(),
+                session_id: None,
+                limit: 10,
+                cursor: None,
+                include_inactive: false,
+            },
+            Some(&internal_filter),
+        )
+        .is_err());
+
+    let mut document = structured_doc(
+        "metadata-internal-filter",
+        "a memory",
+        "u1",
+        &[("membrick_last_enrichment_search_id", "private")],
+    );
+    document.filters.insert(
+        "topic".into(),
+        encode_metadata_value(&serde_json::json!({ "color": "blue" })).unwrap(),
+    );
+    let metadata_filter = Mem0FilterExpr::from_platform_value(serde_json::json!({
+        "metadata": { "membrick_last_enrichment_search_id": "private" }
+    }))
+    .unwrap();
+    assert!(metadata_filter.validate_mem0_fields().is_err());
+
+    let record = memory_record(&document);
+    assert_eq!(
+        record.metadata,
+        BTreeMap::from([(
+            "topic".into(),
+            encode_metadata_value(&serde_json::json!({ "color": "blue" })).unwrap(),
+        )])
+    );
 }
 
 #[test]

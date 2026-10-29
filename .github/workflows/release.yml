@@ -39,6 +39,15 @@ jobs:
       - name: Build agent-capable binary
         run: cargo build --release --target ${{ matrix.target }} --features agent-integrations
 
+      - name: Ad-hoc sign macOS binary
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/membrick"
+          codesign --force --sign - "$binary"
+          codesign --verify --strict "$binary"
+          "$binary" --version
+
       - name: Package and checksum (unix)
         if: runner.os != 'Windows'
         shell: bash

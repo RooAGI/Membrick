@@ -2,9 +2,21 @@
 mod server_writer;
 use server_writer::StagedWriter;
 
+#[path = "server_dashboard_routes.rs"]
+mod server_dashboard_routes;
+#[path = "server_extension_events.rs"]
+mod server_extension_events;
+#[path = "server_memory_routes.rs"]
+mod server_memory_routes;
+#[path = "server_operations_routes.rs"]
+mod server_operations_routes;
+#[path = "server_provider_routes.rs"]
+mod server_provider_routes;
+
 use crate::memory_api::{
-    AddRequest, DeleteRequest, GetRequest, ListRequest, MemoryService, MemoryStore, SearchRequest,
-    SupersedeRequest, UpdateRequest,
+    AddRequest, AddRequestWithMetadata, DeleteRequest, GetRequest, ListRequest, Mem0FilterExpr,
+    MemoryService, MemoryStore, SearchRequest, SearchRequestWithFilterAst, SupersedeRequest,
+    UpdateRequestWithMetadata,
 };
 use crate::segments::SegmentRoutingStrategy;
 use crate::telemetry::{
@@ -13,16 +25,17 @@ use crate::telemetry::{
 };
 use crate::{
     default_production_pipeline_options, lang::Lang, IndexStoreInspection, MemoryIndexLayout,
-    PipelineOptions, DEFAULT_SEGMENT_QUERY_TOP_N,
+    PipelineOptions, DEFAULT_SEGMENT_QUERY_TOP_N, MCP_DOCUMENTS_UPSERT_PATH, MCP_TOOLS_CALL_PATH,
 };
 use anyhow::Context;
 use axum::{
+    body::Body,
     error_handling::HandleErrorLayer,
     extract::{Extension, Json, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse},
-    routing::{get, post},
+    response::{Html, IntoResponse, Redirect},
+    routing::{any, get, post},
     Router,
 };
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -119,7 +132,6 @@ struct ServerSettings {
     bind: Option<String>,
     resident_http_bind: Option<String>,
     resident_http_auto_port: Option<bool>,
-    resident_idle_timeout_seconds: Option<u64>,
     index: Option<PathBuf>,
     project_root: Option<PathBuf>,
     server_token: Option<String>,
@@ -588,6 +600,76 @@ struct DashboardIntegrationStatus {
     capture_events: u64,
     indexes: Vec<DashboardProviderIndex>,
     events: Vec<ProviderLifecycleEvent>,
+    /// Retention cap of `events`, so clients can label window-only figures.
+    event_window_limit: usize,
+    /// Cumulative counters, or `None` when the ledger predates them.
+    counters: Option<DashboardProviderCounters>,
+    /// The newest prompt, stop, usage and subagent events.
+    milestone_events: Vec<ProviderLifecycleEvent>,
+}
+
+/// Cumulative per-provider counters as served by `/api/status`. The ledger's
+/// open-prompt bookkeeping is not exposed.
+#[derive(serde::Serialize)]
+struct DashboardProviderCounters {
+    since_ms: u64,
+    prompts: u64,
+    stops: u64,
+    tool_calls: u64,
+    tool_results: u64,
+    tool_failures: u64,
+    subagent_starts: u64,
+    subagent_stops: u64,
+    usage_events: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    reported_total_tokens: u64,
+    cycles_completed: u64,
+    cycle_duration_sum_ms: u64,
+    cycle_duration_max_ms: u64,
+    cycle_duration_avg_ms: Option<u64>,
+    cycle_duration_p50_ms: Option<u64>,
+    cycle_duration_p95_ms: Option<u64>,
+    subagent_interrupted: u64,
+    subagent_ended_without_stop: u64,
+    /// Subagents started and not yet stopped, by agent id.
+    open_subagents: std::collections::BTreeMap<String, crate::telemetry::OpenSubagent>,
+}
+
+impl DashboardProviderCounters {
+    fn from_ledger(counters: &crate::telemetry::ProviderLifecycleCounters) -> Option<Self> {
+        if counters.since_ms == 0 {
+            return None;
+        }
+        Some(Self {
+            since_ms: counters.since_ms,
+            prompts: counters.prompts,
+            stops: counters.stops,
+            tool_calls: counters.tool_calls,
+            tool_results: counters.tool_results,
+            tool_failures: counters.tool_failures,
+            subagent_starts: counters.subagent_starts,
+            subagent_stops: counters.subagent_stops,
+            usage_events: counters.usage_events,
+            input_tokens: counters.input_tokens,
+            output_tokens: counters.output_tokens,
+            cache_creation_input_tokens: counters.cache_creation_input_tokens,
+            cache_read_input_tokens: counters.cache_read_input_tokens,
+            reported_total_tokens: counters.reported_total_tokens,
+            cycles_completed: counters.cycles_completed,
+            cycle_duration_sum_ms: counters.cycle_duration_sum_ms,
+            cycle_duration_max_ms: counters.cycle_duration_max_ms,
+            cycle_duration_avg_ms: (counters.cycles_completed > 0)
+                .then(|| counters.cycle_duration_sum_ms / counters.cycles_completed),
+            cycle_duration_p50_ms: counters.cycle_duration_quantile_ms(0.50),
+            cycle_duration_p95_ms: counters.cycle_duration_quantile_ms(0.95),
+            subagent_interrupted: counters.subagent_interrupted,
+            subagent_ended_without_stop: counters.subagent_ended_without_stop,
+            open_subagents: counters.open_subagents.clone(),
+        })
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -645,7 +727,7 @@ fn open_workspace_owner_at(
     options: PipelineOptions,
 ) -> anyhow::Result<MemoryService> {
     let ignore_paths = provider_memory_ignore_paths();
-    let owner = MemoryService::open_workspace_owner_with_options_at(
+    let mut owner = MemoryService::open_workspace_owner_with_options_at(
         root,
         workspace_root,
         crate::integrations::mcp_index::SHARED_MEMORY_DIR,
@@ -664,6 +746,22 @@ fn open_workspace_owner_at(
             Ok(crate::adapters::graph_to_source_documents(&graph))
         },
     )?;
+    // Use the scope extension routes use, so adopted records show up there.
+    match crate::integrations::mcp_tools::adopt_legacy_extension_records(
+        &mut owner,
+        crate::MCP_MEMORY_USER_ID,
+        &root.to_string_lossy(),
+        &root.join(".membrick").join("migrations"),
+    ) {
+        Ok(adoption) if adoption.adopted > 0 => tracing::info!(
+            adopted = adoption.adopted,
+            left_in_place = adoption.left_in_place,
+            backup = ?adoption.backup,
+            "moved legacy records into extension storage"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!("legacy extension records were not adopted: {error:#}"),
+    }
     owner.start_search_history_index(root);
     Ok(owner)
 }
@@ -680,12 +778,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let settings = load_server_settings(&settings_file)?;
     let resident_http_bind = settings.resident_http_bind.clone();
     let resident_http_auto_port = settings.resident_http_auto_port.unwrap_or(false);
-    let resident_idle_timeout = std::time::Duration::from_secs(
-        settings
-            .resident_idle_timeout_seconds
-            .unwrap_or(60)
-            .clamp(5, 3600),
-    );
     if !bind_was_set {
         if let Some(bind) = settings.bind {
             args.bind = bind;
@@ -774,7 +866,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         bind = %args.bind,
         resident_http_bind = ?resident_http_bind,
         resident_http_auto_port,
-        resident_idle_timeout_seconds = resident_idle_timeout.as_secs(),
         index = ?args.index,
         tenant_id = ?args.tenant_id,
         adaptive_segment_max_n = ?args.adaptive_segment_max_n,
@@ -985,7 +1076,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     if args.resident_server {
         let root = state.project_root.clone();
         let managed = args.managed_resident;
-        let idle_timeout = resident_idle_timeout;
         let (log_level, log_level_source) = crate::logging::active_level()
             .map_or(("unset".to_owned(), "none"), |(level, source)| {
                 (level.to_string(), source)
@@ -999,8 +1089,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             "resident starting"
         );
         let shutdown = async move {
-            crate::local_ipc::resident_shutdown(&root, managed, idle_timeout, shutdown_signal())
-                .await
+            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal()).await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(
             app,
@@ -1042,6 +1131,8 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|status| anyhow::anyhow!("shutdown flush failed: {status}"))?;
     }
+    crate::extension_host::shutdown()
+        .map_err(|error| anyhow::anyhow!("extension shutdown failed: {error}"))?;
     tracing::info!("shutdown complete; pending writes flushed");
     Ok(())
 }
@@ -1063,81 +1154,12 @@ async fn shutdown_signal() {
 
 fn app_router(state: AppState) -> Router {
     let router = Router::new()
-        .route("/health", get(health).post(health))
-        .route("/dashboard", get(dashboard))
-        .route("/dashboard/app.js", get(dashboard_app))
-        .route("/dashboard/event-detail.js", get(dashboard_event_detail))
-        .route(
-            "/dashboard/capture-progress.mjs",
-            get(dashboard_capture_progress),
-        )
-        .route(
-            "/dashboard/search-evaluation.mjs",
-            get(dashboard_search_evaluation),
-        )
-        .route("/dashboard/styles.css", get(dashboard_styles))
-        .route("/dashboard/rooagi-logo.png", get(dashboard_logo))
-        .route("/api/status", get(api_status))
-        .route("/api/timeseries", get(api_timeseries))
-        .route("/api/boards", get(api_boards))
-        .route("/api/boards/events", get(api_board_events))
-        .route("/api/boards/:board_id", get(api_board_detail))
-        .route("/api/flows", get(api_flows))
-        .route("/api/flows/:flow_id", get(api_flow_detail))
-        .route("/api/search-reviews", get(api_search_reviews))
-        .route("/api/integrations", get(api_integrations))
-        .route("/api/sessions", get(api_sessions))
-        .route("/api/sessions/:session_key/events", get(api_session_events))
-        .route("/api/events", get(api_events))
-        .route("/api/metrics", get(api_metrics))
-        .route("/metrics", get(metrics))
-        .route("/add", post(add))
-        .route("/add/batch", post(add_batch))
-        .route("/flush", post(refresh_memories))
-        .route("/search", post(search))
-        .route("/delete", post(delete))
-        .route("/supersede", post(supersede))
-        .route("/expire", post(expire))
-        .route("/v1/memories", get(list_memories).post(add))
-        .route(
-            "/v1/memories/:memory_id",
-            get(get_memory).patch(update_memory).delete(delete_memory),
-        )
-        .route("/v1/memories/search", post(search))
-        .route("/v1/memories/refresh", post(refresh_memories));
-    #[cfg(any(
-        feature = "claude-code",
-        feature = "codex",
-        feature = "gemini-cli",
-        feature = "agy",
-        feature = "muse-code",
-        feature = "openclaw",
-        feature = "hermes",
-        feature = "roo-runtime"
-    ))]
-    let router = router
-        .route(
-            "/provider-memory/add/batch",
-            post(provider_memory_add_batch),
-        )
-        .route("/provider-memory/search", post(provider_memory_search))
-        .route(
-            "/provider-memory/mcp/tools/call",
-            post(provider_mcp_tool_call),
-        )
-        .route(
-            "/provider-memory/mcp/documents/upsert",
-            post(provider_mcp_document_upsert),
-        );
-    #[cfg(any(feature = "claude-code", feature = "codex"))]
-    let router = router
-        .route(
-            "/provider-memory/captures",
-            post(provider_transcript_capture),
-        )
-        .route("/api/captures", get(api_transcript_captures));
-    #[cfg(feature = "openclaw")]
-    let router = router.route("/integrations/openclaw/hooks/:kind", post(openclaw_hook));
+        .merge(server_operations_routes::router())
+        .merge(server_dashboard_routes::router())
+        .merge(server_extension_events::router())
+        .merge(server_memory_routes::router())
+        .merge(server_provider_routes::router())
+        .fallback(any(extension_http_route));
     router
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(
@@ -1157,91 +1179,268 @@ fn app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[cfg(feature = "openclaw")]
-async fn openclaw_hook(
+async fn extension_http_route(
     State(state): State<AppState>,
-    Path(kind): Path<String>,
-    Json(payload): Json<Value>,
-) -> impl IntoResponse {
-    let Some(kind) = crate::integrations::openclaw::hooks::OpenClawHookKind::from_str(&kind) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"detail":"unknown OpenClaw hook"})),
-        )
-            .into_response();
+    request: Request<Body>,
+) -> axum::response::Response {
+    use membrick_extension_api::ExtensionHttpRequest;
+
+    let Some(method) = extension_http_method(request.method()) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    // These hooks read/write workspace-wide provider data, not tenant data.
-    if state.tenant_id.is_some() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"detail":"workspace hooks are unavailable in tenant mode"})),
-        )
-            .into_response();
-    }
-    let mut requested_workspace = None;
-    for pointer in [
-        "/ctx/workspaceDir",
-        "/event/context/workspaceDir",
-        "/event/workspaceDir",
-    ] {
-        if let Some(candidate) = payload
-            .pointer(pointer)
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            let canonical = match std::fs::canonicalize(candidate.trim()) {
-                Ok(path) if path.is_dir() => path,
-                _ => return StatusCode::FORBIDDEN.into_response(),
-            };
-            if requested_workspace
-                .as_ref()
-                .is_some_and(|previous| previous != &canonical)
-            {
+    let registry = crate::extension_host::registry();
+    let Some(route) = registry.match_http_route(method, request.uri().path()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let (parts, body) = request.into_parts();
+    let body = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
+        Ok(body) if body.is_empty() => Value::Null,
+        Ok(body) => match serde_json::from_slice::<Value>(&body) {
+            Ok(body) => body,
+            Err(error) => {
                 return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({"detail":"hook workspace fields do not match"})),
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"detail": format!("invalid JSON request body: {error}")})),
                 )
-                    .into_response();
+                    .into_response()
             }
-            requested_workspace = Some(canonical);
+        },
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"detail": format!("could not read request body: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    let extension_request = ExtensionHttpRequest {
+        path_params: BTreeMap::new(),
+        query: extension_query_parameters(parts.uri.query()),
+        body,
+    };
+    let workspace = state.project_root.to_string_lossy().into_owned();
+
+    // Extension route metadata is descriptive only. A handler can mutate
+    // storage even when it labels a route read-only, so every extension route
+    // uses the host's serialized durable path.
+    let response = if let Some(writer) = state.staged_writer.clone() {
+        let route_for_call = route.clone();
+        let workspace_for_call = workspace.clone();
+        match writer
+            .mutate(move |service| {
+                Ok(extension_http_result_value(
+                    crate::integrations::mcp_tools::dispatch_extension_http_route(
+                        &route_for_call,
+                        extension_request,
+                        service,
+                        crate::MCP_MEMORY_USER_ID,
+                        &workspace_for_call,
+                        "http",
+                    ),
+                ))
+            })
+            .await
+        {
+            Ok(value) => extension_http_result_from_value(value),
+            Err(error) => {
+                tracing::warn!("extension HTTP invocation failed: {error:#}");
+                extension_http_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "extension writer unavailable",
+                )
+            }
+        }
+    } else {
+        extension_http_dispatch_locked(&state, &route, extension_request, &workspace)
+    };
+    extension_http_into_response(response)
+}
+
+fn extension_http_method(method: &Method) -> Option<membrick_extension_api::HttpMethod> {
+    use membrick_extension_api::HttpMethod;
+    match *method {
+        Method::GET => Some(HttpMethod::Get),
+        Method::POST => Some(HttpMethod::Post),
+        Method::PUT => Some(HttpMethod::Put),
+        Method::PATCH => Some(HttpMethod::Patch),
+        Method::DELETE => Some(HttpMethod::Delete),
+        Method::HEAD => Some(HttpMethod::Head),
+        Method::OPTIONS => Some(HttpMethod::Options),
+        _ => None,
+    }
+}
+
+fn extension_query_parameters(query: Option<&str>) -> BTreeMap<String, Vec<String>> {
+    let mut parsed = BTreeMap::<String, Vec<String>>::new();
+    for pair in query
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+    {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        parsed
+            .entry(extension_query_decode(key))
+            .or_default()
+            .push(extension_query_decode(value));
+    }
+    parsed
+}
+
+fn extension_query_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = |byte: u8| match byte {
+                    b'0'..=b'9' => Some(byte - b'0'),
+                    b'a'..=b'f' => Some(byte - b'a' + 10),
+                    b'A'..=b'F' => Some(byte - b'A' + 10),
+                    _ => None,
+                };
+                match (hex(bytes[index + 1]), hex(bytes[index + 2])) {
+                    (Some(high), Some(low)) => {
+                        decoded.push((high << 4) | low);
+                        index += 3;
+                    }
+                    _ => {
+                        decoded.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
         }
     }
-    let requested_workspace = requested_workspace
-        .unwrap_or_else(|| state.project_root.clone())
-        .to_string_lossy()
-        .into_owned();
-    let runtime = match state.workspace_registry.resolve(&requested_workspace).await {
-        Ok(runtime) => runtime,
-        Err(error) => return error.into_response(),
-    };
-    let root = runtime.project_root.clone();
-    // Serialize admission per workspace. The MemoryService writer remains the
-    // owner of persistence and publication for the captured documents.
-    let Ok(writer) = runtime.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let provider_writer = runtime.staged_writer.clone();
-    let result = match tokio::task::spawn_blocking(move || {
-        // Keep admission held if the HTTP timeout cancels the awaiting task.
-        let _writer = writer;
-        crate::integrations::openclaw::hooks::process_http_hook_with_writer(
-            kind,
-            payload,
-            &root,
-            |document| provider_writer.upsert_documents_blocking(vec![document]),
-        )
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    (StatusCode::OK, Json(result)).into_response()
+    String::from_utf8_lossy(&decoded).into_owned()
 }
+
+fn extension_http_dispatch_locked(
+    state: &AppState,
+    route: &membrick_extension_api::ExtensionRouteMatch,
+    request: membrick_extension_api::ExtensionHttpRequest,
+    workspace: &str,
+) -> membrick_extension_api::ExtensionHttpResponse {
+    match state.service.write() {
+        Ok(mut service) => extension_http_result_from_value(extension_http_result_value(
+            crate::integrations::mcp_tools::dispatch_extension_http_route(
+                route,
+                request,
+                &mut service,
+                crate::MCP_MEMORY_USER_ID,
+                workspace,
+                "http",
+            ),
+        )),
+        Err(_) => extension_http_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "memory service is unavailable",
+        ),
+    }
+}
+
+fn extension_http_result_value(
+    result: Result<
+        membrick_extension_api::ExtensionHttpResponse,
+        membrick_extension_api::ExtensionError,
+    >,
+) -> Value {
+    use membrick_extension_api::ExtensionErrorKind;
+    match result {
+        Ok(response) => json!({
+            "status": response.status,
+            "headers": response.headers,
+            "body": response.body,
+        }),
+        Err(error) => {
+            let status = match error.kind() {
+                ExtensionErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+                ExtensionErrorKind::NotFound => StatusCode::NOT_FOUND,
+                ExtensionErrorKind::Conflict => StatusCode::CONFLICT,
+                ExtensionErrorKind::Forbidden => StatusCode::FORBIDDEN,
+                ExtensionErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+                ExtensionErrorKind::Unsupported => StatusCode::NOT_IMPLEMENTED,
+                ExtensionErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            json!({ "status": status.as_u16(), "headers": [], "body": {"detail": error.message()} })
+        }
+    }
+}
+
+fn extension_http_result_from_value(value: Value) -> membrick_extension_api::ExtensionHttpResponse {
+    let status = value["status"]
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+    let headers = value["headers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|header| {
+            Some((
+                header.get(0)?.as_str()?.to_owned(),
+                header.get(1)?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    membrick_extension_api::ExtensionHttpResponse {
+        status,
+        headers,
+        body: value.get("body").cloned().unwrap_or(Value::Null),
+    }
+}
+
+fn extension_http_error_response(
+    status: StatusCode,
+    detail: &str,
+) -> membrick_extension_api::ExtensionHttpResponse {
+    membrick_extension_api::ExtensionHttpResponse::json(status.as_u16(), json!({"detail": detail}))
+}
+
+fn extension_http_into_response(
+    response: membrick_extension_api::ExtensionHttpResponse,
+) -> axum::response::Response {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = match serde_json::to_vec(&response.body) {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail": format!("invalid extension response: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    let mut builder = axum::response::Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    for (name, value) in response.headers {
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"detail":"extension returned an invalid HTTP header"})),
+            )
+                .into_response();
+        };
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+#[cfg(feature = "openclaw")]
 
 /// Production pipeline options with the server's CLI flags applied as
 /// overrides on top of [`default_production_pipeline_options`].
@@ -1354,7 +1553,7 @@ async fn authorize(
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if path == "/health" || path == "/dashboard" || path.starts_with("/dashboard/") {
+    if path == "/" || path == "/health" || path == "/dashboard" || path.starts_with("/dashboard/") {
         return next.run(request).await;
     }
     if !browser_request_allowed(
@@ -1446,10 +1645,30 @@ fn is_workspace_operation_path(path: &str) -> bool {
     // Provider hooks access the entire workspace and do not implement
     // per-user attribution or retrieval. A user JWT is insufficient.
     is_workspace_telemetry_path(path)
+        || extension_http_path_registered(path)
         || path.starts_with("/integrations/openclaw/hooks/")
         || path == "/provider-memory/mcp/tools/call"
         || path == "/provider-memory/mcp/documents/upsert"
         || path == "/provider-memory/captures"
+}
+
+fn extension_http_path_registered(path: &str) -> bool {
+    use membrick_extension_api::HttpMethod;
+    [
+        HttpMethod::Get,
+        HttpMethod::Post,
+        HttpMethod::Put,
+        HttpMethod::Patch,
+        HttpMethod::Delete,
+        HttpMethod::Head,
+        HttpMethod::Options,
+    ]
+    .into_iter()
+    .any(|method| {
+        crate::extension_host::registry()
+            .match_http_route(method, path)
+            .is_some()
+    })
 }
 
 fn is_workspace_telemetry_path(path: &str) -> bool {
@@ -1462,13 +1681,10 @@ fn is_workspace_telemetry_path(path: &str) -> bool {
             | "/api/status"
             | "/api/timeseries"
             | "/api/search-reviews"
-            | "/api/boards"
-            | "/api/flows"
+            | "/api/extensions/events"
             | "/api/metrics"
             | "/metrics"
     ) || path.starts_with("/api/sessions/")
-        || path.starts_with("/api/boards/")
-        || path.starts_with("/api/flows/")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1481,20 +1697,6 @@ struct AuthContext {
     user_id: String,
 }
 
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let canonical = state
-        .project_root
-        .canonicalize()
-        .unwrap_or_else(|_| state.project_root.clone());
-    let digest = sha2::Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let workspace_id: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    Json(json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-        "workspace_id": workspace_id
-    }))
-}
-
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1502,592 +1704,22 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
-async fn dashboard() -> Html<&'static str> {
-    Html(include_str!("../../dashboard/index.html"))
-}
+/// The server has no landing page of its own, so the root opens the dashboard.
 
-async fn dashboard_app() -> (
-    [(axum::http::header::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../dashboard/app.js"),
-    )
-}
-
-async fn dashboard_event_detail() -> (
-    [(axum::http::header::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../dashboard/event-detail.js"),
-    )
-}
-
-async fn dashboard_search_evaluation() -> (
-    [(axum::http::header::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../dashboard/search-evaluation.mjs"),
-    )
-}
-
-async fn dashboard_capture_progress() -> (
-    [(axum::http::header::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
-        include_str!("../../dashboard/capture-progress.mjs"),
-    )
-}
-
-async fn dashboard_styles() -> (
-    [(axum::http::header::HeaderName, &'static str); 1],
-    &'static str,
-) {
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../../dashboard/styles.css"),
-    )
-}
-
-async fn dashboard_logo() -> (
-    [(axum::http::header::HeaderName, &'static str); 1],
-    &'static [u8],
-) {
-    (
-        [(axum::http::header::CONTENT_TYPE, "image/png")],
-        include_bytes!("../../dashboard/rooagi-logo.png"),
-    )
-}
-
-async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
-    let inspection = match state.service.read() {
-        Ok(service) => service.memory_store(MemoryStore::Workspace).inspection(),
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail":"status unavailable"})),
-            )
-                .into_response()
-        }
-    };
-    let telemetry = project_query_snapshot(&state.project_root)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| state.telemetry.snapshot());
-    Json(DashboardStatus {
-        status: if inspection.dirty {
-            "degraded"
-        } else {
-            "healthy"
-        },
-        version: env!("CARGO_PKG_VERSION"),
-        uptime_seconds: now_unix_ms()
-            .saturating_sub(telemetry.started_at_ms)
-            .checked_div(1_000)
-            .unwrap_or_default(),
-        index: dashboard_index_status(inspection),
-        telemetry,
-        integrations: dashboard_integrations(&state.project_root),
-        transcript_captures: {
-            let registry = state.workspace_registry.state.lock().await;
-            registry
-                .entries
-                .get(&state.project_root)
-                .map(|runtime| transcript_capture_status(runtime))
-                .unwrap_or_else(|| json!([]))
-        },
-    })
-    .into_response()
-}
-
-async fn api_timeseries(State(state): State<AppState>) -> impl IntoResponse {
-    Json(
-        project_query_snapshot(&state.project_root)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| state.telemetry.snapshot()),
-    )
-}
-
-async fn api_boards(State(state): State<AppState>) -> impl IntoResponse {
-    let workspace = state.project_root.to_string_lossy();
-    match state.service.read() {
-        Ok(service) => match service.board_dashboard_list("mcp", &workspace) {
-            Ok(boards) => Json(json!({"boards": boards})).into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": format!("boards unavailable: {error}")})),
-            )
-                .into_response(),
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"boards unavailable"})),
-        )
-            .into_response(),
-    }
-}
-
-/// The dashboard change notice for a successful board or Flow write, or
-/// `None` when the result does not identify what changed. Notices carry IDs
-/// only; clients refetch content through the authenticated read APIs.
+/// Ask the tool's owning extension for an opaque dashboard change notice.
+/// Clients refetch content through their authenticated read APIs.
 fn change_event(tool: &str, payload: &Value) -> Option<Value> {
-    if crate::integrations::mcp_tools::is_flow_tool_name(tool) {
-        let run = payload.get("run")?;
-        return Some(json!({
-            "kind": "flow",
-            "tool": tool,
-            "flow_id": run.get("flow_id")?,
-            "board_id": run.get("board_id"),
-            "revision": run.get("revision"),
-        }));
-    }
-    Some(json!({
-        "kind": "board",
-        "tool": tool,
-        "board_id": payload.get("board_id")?,
-        "sequence": payload.get("sequence"),
-    }))
+    crate::extension_host::registry().change_notification(tool, payload)
 }
 
-/// Server-sent board and Flow change notices for this workspace. The stream
-/// opens with `ready`, then sends one `change` per applied write. A client
-/// that falls behind receives `resync` and should refetch what it shows.
-async fn api_board_events(State(state): State<AppState>) -> axum::response::Response {
-    use axum::response::sse::{Event, KeepAlive, Sse};
-    use futures_util::StreamExt;
-    use tokio::sync::broadcast::error::RecvError;
-
-    let Some(writer) = state.staged_writer.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"detail":"board events unavailable"})),
-        )
-            .into_response();
-    };
-    let receiver = writer.changes().subscribe();
-    let ready = futures_util::stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().event("ready").data("{}"))
-    });
-    let changes = futures_util::stream::unfold(receiver, |mut receiver| async move {
-        let event = match receiver.recv().await {
-            Ok(change) => Event::default().event("change").data(change.to_string()),
-            Err(RecvError::Lagged(skipped)) => Event::default()
-                .event("resync")
-                .data(json!({"skipped": skipped}).to_string()),
-            Err(RecvError::Closed) => return None,
-        };
-        Some((Ok(event), receiver))
-    });
-    Sse::new(ready.chain(changes))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response()
-}
-
-async fn api_flows(State(state): State<AppState>) -> impl IntoResponse {
-    let workspace = state.project_root.to_string_lossy();
-    match state.service.read() {
-        Ok(service) => match service.flow_list("mcp", &workspace) {
-            Ok(flows) => Json(json!({"flows": flows})).into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": format!("flows unavailable: {error}")})),
-            )
-                .into_response(),
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"flows unavailable"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn api_flow_detail(
-    State(state): State<AppState>,
-    Path(flow_id): Path<String>,
-) -> impl IntoResponse {
-    let workspace = state.project_root.to_string_lossy();
-    match state.service.read() {
-        Ok(service) => match service.flow_get("mcp", &workspace, &flow_id) {
-            Ok(Some(snapshot)) => {
-                Json(json!({"flow": snapshot.run, "events": snapshot.events})).into_response()
-            }
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({"detail":"flow not found"})),
-            )
-                .into_response(),
-            Err(error) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail": format!("flow unavailable: {error}")})),
-            )
-                .into_response(),
-        },
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"flows unavailable"})),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct DashboardBoardPostsQuery {
-    after_sequence: Option<u64>,
-    limit: Option<usize>,
-    latest: Option<bool>,
-}
-
-async fn api_board_detail(
-    State(state): State<AppState>,
-    Path(board_id): Path<String>,
-    Query(query): Query<DashboardBoardPostsQuery>,
-) -> impl IntoResponse {
-    let workspace = state.project_root.to_string_lossy();
-    let limit = query.limit.unwrap_or(100).clamp(1, 100);
-    if query.latest.unwrap_or(false) && query.after_sequence.is_some() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"detail":"latest cannot be combined with after_sequence"})),
-        )
-            .into_response();
-    }
-    match state.service.read() {
-        Ok(service) => {
-            let snapshot = if query.latest.unwrap_or(false) {
-                service.board_dashboard_latest_detail(&board_id, "mcp", &workspace, limit)
-            } else {
-                service.board_dashboard_detail(
-                    &board_id,
-                    "mcp",
-                    &workspace,
-                    query.after_sequence,
-                    limit,
-                )
-            };
-            match snapshot {
-                Ok(Some(snapshot)) => {
-                    let next_after = snapshot.posts.last().map(|post| post.sequence);
-                    Json(json!({
-                        "board": snapshot.board,
-                        "posts": snapshot.posts,
-                        "has_more": snapshot.has_more,
-                        "next_after_sequence": if snapshot.has_more {
-                            next_after
-                        } else {
-                            None
-                        },
-                        "latest_sequence": snapshot.latest_sequence,
-                    }))
-                    .into_response()
-                }
-                Ok(None) => (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"detail":"board not found"})),
-                )
-                    .into_response(),
-                Err(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"detail": format!("board unavailable: {error}")})),
-                )
-                    .into_response(),
-            }
-        }
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"board unavailable"})),
-        )
-            .into_response(),
-    }
-}
+/// Server-sent opaque extension change notices for this workspace. The stream
+/// opens with `ready`, then forwards each registered extension notification.
+/// A client that falls behind receives `resync` and should refetch its view.
 
 #[derive(Debug, Deserialize)]
 struct DashboardSearchReviewsQuery {
     offset: Option<usize>,
     page_size: Option<usize>,
-}
-
-async fn api_search_reviews(
-    State(state): State<AppState>,
-    Query(query): Query<DashboardSearchReviewsQuery>,
-) -> impl IntoResponse {
-    match crate::memory_api::MemoryService::dashboard_search_feedback_reviews(
-        &state.project_root,
-        query.offset.unwrap_or_default(),
-        query.page_size.unwrap_or(25),
-    ) {
-        Ok(reviews) => Json(reviews).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail": format!("search reviews unavailable: {error}")})),
-        )
-            .into_response(),
-    }
-}
-
-async fn api_integrations(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
-        "integrations": dashboard_integrations(&state.project_root),
-        "note": "Provider hooks and MCP processes report independently; this server does not infer agent connectivity from index health."
-    }))
-}
-
-async fn api_sessions(State(state): State<AppState>) -> impl IntoResponse {
-    let mut sessions = BTreeMap::<(String, String), Vec<ProviderLifecycleEvent>>::new();
-    for integration in dashboard_integrations(&state.project_root) {
-        for event in integration.events {
-            sessions
-                .entry((event.provider.clone(), event.session_key.clone()))
-                .or_default()
-                .push(event);
-        }
-    }
-    let sessions = sessions
-        .into_iter()
-        .map(|((provider, session_key), mut events)| {
-            events.sort_by_key(|event| event.timestamp_ms);
-            let first_seen_ms = events
-                .first()
-                .map(|event| event.timestamp_ms)
-                .unwrap_or_default();
-            let last = events.last();
-            DashboardSession {
-                provider,
-                session_key,
-                event_count: events.len(),
-                first_seen_ms,
-                last_seen_ms: last.map(|event| event.timestamp_ms).unwrap_or_default(),
-                last_event: last.map(|event| event.event.clone()).unwrap_or_default(),
-            }
-        })
-        .collect::<Vec<_>>();
-    Json(json!({"sessions": sessions}))
-}
-
-async fn api_events(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({"events": recent_provider_events(&state.project_root)}))
-}
-
-async fn api_session_events(
-    State(state): State<AppState>,
-    Path(session_key): Path<String>,
-) -> impl IntoResponse {
-    let events = recent_provider_events(&state.project_root)
-        .into_iter()
-        .filter(|event| event.session_key == session_key)
-        .collect::<Vec<_>>();
-    Json(json!({"session_key": session_key, "events": events}))
-}
-
-async fn api_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let integrations = dashboard_integrations(&state.project_root);
-    let query = project_query_snapshot(&state.project_root)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| state.telemetry.snapshot())
-        .query_summary;
-    Json(json!({
-        "query": query,
-        "providers": integrations.into_iter().map(|item| json!({
-            "provider": item.provider,
-            "compiled": item.compiled,
-            "state": item.state,
-            "events_total": item.events_total,
-            "sessions_started": item.sessions_started,
-            "sessions_ended": item.sessions_ended,
-            "sessions_active": item.sessions_active,
-            "retrieval_events": item.retrieval_events,
-            "capture_events": item.capture_events,
-        })).collect::<Vec<_>>(),
-    }))
-}
-
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let query = project_query_snapshot(&state.project_root)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| state.telemetry.snapshot())
-        .query_summary;
-    let integrations = dashboard_integrations(&state.project_root);
-    let mut body = String::from("# Membrick operational metrics\n");
-    body.push_str("# HELP membrick_query_requests_window Search requests in the retained telemetry window.\n# TYPE membrick_query_requests_window gauge\n");
-    body.push_str(&format!(
-        "membrick_query_requests_window {}\n",
-        query.requests
-    ));
-    body.push_str("# HELP membrick_query_errors_window Search errors in the retained telemetry window.\n# TYPE membrick_query_errors_window gauge\n");
-    body.push_str(&format!("membrick_query_errors_window {}\n", query.errors));
-    body.push_str("# HELP membrick_query_empty_results_window Searches with no results in the retained telemetry window.\n# TYPE membrick_query_empty_results_window gauge\n");
-    body.push_str(&format!(
-        "membrick_query_empty_results_window {}\n",
-        query.empty_results
-    ));
-    body.push_str("# HELP membrick_query_requests_per_second Search request rate over the retained telemetry window.\n# TYPE membrick_query_requests_per_second gauge\n");
-    body.push_str(&format!(
-        "membrick_query_requests_per_second {}\n",
-        query.requests_per_second
-    ));
-    body.push_str("# HELP membrick_query_error_rate Fraction of searches that returned errors in the retained telemetry window.\n# TYPE membrick_query_error_rate gauge\n");
-    body.push_str(&format!("membrick_query_error_rate {}\n", query.error_rate));
-    body.push_str("# HELP membrick_query_empty_result_rate Fraction of searches with no results in the retained telemetry window.\n# TYPE membrick_query_empty_result_rate gauge\n");
-    body.push_str(&format!(
-        "membrick_query_empty_result_rate {}\n",
-        query.empty_result_rate
-    ));
-    body.push_str("# HELP membrick_query_latency_ms Estimated query latency quantile in milliseconds over the retained telemetry window.\n# TYPE membrick_query_latency_ms gauge\n");
-    body.push_str(&format!(
-        "membrick_query_latency_ms{{quantile=\"0.5\"}} {}\n",
-        query.p50_ms
-    ));
-    body.push_str(&format!(
-        "membrick_query_latency_ms{{quantile=\"0.95\"}} {}\n",
-        query.p95_ms
-    ));
-    body.push_str("# HELP membrick_provider_compiled Whether this server build includes the provider integration.\n# TYPE membrick_provider_compiled gauge\n");
-    body.push_str("# HELP membrick_provider_observed Whether Membrick has ever received lifecycle telemetry for the provider.\n# TYPE membrick_provider_observed gauge\n");
-    body.push_str("# HELP membrick_provider_events_total Lifecycle events recorded for the provider.\n# TYPE membrick_provider_events_total counter\n");
-    body.push_str("# HELP membrick_provider_sessions_started_total Provider sessions started.\n# TYPE membrick_provider_sessions_started_total counter\n");
-    body.push_str("# HELP membrick_provider_sessions_ended_total Provider sessions ended.\n# TYPE membrick_provider_sessions_ended_total counter\n");
-    body.push_str("# HELP membrick_provider_retrieval_events_total Provider lifecycle events categorized as retrieval.\n# TYPE membrick_provider_retrieval_events_total counter\n");
-    body.push_str("# HELP membrick_provider_capture_events_total Provider lifecycle events categorized as capture.\n# TYPE membrick_provider_capture_events_total counter\n");
-    body.push_str("# HELP membrick_provider_sessions_active Active provider sessions observed by Membrick.\n# TYPE membrick_provider_sessions_active gauge\n");
-    body.push_str("# HELP membrick_provider_last_seen_timestamp_seconds Unix timestamp of the last received provider event, or zero if none.\n# TYPE membrick_provider_last_seen_timestamp_seconds gauge\n");
-    body.push_str("# HELP membrick_provider_recent_events Events by bounded lifecycle category in the retained provider event ledger.\n# TYPE membrick_provider_recent_events gauge\n");
-    body.push_str("# HELP membrick_provider_token_usage_recent Tokens reported in the retained provider event ledger.\n# TYPE membrick_provider_token_usage_recent gauge\n");
-    for integration in integrations {
-        body.push_str(&format!(
-            "membrick_provider_events_total{{provider=\"{}\"}} {}\n",
-            integration.recording_provider, integration.events_total
-        ));
-        body.push_str(&format!(
-            "membrick_provider_compiled{{provider=\"{}\"}} {}\n",
-            integration.recording_provider,
-            u8::from(integration.compiled)
-        ));
-        body.push_str(&format!(
-            "membrick_provider_observed{{provider=\"{}\"}} {}\n",
-            integration.recording_provider,
-            u8::from(integration.last_seen_ms.is_some())
-        ));
-        body.push_str(&format!(
-            "membrick_provider_sessions_started_total{{provider=\"{}\"}} {}\n",
-            integration.recording_provider, integration.sessions_started
-        ));
-        body.push_str(&format!(
-            "membrick_provider_sessions_ended_total{{provider=\"{}\"}} {}\n",
-            integration.recording_provider, integration.sessions_ended
-        ));
-        body.push_str(&format!(
-            "membrick_provider_retrieval_events_total{{provider=\"{}\"}} {}\n",
-            integration.recording_provider, integration.retrieval_events
-        ));
-        body.push_str(&format!(
-            "membrick_provider_capture_events_total{{provider=\"{}\"}} {}\n",
-            integration.recording_provider, integration.capture_events
-        ));
-        body.push_str(&format!(
-            "membrick_provider_sessions_active{{provider=\"{}\"}} {}\n",
-            integration.recording_provider, integration.sessions_active
-        ));
-        body.push_str(&format!(
-            "membrick_provider_last_seen_timestamp_seconds{{provider=\"{}\"}} {}\n",
-            integration.recording_provider,
-            integration.last_seen_ms.unwrap_or_default() as f64 / 1_000.0
-        ));
-
-        let mut recent_categories = BTreeMap::<&str, u64>::new();
-        let mut recent_tokens = BTreeMap::<&str, u64>::new();
-        for event in &integration.events {
-            if matches!(
-                event.category.as_str(),
-                "session" | "retrieval" | "compaction" | "capture" | "lifecycle"
-            ) {
-                *recent_categories
-                    .entry(event.category.as_str())
-                    .or_default() += 1;
-            }
-            for (kind, value) in [
-                ("input", event.input_tokens),
-                ("output", event.output_tokens),
-                ("cache_creation_input", event.cache_creation_input_tokens),
-                ("cache_read_input", event.cache_read_input_tokens),
-            ] {
-                if let Some(value) = value {
-                    let total = recent_tokens.entry(kind).or_default();
-                    *total = total.saturating_add(value);
-                }
-            }
-        }
-        for category in ["session", "retrieval", "compaction", "capture", "lifecycle"] {
-            body.push_str(&format!(
-                "membrick_provider_recent_events{{provider=\"{}\",category=\"{}\"}} {}\n",
-                integration.recording_provider,
-                category,
-                recent_categories.get(category).copied().unwrap_or_default()
-            ));
-        }
-        for kind in [
-            "input",
-            "output",
-            "cache_creation_input",
-            "cache_read_input",
-        ] {
-            body.push_str(&format!(
-                "membrick_provider_token_usage_recent{{provider=\"{}\",kind=\"{}\"}} {}\n",
-                integration.recording_provider,
-                kind,
-                recent_tokens.get(kind).copied().unwrap_or_default()
-            ));
-        }
-    }
-
-    body.push_str("# HELP membrick_index_source_documents Source documents in the project memory index.\n# TYPE membrick_index_source_documents gauge\n");
-    body.push_str("# HELP membrick_index_records Records in the project memory index.\n# TYPE membrick_index_records gauge\n");
-    body.push_str("# HELP membrick_index_dirty Whether the memory index has unpublished changes.\n# TYPE membrick_index_dirty gauge\n");
-    body.push_str("# HELP membrick_index_store_revision Current mutable store revision.\n# TYPE membrick_index_store_revision gauge\n");
-    body.push_str("# HELP membrick_index_snapshot_revision Published search snapshot revision.\n# TYPE membrick_index_snapshot_revision gauge\n");
-    body.push_str("# HELP membrick_index_revision_lag Difference between store and published snapshot revisions.\n# TYPE membrick_index_revision_lag gauge\n");
-    body.push_str("# HELP membrick_index_segments Number of segments in the published search snapshot.\n# TYPE membrick_index_segments gauge\n");
-    if let Ok(service) = state.service.read() {
-        let inspection = service.memory_store(MemoryStore::Workspace).inspection();
-        body.push_str(&format!(
-            "membrick_index_source_documents {}\nmembrick_index_records {}\nmembrick_index_dirty {}\nmembrick_index_store_revision {}\nmembrick_index_snapshot_revision {}\nmembrick_index_revision_lag {}\nmembrick_index_segments {}\n",
-            inspection.source_document_count,
-            inspection.record_count,
-            u8::from(inspection.dirty),
-            inspection.store_revision,
-            inspection.snapshot_revision,
-            inspection.store_revision.saturating_sub(inspection.snapshot_revision),
-            inspection.snapshot.map(|snapshot| snapshot.segment_count).unwrap_or_default()
-        ));
-    }
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4",
-        )],
-        body,
-    )
 }
 
 fn recent_provider_events(root: &std::path::Path) -> Vec<ProviderLifecycleEvent> {
@@ -2171,7 +1803,11 @@ fn dashboard_integration(
         ),
     };
     let status = observed.unwrap_or_default();
+    let counters = DashboardProviderCounters::from_ledger(&status.counters);
     DashboardIntegrationStatus {
+        event_window_limit: crate::telemetry::MAX_PROVIDER_TELEMETRY_EVENTS,
+        counters,
+        milestone_events: status.milestone_events,
         provider,
         recording_provider,
         compiled,
@@ -2234,7 +1870,7 @@ fn dashboard_provider_indexes(
             if prefix != normalized {
                 return None;
             }
-            let inspection = MemoryService::at_path(
+            let inspection = MemoryService::at_path_without_owner_lock(
                 &path,
                 memory_pipeline_options(
                     None,
@@ -2312,73 +1948,6 @@ struct WriteOptions {
     wait_for_visibility: bool,
 }
 
-async fn add(
-    State(state): State<AppState>,
-    Query(options): Query<WriteOptions>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let request = match serde_json::from_value::<AddRequest>(value) {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"invalid request"})),
-            )
-                .into_response()
-        }
-    };
-    if let Some(worker) = &state.staged_writer {
-        return match worker.add(vec![request], options.wait_for_visibility).await {
-            Ok(mut responses) => Json(responses.as_array_mut().unwrap().remove(0)).into_response(),
-            Err(status) => (
-                status,
-                Json(json!({"detail":"mutation failed or writer queue full"})),
-            )
-                .into_response(),
-        };
-    }
-    StatusCode::SERVICE_UNAVAILABLE.into_response()
-}
-
-async fn add_batch(
-    State(state): State<AppState>,
-    Query(options): Query<WriteOptions>,
-    auth: Option<Extension<AuthContext>>,
-    Json(requests): Json<Vec<AddRequest>>,
-) -> impl IntoResponse {
-    if requests.is_empty() || requests.len() > 128 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"batch must contain between 1 and 128 requests"})),
-        )
-            .into_response();
-    }
-    for request in &requests {
-        let value = match serde_json::to_value(request) {
-            Ok(value) => value,
-            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-        };
-        if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-            return error.into_response();
-        }
-    }
-    if let Some(worker) = &state.staged_writer {
-        return match worker.add(requests, options.wait_for_visibility).await {
-            Ok(responses) => Json(responses).into_response(),
-            Err(status) => (
-                status,
-                Json(json!({"detail":"mutation failed or writer queue full"})),
-            )
-                .into_response(),
-        };
-    }
-    StatusCode::SERVICE_UNAVAILABLE.into_response()
-}
-
 /// Provider hooks share `.membrick/memory` regardless of the server's primary
 /// `--index`. Search composes that store with the workspace-memory index.
 #[cfg(any(
@@ -2391,44 +1960,6 @@ async fn add_batch(
     feature = "hermes",
     feature = "roo-runtime"
 ))]
-async fn provider_memory_add_batch(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(requests): Json<Vec<AddRequest>>,
-) -> impl IntoResponse {
-    if requests.is_empty() || requests.len() > 128 {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"batch must contain between 1 and 128 requests"})),
-        )
-            .into_response();
-    }
-    for request in &requests {
-        let value = match serde_json::to_value(request) {
-            Ok(value) => value,
-            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-        };
-        if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-            return error.into_response();
-        }
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    drop(writer);
-    let Some(worker) = &state.staged_writer else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    match worker.add(requests, true).await {
-        Ok(response) => Json(response).into_response(),
-        Err(status) => status.into_response(),
-    }
-}
-
 #[cfg(any(
     feature = "claude-code",
     feature = "codex",
@@ -2439,995 +1970,12 @@ async fn provider_memory_add_batch(
     feature = "hermes",
     feature = "roo-runtime"
 ))]
-async fn provider_memory_search(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    let requested_workspace = value
-        .get("workspace")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let mut request = match serde_json::from_value::<SearchRequest>(value) {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"invalid request"})),
-            )
-                .into_response()
-        }
-    };
-    if let Some(auth) = auth.as_ref() {
-        request.scope = Some(auth.0.user_id.clone());
-    } else if let Some(tenant) = state.tenant_id.as_deref() {
-        request.scope = Some(tenant.to_string());
-    } else {
-        // Server-token provider adapters share one workspace store across
-        // integrations. Keep conversation state scoped to the caller's
-        // configured identity, while allowing retrieval across provider-owned
-        // memories and ordinary workspace documents. JWT callers remain
-        // isolated to their authenticated user below.
-        let caller_scope = request.user_id.clone();
-        request.user_id.clear();
-        if request.scope.as_deref().is_none_or(str::is_empty) {
-            request.scope = Some(caller_scope);
-        }
-    }
-    let published_view = if let Some(workspace) = requested_workspace.as_deref() {
-        match state.workspace_registry.resolve(workspace).await {
-            Ok(runtime) => runtime.staged_writer.read_view(),
-            Err(error) => return error.into_response(),
-        }
-    } else {
-        state.provider_published_view()
-    };
-    let started = Instant::now();
-    let result = published_view.and_then(|view| view.search_cached(request));
-    state.telemetry.record_query(
-        started.elapsed().as_millis() as u64,
-        result.is_err(),
-        result
-            .as_ref()
-            .map(|response| response.data.is_empty())
-            .unwrap_or(false),
-    );
-    match result {
-        Ok(response) => Json(serde_json::to_value(response).unwrap()).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
 #[cfg(any(feature = "claude-code", feature = "codex"))]
-async fn provider_transcript_capture(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> axum::response::Response {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let runtime = match state
-        .workspace_registry
-        .resolve(
-            value
-                .get("workspace")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        )
-        .await
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return error.into_response(),
-    };
-    let request = match serde_json::from_value::<
-        crate::memory_api::transcript_capture::CaptureRequest,
-    >(value)
-    {
-        Ok(request) => request,
-        Err(error) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":error.to_string()})),
-            )
-                .into_response()
-        }
-    };
-    if let Err(error) = request.validate(&runtime.project_root) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":error.to_string()})),
-        )
-            .into_response();
-    }
-    let worker = runtime.transcript_captures.clone();
-    match tokio::task::spawn_blocking(move || worker.submit(request)).await {
-        Ok(Ok(status)) => (
-            StatusCode::ACCEPTED,
-            Json(json!({"accepted":true, "capture":status})),
-        )
-            .into_response(),
-        Ok(Err(error)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"detail":error.to_string()})),
-        )
-            .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
 #[cfg(any(feature = "claude-code", feature = "codex"))]
-async fn api_transcript_captures(State(state): State<AppState>) -> axum::response::Response {
-    let runtime = match state
-        .workspace_registry
-        .resolve(&state.project_root.to_string_lossy())
-        .await
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return error.into_response(),
-    };
-    match runtime.transcript_captures.status() {
-        Ok(captures) => Json(json!({"captures":captures})).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":error.to_string()})),
-        )
-            .into_response(),
-    }
-}
 
 /// Journal provider documents through the resident owner's single upsert
 /// path. The reply means the documents are durable; they become searchable
 /// on the next background publication.
-async fn provider_mcp_document_upsert(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> axum::response::Response {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let workspace = value
-        .get("workspace")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let runtime = match state.workspace_registry.resolve(workspace).await {
-        Ok(runtime) => runtime,
-        Err(error) => return error.into_response(),
-    };
-    let provider = value
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !crate::integrations::mcp_tools::provider_filter_values().contains(&provider) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"invalid provider"})),
-        )
-            .into_response();
-    }
-    let documents_value = value
-        .get("documents")
-        .cloned()
-        .or_else(|| value.get("document").map(|document| json!([document])));
-    let Some(documents_value) = documents_value else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"documents are required"})),
-        )
-            .into_response();
-    };
-    let documents = match serde_json::from_value::<Vec<crate::SourceDocument>>(documents_value) {
-        Ok(documents) if !documents.is_empty() => documents,
-        _ => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"invalid documents"})),
-            )
-                .into_response()
-        }
-    };
-    for document in &documents {
-        if document.filters.get("provider").map(String::as_str) != Some(provider) {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"document provider does not match request context"})),
-            )
-                .into_response();
-        }
-        if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
-            if document.filters.get("session_id").map(String::as_str) != Some(session_id) {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({"detail":"document session does not match request context"})),
-                )
-                    .into_response();
-            }
-        }
-    }
-    let writer = &runtime.staged_writer;
-    let audit = server_writer::CaptureAudit {
-        provider: provider.to_string(),
-        user_id: value
-            .get("user_id")
-            .and_then(Value::as_str)
-            .unwrap_or("mcp")
-            .to_string(),
-        session_id: value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-    };
-    let result = if let Some(group) = value.get("replace_group") {
-        let key = group.get("key").and_then(Value::as_str).unwrap_or_default();
-        let group_value = group
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if key.is_empty() || group_value.is_empty() {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"replace_group requires key and value"})),
-            )
-                .into_response();
-        }
-        let audit_ids = documents
-            .iter()
-            .map(|document| document.doc_id.clone())
-            .collect::<Vec<_>>();
-        match writer
-            .replace_group(key.to_string(), group_value.to_string(), documents)
-            .await
-        {
-            Ok(()) => writer
-                .mutate(move |service| {
-                    service.record_capture_mutation(
-                        &audit.provider,
-                        &audit.user_id,
-                        &audit.session_id,
-                        &audit_ids,
-                    )?;
-                    Ok(Value::Null)
-                })
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    server_writer::mutation_status(&error, StatusCode::INTERNAL_SERVER_ERROR)
-                }),
-            Err(status) => Err(status),
-        }
-    } else {
-        writer.upsert_documents(documents, Some(audit)).await
-    };
-    match result {
-        Ok(()) => Json(json!({"success": true, "durable": true})).into_response(),
-        Err(status) => (
-            status,
-            Json(json!({"detail":"provider memory write failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn provider_mcp_tool_call(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let workspace = value
-        .get("workspace")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let runtime = match state.workspace_registry.resolve(workspace).await {
-        Ok(runtime) => runtime,
-        Err(error) => return error.into_response(),
-    };
-    let provider = value
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !crate::integrations::mcp_tools::provider_filter_values().contains(&provider) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"invalid provider"})),
-        )
-            .into_response();
-    }
-    let Some(tool) = value
-        .get("tool")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"tool is required"})),
-        )
-            .into_response();
-    };
-    let mut arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    if !arguments.is_object() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"arguments must be an object"})),
-        )
-            .into_response();
-    }
-    if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
-        if arguments
-            .get("session_id")
-            .and_then(Value::as_str)
-            .is_some_and(|arg| arg != session_id)
-        {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"session_id context does not match tool arguments"})),
-            )
-                .into_response();
-        }
-        arguments["session_id"] = json!(session_id);
-    }
-    let workspace = runtime.project_root.to_string_lossy().into_owned();
-    let result: anyhow::Result<Value> = async {
-        match tool.as_str() {
-            "search" => {
-                if arguments.as_object().is_some_and(|args| {
-                    args.keys().any(|key| {
-                        !["query", "top_k", "provider", "session_id"].contains(&key.as_str())
-                    })
-                }) {
-                    anyhow::bail!("unknown search argument");
-                }
-                let query = arguments
-                    .get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim();
-                anyhow::ensure!(!query.is_empty(), "query is required");
-                let top_k = arguments
-                    .get("top_k")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(5)
-                    .clamp(1, 20) as usize;
-                let filters = crate::integrations::mcp_tools::search_provider_filters(&arguments)
-                    .map_err(anyhow::Error::msg)?;
-                let view = runtime.staged_writer.read_view()?;
-                let session_id = crate::integrations::mcp_tools::resolve_search_session_id(
-                    &arguments, &view, provider,
-                )
-                .map_err(anyhow::Error::msg)?;
-                let attribution = if arguments
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty())
-                {
-                    "explicit"
-                } else if session_id.is_some() {
-                    "inferred"
-                } else {
-                    "absent"
-                };
-                let mut payload = view.search_agent_cached(
-                    query,
-                    provider,
-                    session_id.as_deref(),
-                    top_k,
-                    &filters,
-                )?;
-                if let Some(object) = payload.as_object_mut() {
-                    object.insert(
-                        "__membrick_telemetry".to_string(),
-                        json!({
-                            "session_id": session_id,
-                            "session_attribution": attribution,
-                        }),
-                    );
-                }
-                Ok(payload)
-            }
-            "review_search" => {
-                let root = runtime.project_root.clone();
-                runtime
-                    .staged_writer
-                    .read_view()?
-                    .review_search_mcp(&root, &arguments)
-            }
-            "search_feedback" => {
-                let root = runtime.project_root.clone();
-                let arguments = arguments.clone();
-                runtime
-                    .staged_writer
-                    .mutate(move |service| service.search_feedback_mcp(&root, &arguments))
-                    .await
-            }
-            "enrich_doc" => {
-                let arguments = arguments.clone();
-                runtime
-                    .staged_writer
-                    .mutate(move |service| service.enrich_doc_mcp(&arguments))
-                    .await
-            }
-            "add_memory" => {
-                let request = {
-                    let owner = runtime
-                        .service
-                        .read()
-                        .map_err(|_| anyhow::anyhow!("provider memory service poisoned"))?;
-                    crate::integrations::mcp_tools::build_add_memory_request(
-                        &arguments, &owner, provider,
-                    )
-                    .map_err(anyhow::Error::msg)?
-                };
-                let writer = &runtime.staged_writer;
-                let value = writer
-                    .add(vec![request], true)
-                    .await
-                    .map_err(|status| anyhow::anyhow!("provider write failed with {status}"))?;
-                Ok(value
-                    .as_array()
-                    .and_then(|values| values.first())
-                    .cloned()
-                    .unwrap_or(value))
-            }
-            "get_memory" => {
-                let mut owner = runtime
-                    .service
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("provider memory service poisoned"))?;
-                crate::integrations::mcp_tools::dispatch_memory_tool(
-                    &tool, &arguments, &mut owner, provider,
-                )
-                .map_err(anyhow::Error::msg)
-            }
-            "delete_memory" => {
-                let mut owner = runtime
-                    .service
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("provider memory service poisoned"))?;
-                crate::integrations::mcp_tools::dispatch_memory_tool(
-                    &tool, &arguments, &mut owner, provider,
-                )
-                .map_err(anyhow::Error::msg)
-            }
-            "list_memories" => {
-                if arguments
-                    .as_object()
-                    .is_some_and(|args| args.keys().any(|key| key != "limit"))
-                {
-                    anyhow::bail!("unknown list_memories argument");
-                }
-                let limit = arguments
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(20)
-                    .clamp(1, 100) as usize;
-                let view = runtime.staged_writer.read_view()?;
-                Ok(view.list_memories_payload(limit))
-            }
-            "info" => {
-                anyhow::ensure!(
-                    arguments.as_object().is_none_or(|args| args.is_empty()),
-                    "info takes no arguments"
-                );
-                let view = runtime.staged_writer.read_view()?;
-                Ok(json!({
-                    "root": workspace,
-                    "docs_count": view.docs_count(),
-                    "reasoning_rules": view.reasoning_rules_status(),
-                    "transcript_captures": transcript_capture_status(&runtime),
-                }))
-            }
-            "board_open" | "board_post" => {
-                let writer = &runtime.staged_writer;
-                let provider = provider.to_string();
-                let write_tool = tool.clone();
-                let payload = writer
-                    .mutate(move |owner| {
-                        crate::integrations::mcp_tools::dispatch_board_tool(
-                            &write_tool,
-                            &arguments,
-                            owner,
-                            "mcp",
-                            &workspace,
-                            &provider,
-                        )
-                        .map_err(anyhow::Error::msg)
-                    })
-                    .await?;
-                // The mutation is applied to the owner before `mutate`
-                // returns, so dashboard reads already see this change.
-                if let Some(event) = change_event(&tool, &payload) {
-                    writer.changes().publish(event);
-                }
-                Ok(payload)
-            }
-            "flow_create" | "flow_event_append" | "flow_action_consume" => {
-                let writer = &runtime.staged_writer;
-                let provider = provider.to_string();
-                let write_tool = tool.clone();
-                let payload = writer
-                    .mutate(move |owner| {
-                        crate::integrations::mcp_tools::dispatch_flow_tool(
-                            &write_tool,
-                            &arguments,
-                            owner,
-                            "mcp",
-                            &workspace,
-                            &provider,
-                        )
-                        .map_err(anyhow::Error::msg)
-                    })
-                    .await?;
-                if let Some(event) = change_event(&tool, &payload) {
-                    writer.changes().publish(event);
-                }
-                Ok(payload)
-            }
-            "flow_list" | "flow_get" | "flow_pending_actions" => {
-                let mut owner = runtime
-                    .service
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("provider memory service poisoned"))?;
-                crate::integrations::mcp_tools::dispatch_flow_tool(
-                    &tool, &arguments, &mut owner, "mcp", &workspace, provider,
-                )
-                .map_err(anyhow::Error::msg)
-            }
-            "board_list" | "board_info" | "board_read" | "board_get" | "board_search" => {
-                let mut owner = runtime
-                    .service
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("provider memory service poisoned"))?;
-                crate::integrations::mcp_tools::dispatch_board_tool(
-                    &tool, &arguments, &mut owner, "mcp", &workspace, provider,
-                )
-                .map_err(anyhow::Error::msg)
-            }
-            _ => anyhow::bail!("unknown memory tool: {tool}"),
-        }
-    }
-    .await;
-    match result {
-        Ok(payload) => Json(payload).into_response(),
-        Err(error) => (
-            server_writer::mutation_status(&error, StatusCode::UNPROCESSABLE_ENTITY),
-            Json(json!({"detail":format!("{error:#}")})),
-        )
-            .into_response(),
-    }
-}
-
-async fn search(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let mut request = match serde_json::from_value::<SearchRequest>(value) {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"invalid request"})),
-            )
-                .into_response()
-        }
-    };
-    if let Some(auth) = auth.as_ref() {
-        // The JWT subject owns both the documents and conversation context.
-        // Ignore caller-provided scope so one user cannot mutate another
-        // user's follow-up state.
-        request.scope = Some(auth.0.user_id.clone());
-    }
-    // Search uses the already-published immutable index snapshot. Its small
-    // mutable side state is internally synchronized, so requests can share
-    // the service read lock and run retrieval concurrently.
-    //
-    // Query-time key-phrase backfill: documents written by provider hooks
-    // (separate short-lived processes) never see this process's background
-    // enrichment worker, so the first query that needs their phrases
-    // extracts them synchronously here. The read-lock check is cheap, so
-    // the steady state costs nothing; the extractor (the slow part) runs
-    // with no service lock held, and only the fast apply step takes the
-    // write lock. A concurrent write landing mid-backfill is safe:
-    // application re-validates content hashes and skips stale results.
-    // Bounded and fail-open.
-    let backfill_needed = if let Some(worker) = &state.staged_writer {
-        worker
-            .read_view()
-            .map(|view| view.key_phrase_backfill_needed())
-            .unwrap_or(false)
-    } else {
-        state
-            .service
-            .read()
-            .map(|service| {
-                service
-                    .memory_store(MemoryStore::Workspace)
-                    .key_phrase_backfill_needed()
-            })
-            .unwrap_or(false)
-    };
-    if backfill_needed {
-        let owned_state = state.clone();
-        let backfill = tokio::task::spawn_blocking(move || {
-            let (docs, script) = owned_state
-                .service
-                .read()
-                .map(|service| {
-                    service
-                        .memory_store(MemoryStore::Workspace)
-                        .key_phrase_backfill_snapshot()
-                })
-                .map_err(|_| anyhow::anyhow!("memory service lock poisoned"))?;
-            if docs.is_empty() {
-                return Ok(0);
-            }
-            let raw = MemoryService::extract_key_phrases_for_docs(&docs, script.as_deref());
-            write_workspace_mutation(&owned_state, move |service| {
-                Ok(service.apply_key_phrase_backfill(&docs, raw))
-            })
-        })
-        .await
-        .map_err(|join| anyhow::anyhow!("backfill task failed: {join}"))
-        .and_then(|inner| inner);
-        if let Err(error) = backfill {
-            tracing::warn!("key-phrase backfill failed (fail-open): {error:#}");
-        }
-    }
-    if let Some(worker) = &state.staged_writer {
-        let started = Instant::now();
-        let result = worker
-            .read_view()
-            .and_then(|view| view.search_cached(request));
-        state.telemetry.record_query(
-            started.elapsed().as_millis() as u64,
-            result.is_err(),
-            result.as_ref().map(|r| r.data.is_empty()).unwrap_or(false),
-        );
-        return match result {
-            Ok(response) => Json(response).into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-    }
-    let started = Instant::now();
-    let result = match state.service.read() {
-        Ok(service) => service
-            .memory_store(MemoryStore::Workspace)
-            .search_cached(request),
-        Err(_) => Err(anyhow::anyhow!("memory service lock poisoned")),
-    };
-    match result {
-        Ok(result) => {
-            state.telemetry.record_query(
-                started.elapsed().as_millis() as u64,
-                false,
-                result.data.is_empty(),
-            );
-            Json(serde_json::to_value(result).unwrap()).into_response()
-        }
-        Err(_) => {
-            state
-                .telemetry
-                .record_query(started.elapsed().as_millis() as u64, true, false);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"detail":"search failed"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn get_memory(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Path(memory_id): Path<String>,
-    Query(query): Query<GetRequest>,
-) -> impl IntoResponse {
-    let request = GetRequest { memory_id, ..query };
-    let value = match serde_json::to_value(&request) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-    };
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let result = match state.service.read() {
-        Ok(service) => service.memory_store(MemoryStore::Captured).get(request),
-        Err(_) => Err(anyhow::anyhow!("memory reader lock poisoned")),
-    };
-    match result {
-        Ok(Some(memory)) => Json(memory).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"memory lookup failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn list_memories(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Query(request): Query<ListRequest>,
-) -> impl IntoResponse {
-    let value = match serde_json::to_value(&request) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-    };
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let result = match state.service.read() {
-        Ok(service) => service.memory_store(MemoryStore::Captured).list(request),
-        Err(_) => Err(anyhow::anyhow!("memory reader lock poisoned")),
-    };
-    match result {
-        Ok(result) => Json(result).into_response(),
-        Err(_) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"detail":"invalid list request"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn update_memory(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Path(memory_id): Path<String>,
-    Json(mut request): Json<UpdateRequest>,
-) -> impl IntoResponse {
-    request.memory_id = memory_id;
-    let value = match serde_json::to_value(&request) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-    };
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let result = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let _writer = writer;
-            write_mutation(&state, move |service| service.update(request))
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("mutation task failed: {error}")))
-    };
-    match result {
-        Ok(Some(memory)) => Json(memory).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => (
-            server_writer::mutation_status(&error, StatusCode::UNPROCESSABLE_ENTITY),
-            Json(json!({"detail":"memory update failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn delete_memory(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Path(memory_id): Path<String>,
-    Query(query): Query<DeleteRequest>,
-) -> impl IntoResponse {
-    let request = DeleteRequest {
-        doc_id: memory_id,
-        ..query
-    };
-    let value = match serde_json::to_value(&request) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-    };
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let result = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let _writer = writer;
-            write_mutation(&state, move |service| {
-                service.delete(&request.user_id, &request.doc_id)
-            })
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("mutation task failed: {error}")))
-    };
-    match result {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => (
-            server_writer::mutation_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
-            Json(json!({"detail":"memory deletion failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn refresh_memories(State(state): State<AppState>) -> impl IntoResponse {
-    if let Some(worker) = &state.staged_writer {
-        return match worker.flush().await {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(status) => status.into_response(),
-        };
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let result = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let _writer = writer;
-            write_mutation(&state, move |service| service.refresh())
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("mutation task failed: {error}")))
-    };
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"detail":"memory refresh failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn delete(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let request = match serde_json::from_value::<DeleteRequest>(value) {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"invalid request"})),
-            )
-                .into_response()
-        }
-    };
-    let result = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let _writer = writer;
-            write_mutation(&state, move |s| s.delete(&request.user_id, &request.doc_id))
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("mutation task failed: {error}")))
-    };
-    match result {
-        Ok(affected) => Json(json!({"success":true,"affected":affected as usize})).into_response(),
-        Err(error) => (
-            server_writer::mutation_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
-            Json(json!({"detail":"mutation failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn supersede(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let request = match serde_json::from_value::<SupersedeRequest>(value) {
-        Ok(request) => request,
-        Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"detail":"invalid request"})),
-            )
-                .into_response()
-        }
-    };
-    let result = {
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || {
-            let _writer = writer;
-            write_mutation(&state, move |s| {
-                s.supersede(&request.user_id, &request.replacement_id, &request.old_id)
-            })
-        })
-        .await
-        .unwrap_or_else(|error| Err(anyhow::anyhow!("mutation task failed: {error}")))
-    };
-    match result {
-        Ok(affected) => Json(json!({"success":true,"affected":affected as usize})).into_response(),
-        Err(error) => (
-            server_writer::mutation_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
-            Json(json!({"detail":"mutation failed"})),
-        )
-            .into_response(),
-    }
-}
-
-async fn expire(
-    State(state): State<AppState>,
-    auth: Option<Extension<AuthContext>>,
-    Json(value): Json<Value>,
-) -> impl IntoResponse {
-    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
-        return error.into_response();
-    }
-    let Ok(writer) = state.writer_gate.clone().try_lock_owned() else {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"detail":"writer busy"})),
-        )
-            .into_response();
-    };
-    let user_id = value
-        .get("user_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let state_for_mutation = state.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let _writer = writer;
-        write_mutation(&state_for_mutation, move |service| service.expire(&user_id))
-    })
-    .await
-    .unwrap_or_else(|error| Err(anyhow::anyhow!("mutation task failed: {error}")));
-    match result {
-        Ok(affected) => Json(json!({"success":true,"affected":affected})).into_response(),
-        Err(error) => (
-            server_writer::mutation_status(&error, StatusCode::INTERNAL_SERVER_ERROR),
-            Json(json!({"detail":"mutation failed"})),
-        )
-            .into_response(),
-    }
-}
 
 fn write_mutation<T: serde::Serialize + serde::de::DeserializeOwned + 'static>(
     state: &AppState,
@@ -3498,6 +2046,231 @@ fn token_is_valid(supplied: &str, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SERIALIZATION_TEST_CAPABILITY: membrick_extension_api::CapabilityId =
+        membrick_extension_api::CapabilityId::new("test-invocation-serialization");
+    const SERIALIZATION_TEST_ENTRY_CAPABILITY: membrick_extension_api::CapabilityId =
+        membrick_extension_api::CapabilityId::new("test-invocation-serialization.entry");
+    const SERIALIZATION_TEST_TOOLS: &[membrick_extension_api::ToolDescriptor] = &[
+        membrick_extension_api::ToolDescriptor {
+            id: membrick_extension_api::ToolId::new("test_serialization_outer"),
+            description: "Test-only blocking outer mutation.",
+            input_schema: r#"{"type":"object"}"#,
+        },
+        membrick_extension_api::ToolDescriptor {
+            id: membrick_extension_api::ToolId::new("test_serialization_second"),
+            description: "Test-only competing mutation.",
+            input_schema: r#"{"type":"object"}"#,
+        },
+    ];
+    static SERIALIZATION_TEST_DESCRIPTOR: membrick_extension_api::ExtensionDescriptor =
+        membrick_extension_api::ExtensionDescriptor {
+            id: membrick_extension_api::ExtensionId::new("membrick-test-invocation-serialization"),
+            provides: &[SERIALIZATION_TEST_ENTRY_CAPABILITY],
+            requires: &[SERIALIZATION_TEST_CAPABILITY],
+            tools: SERIALIZATION_TEST_TOOLS,
+        };
+    static SERIALIZATION_TEST_PROVIDER_DESCRIPTOR: membrick_extension_api::ExtensionDescriptor =
+        membrick_extension_api::ExtensionDescriptor {
+            id: membrick_extension_api::ExtensionId::new(
+                "membrick-test-invocation-serialization-provider",
+            ),
+            provides: &[SERIALIZATION_TEST_CAPABILITY],
+            requires: &[],
+            tools: &[],
+        };
+
+    #[derive(Default)]
+    struct InvocationGate {
+        nested_entered: bool,
+        release_nested: bool,
+        second_entered: bool,
+    }
+
+    static INVOCATION_GATE: (std::sync::Mutex<InvocationGate>, std::sync::Condvar) = (
+        std::sync::Mutex::new(InvocationGate {
+            nested_entered: false,
+            release_nested: false,
+            second_entered: false,
+        }),
+        std::sync::Condvar::new(),
+    );
+
+    struct SerializationTestExtension;
+
+    impl membrick_extension_api::ExtensionHandler for SerializationTestExtension {
+        fn tool_is_mutating(&self, tool: membrick_extension_api::ToolId) -> bool {
+            matches!(
+                tool.as_str(),
+                "test_serialization_outer" | "test_serialization_second"
+            )
+        }
+
+        fn call(
+            &self,
+            context: &mut dyn membrick_extension_api::ExtensionContext,
+            tool: membrick_extension_api::ToolId,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, membrick_extension_api::ExtensionError> {
+            match tool.as_str() {
+                "test_serialization_outer" => context.invoke(
+                    SERIALIZATION_TEST_CAPABILITY,
+                    "wait_inside_nested_capability",
+                    serde_json::Value::Null,
+                ),
+                "test_serialization_second" => {
+                    let (gate, changed) = &INVOCATION_GATE;
+                    gate.lock()
+                        .map_err(|_| {
+                            membrick_extension_api::ExtensionError::new("test gate poisoned")
+                        })?
+                        .second_entered = true;
+                    changed.notify_all();
+                    Ok(serde_json::json!({"second": "entered"}))
+                }
+                _ => Err(membrick_extension_api::ExtensionError::new(
+                    "unexpected test tool",
+                )),
+            }
+        }
+
+        fn invoke(
+            &self,
+            _context: &mut dyn membrick_extension_api::ExtensionContext,
+            capability: membrick_extension_api::CapabilityId,
+            operation: &str,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, membrick_extension_api::ExtensionError> {
+            if capability != SERIALIZATION_TEST_CAPABILITY
+                || operation != "wait_inside_nested_capability"
+            {
+                return Err(membrick_extension_api::ExtensionError::new(
+                    "unexpected test capability call",
+                ));
+            }
+            let (gate, changed) = &INVOCATION_GATE;
+            let mut state = gate
+                .lock()
+                .map_err(|_| membrick_extension_api::ExtensionError::new("test gate poisoned"))?;
+            state.nested_entered = true;
+            changed.notify_all();
+            while !state.release_nested {
+                state = changed.wait(state).map_err(|_| {
+                    membrick_extension_api::ExtensionError::new("test gate poisoned")
+                })?;
+            }
+            Ok(serde_json::json!({"nested": "completed"}))
+        }
+    }
+
+    static SERIALIZATION_TEST_HANDLER: SerializationTestExtension = SerializationTestExtension;
+
+    #[membrick_extension_api::distributed_slice(membrick_extension_api::EXTENSIONS)]
+    static SERIALIZATION_TEST_REGISTRATION: membrick_extension_api::ExtensionRegistration =
+        membrick_extension_api::ExtensionRegistration {
+            descriptor: &SERIALIZATION_TEST_DESCRIPTOR,
+            handler: &SERIALIZATION_TEST_HANDLER,
+        };
+    #[membrick_extension_api::distributed_slice(membrick_extension_api::EXTENSIONS)]
+    static SERIALIZATION_TEST_PROVIDER_REGISTRATION: membrick_extension_api::ExtensionRegistration =
+        membrick_extension_api::ExtensionRegistration {
+            descriptor: &SERIALIZATION_TEST_PROVIDER_DESCRIPTOR,
+            handler: &SERIALIZATION_TEST_HANDLER,
+        };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutating_extension_call_holds_serialization_through_nested_capability() {
+        *INVOCATION_GATE.0.lock().unwrap() = InvocationGate::default();
+        let registry = crate::extension_host::registry();
+        assert!(registry
+            .tool_is_mutating_name("test_serialization_outer")
+            .unwrap());
+        assert!(registry
+            .tool_is_mutating_name("test_serialization_second")
+            .unwrap());
+
+        let owner = std::sync::Arc::new(std::sync::RwLock::new(MemoryService::in_memory(
+            PipelineOptions {
+                key_phrase_enrichment: false,
+                ..Default::default()
+            },
+        )));
+        let writer = StagedWriter::start(owner).unwrap();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .mutate(move |service| {
+                    crate::integrations::mcp_tools::dispatch_extension_tool(
+                        "test_serialization_outer",
+                        &serde_json::json!({}),
+                        service,
+                        "owner",
+                        "/workspace",
+                        "test-provider",
+                    )
+                    .map_err(anyhow::Error::msg)
+                })
+                .await
+        });
+
+        let entered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if INVOCATION_GATE.0.lock().unwrap().nested_entered {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            second_writer
+                .mutate(move |service| {
+                    crate::integrations::mcp_tools::dispatch_extension_tool(
+                        "test_serialization_second",
+                        &serde_json::json!({}),
+                        service,
+                        "owner",
+                        "/workspace",
+                        "test-provider",
+                    )
+                    .map_err(anyhow::Error::msg)
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let entered_while_nested_call_blocked = INVOCATION_GATE.0.lock().unwrap().second_entered;
+        {
+            let (gate, changed) = &INVOCATION_GATE;
+            gate.lock().unwrap().release_nested = true;
+            changed.notify_all();
+        }
+
+        let (first_result, second_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .expect("serialized extension mutations did not finish");
+        assert!(
+            entered,
+            "outer extension call did not enter its nested capability"
+        );
+        assert_eq!(
+            first_result.unwrap().unwrap(),
+            serde_json::json!({"nested":"completed"})
+        );
+        assert_eq!(
+            second_result.unwrap().unwrap(),
+            serde_json::json!({"second":"entered"})
+        );
+        assert!(
+            !entered_while_nested_call_blocked,
+            "the competing mutation entered before the nested capability returned"
+        );
+    }
 
     #[test]
     fn server_settings_load_relative_freshness_and_default_to_relative() {
@@ -3822,6 +2595,7 @@ mod tests {
 
     // Behavioural regression: an acknowledged board post must appear in the
     // same published snapshot used by provider searches.
+    #[cfg(feature = "flowboard-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn board_write_acknowledgement_publishes_search_snapshot() {
         use tower::ServiceExt;
@@ -3932,7 +2706,7 @@ mod tests {
     impl SseReader {
         async fn open(app: &Router, authorization: Option<&str>) -> axum::response::Response {
             use tower::ServiceExt;
-            let mut request = axum::http::Request::builder().uri("/api/boards/events");
+            let mut request = axum::http::Request::builder().uri("/api/extensions/events");
             if let Some(value) = authorization {
                 request = request.header("authorization", value);
             }
@@ -3977,6 +2751,7 @@ mod tests {
 
     // A dashboard subscriber gets exactly one notice per board write, and
     // only after the dashboard read API already returns the written post.
+    #[cfg(feature = "flowboard-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn board_change_is_published_once_after_the_write_is_readable() {
         use tower::ServiceExt;
@@ -4052,7 +2827,7 @@ mod tests {
         );
         assert!(
             events.next(Duration::from_millis(300)).await.is_none(),
-            "one board write produced more than one notice"
+            "one extension write produced more than one notice"
         );
         drop(events);
         drop(app);
@@ -4061,7 +2836,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn board_events_require_the_server_token() {
+    async fn extension_events_require_the_server_token() {
         let root = security_test_root();
         let mut state = provider_memory_test_state(&root);
         state.token = Some("events-secret".into());
@@ -4086,7 +2861,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn lagged_board_event_subscriber_is_told_to_resync() {
+    async fn lagged_extension_event_subscriber_is_told_to_resync() {
         let root = security_test_root();
         let state = provider_memory_test_state(&root);
         let app = app_router(state.clone());
@@ -4098,7 +2873,7 @@ mod tests {
         assert_eq!(events.next(wait).await.unwrap().0, "ready");
         let changes = state.staged_writer.as_ref().unwrap().changes();
         for n in 0..300 {
-            changes.publish(json!({"kind":"board","board_id":"board:test","sequence":n}));
+            changes.publish(json!({"notice_id": n, "payload": {"opaque": true}}));
         }
         let (name, data) = events.next(wait).await.unwrap();
         assert_eq!(name, "resync");
@@ -4111,6 +2886,7 @@ mod tests {
 
     // Provider MCP processes forward Flow tools to the resident; it must
     // dispatch them instead of rejecting them as unknown.
+    #[cfg(feature = "flowboard-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resident_dispatches_forwarded_flow_tools() {
         let root = security_test_root();
@@ -4124,6 +2900,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(feature = "flowboard-tests")]
     #[test]
     fn change_events_identify_what_changed() {
         assert_eq!(
@@ -4230,6 +3007,96 @@ mod tests {
                 .inspection()
                 .source_document_count,
             1
+        );
+
+        let one_shot = json!({
+            "user_id":"alice",
+            "messages":[{"role":"user","content":"one-shot identity test"}]
+        });
+        let (first_status, first) = post(&app, "/v1/memories", one_shot.clone()).await;
+        let (second_status, second) = post(&app, "/v1/memories", one_shot).await;
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        assert!(first["request_id"].as_str().is_some());
+        assert!(first["session_id"].as_str().is_some());
+        assert_ne!(first["request_id"], second["request_id"]);
+        assert_ne!(first["session_id"], second["session_id"]);
+        let explicit_session = json!({
+            "request_id":"http-explicit-session",
+            "user_id":"alice",
+            "session_id":"app-session-42",
+            "messages":[{"role":"user","content":"explicit session identity test"}]
+        });
+        let (explicit_session_status, explicit_session_response) =
+            post(&app, "/v1/memories", explicit_session).await;
+        assert_eq!(explicit_session_status, StatusCode::OK);
+        assert_eq!(explicit_session_response["session_id"], "app-session-42");
+        assert_eq!(
+            post(
+                &app,
+                "/v1/memories",
+                json!({"messages":[{"role":"user","content":"missing owner"}]}),
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let retry = json!({
+            "request_id":"http-stable-retry",
+            "user_id":"alice",
+            "messages":[{"role":"user","content":"explicit retry identity test"}]
+        });
+        let (retry_status, retry_first) = post(&app, "/v1/memories", retry.clone()).await;
+        let (retry_again_status, retry_again) = post(&app, "/v1/memories", retry.clone()).await;
+        assert_eq!(retry_status, StatusCode::OK);
+        assert_eq!(retry_again_status, StatusCode::OK);
+        assert_eq!(retry_first["request_id"], "http-stable-retry");
+        assert_eq!(retry_first["session_id"], retry_again["session_id"]);
+        assert_eq!(retry_first["request_id"], retry_again["request_id"]);
+        let changed_retry = json!({
+            "request_id":"http-stable-retry",
+            "user_id":"alice",
+            "messages":[{"role":"user","content":"changed retry payload"}]
+        });
+        assert_eq!(
+            post(&app, "/v1/memories", changed_retry).await.0,
+            StatusCode::CONFLICT
+        );
+
+        let (batch_status, batch) = post(
+            &app,
+            "/add/batch",
+            json!([
+                {"user_id":"alice","messages":[{"role":"user","content":"batch without ids one"}]},
+                {"user_id":"alice","messages":[{"role":"user","content":"batch without ids two"}]}
+            ]),
+        )
+        .await;
+        assert_eq!(batch_status, StatusCode::OK);
+        assert_eq!(batch.as_array().unwrap().len(), 2);
+        assert_ne!(batch[0]["request_id"], batch[1]["request_id"]);
+        assert_ne!(batch[0]["session_id"], batch[1]["session_id"]);
+        let stable_batch = json!([{
+            "request_id":"http-batch-retry",
+            "user_id":"alice",
+            "messages":[{"role":"user","content":"batch retry identity test"}]
+        }]);
+        let (batch_retry_status, batch_retry) =
+            post(&app, "/add/batch", stable_batch.clone()).await;
+        let (batch_again_status, batch_again) = post(&app, "/add/batch", stable_batch).await;
+        assert_eq!(batch_retry_status, StatusCode::OK);
+        assert_eq!(batch_again_status, StatusCode::OK);
+        assert_eq!(batch_retry[0]["request_id"], "http-batch-retry");
+        assert_eq!(batch_retry[0]["session_id"], batch_again[0]["session_id"]);
+        let changed_batch_retry = json!([{
+            "request_id":"http-batch-retry",
+            "user_id":"alice",
+            "messages":[{"role":"user","content":"changed batch retry payload"}]
+        }]);
+        assert_eq!(
+            post(&app, "/add/batch", changed_batch_retry).await.0,
+            StatusCode::CONFLICT
         );
         drop(app);
         drop(state);
@@ -4372,7 +3239,7 @@ mod tests {
             .iter()
             .any(|hit| hit.content.contains("cancellation regression")));
         // Reopening verifies the cancelled request's accepted write was durable.
-        let persisted = MemoryService::at_path(
+        let persisted = MemoryService::at_path_without_owner_lock(
             &crate::memory_api::workspace::shared_memory_root(&root),
             crate::memory_api::workspace::segmented_store_options(),
         )
@@ -5174,6 +4041,19 @@ mod tests {
             .await
             .unwrap();
         });
+
+        // Generous, because the server builds its test store before it
+        // publishes the endpoint, and the full suite loads the machine.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if crate::local_ipc::socket_path(&root).is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("resident IPC endpoint should be published before the client call");
 
         let session_id = "codex:resident-client-session";
         let add_root = root.clone();

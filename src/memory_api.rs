@@ -36,10 +36,9 @@ pub(crate) mod workspace;
 #[cfg(any(feature = "claude-code", feature = "codex"))]
 pub(crate) mod transcript_capture;
 
-mod board;
 mod enrich;
-mod flow;
 mod key_phrases;
+mod mem0_filter;
 mod receipts;
 mod review;
 mod search;
@@ -48,12 +47,26 @@ mod staged;
 mod tests;
 
 use key_phrases::KeyPhraseEnrichment;
+pub use mem0_filter::{Mem0FilterExpr, Mem0FilterOperator};
 use review::{SearchHistoryIndex, SearchReviewStateIndex};
 use search::RelationsCache;
 pub use staged::StagedAddResponse;
 
 const USER_FILTER: &str = "memory_user_id";
 const SESSION_OBSERVATION_DOCUMENT_TYPE: &str = "session-observation";
+
+/// A durable request ID was reused with a payload that differs from its
+/// original request. Callers must treat this as a definitive conflict.
+#[derive(Debug)]
+pub(crate) struct RequestFingerprintConflict;
+
+impl std::fmt::Display for RequestFingerprintConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request_id was already used with different content")
+    }
+}
+
+impl std::error::Error for RequestFingerprintConflict {}
 
 fn is_session_observation(document: &SourceDocument) -> bool {
     document
@@ -96,6 +109,31 @@ pub struct AddRequest {
     pub messages: Vec<Message>,
     pub user_id: String,
     pub session_id: String,
+}
+
+/// Add request extension that carries user metadata without changing the
+/// source-compatible `AddRequest` struct-literal contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddRequestWithMetadata {
+    #[serde(flatten)]
+    pub request: AddRequest,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+impl AddRequestWithMetadata {
+    /// Build a metadata-bearing add request. Direct service calls treat the
+    /// supplied session ID as explicit.
+    pub fn new(request: AddRequest, metadata: BTreeMap<String, serde_json::Value>) -> Self {
+        Self { request, metadata }
+    }
+}
+
+/// Internal provenance that cannot be supplied through the public service DTO.
+#[derive(Debug, Clone)]
+pub(crate) struct AddRequestContext {
+    pub(crate) request: AddRequestWithMetadata,
+    pub(crate) session_id_was_omitted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +250,16 @@ pub struct SearchRequest {
     pub reference_date: Option<String>,
 }
 
+/// Additive wire DTO for typed Mem0-style filters without changing the
+/// source-compatible `SearchRequest` fields.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchRequestWithFilterAst {
+    #[serde(flatten)]
+    pub request: SearchRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_ast: Option<Mem0FilterExpr>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub data: Vec<SearchMemory>,
@@ -257,6 +305,10 @@ pub struct ListRequest {
 pub struct ListResponse {
     pub data: Vec<MemoryRecord>,
     pub next_cursor: Option<String>,
+    /// Number of records matching ownership, visibility, session, and filter
+    /// criteria before cursor pagination is applied.
+    #[serde(default)]
+    pub total_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +323,19 @@ pub struct UpdateRequest {
     pub timestamp: Option<i64>,
     #[serde(default)]
     pub expires_at_ms: Option<u64>,
+}
+
+/// Update request extension that preserves the existing `UpdateRequest` API.
+/// `None` leaves metadata unchanged; `Some` replaces user metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateRequestWithMetadata {
+    #[serde(flatten)]
+    pub request: UpdateRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<BTreeMap<String, serde_json::Value>>,
+    /// Keep the stored expiry when the request does not supply one.
+    #[serde(default)]
+    pub preserve_expiration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +361,12 @@ pub struct SearchMemory {
     pub role: Option<String>,
     pub user_id: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_id: Option<String>,
     /// Why a structured-fact hit was returned (e.g. "shared relation: Rome").
     /// Empty for lexical hits; skipped in serialization when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -327,6 +398,10 @@ impl MemoryStore {
 
 pub struct MemoryService {
     store: IndexStore,
+    /// Keeps standalone service instances from overlapping a project's
+    /// resident owner. Resident-owned services use the internal constructor
+    /// while their WorkspaceRuntime holds this same lock.
+    workspace_owner_lock: Option<crate::state_paths::ProjectOwnerLock>,
     /// Private workspace backing service owned by the resident memory owner.
     /// The one writer selects either this service or the shared captured-memory
     /// `store`; publication composes their snapshots for resident searches.
@@ -360,9 +435,6 @@ pub struct MemoryService {
     /// Immutable workspace-specific query rules, replaced atomically by the
     /// project rules watcher after a complete overlay validates.
     project_rules: Option<Arc<crate::reasoning_rules::ProjectReasoningRules>>,
-    /// Agent bulletin-board state: per-board sequence counters and
-    /// request-id dedup, all assigned under one lock by the single writer.
-    board_state: Mutex<BoardState>,
     /// Resident-local locator map reconstructed from the authoritative MCP
     /// telemetry file. Read views share it; no query or result bodies live here.
     search_history_index: Arc<SearchHistoryIndex>,
@@ -380,18 +452,55 @@ struct MutationAuditRecord<'a> {
     memory_ids: &'a [String],
 }
 
-/// Mutable bulletin-board state owned by the single writer process.
-///
-/// Per-board sequence counters are assigned here while holding the lock,
-/// so concurrent `board_post` calls get distinct increasing sequences.
-/// Lazily initialized from the store's max sequence per board, so a
-/// restart recovers without gaps or reuse.
-#[derive(Default)]
-struct BoardState {
-    /// board_id -> next sequence to assign.
-    next_sequence: std::collections::HashMap<String, u64>,
-    /// (board_id, request_id) -> post_id, for retry idempotency.
-    request_ids: std::collections::HashMap<(String, String), String>,
+fn acquire_owner_lock_for_store(
+    index_root: &Path,
+) -> anyhow::Result<Option<crate::state_paths::ProjectOwnerLock>> {
+    let absolute = if index_root.is_absolute() {
+        index_root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(index_root)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+
+    let mut existing = normalized.clone();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            anyhow::bail!("cannot resolve store path {}", index_root.display());
+        };
+        missing.push(name.to_os_string());
+        if !existing.pop() {
+            anyhow::bail!("cannot resolve store path {}", index_root.display());
+        }
+    }
+    let existing = existing.canonicalize()?;
+    let mut resolved_store = existing.clone();
+    for component in missing.iter().rev() {
+        resolved_store.push(component);
+    }
+    let Some(project_root) = crate::state_paths::find_project_root(&existing)? else {
+        return Ok(None);
+    };
+    if !resolved_store.starts_with(project_root.join(".membrick")) {
+        return Ok(None);
+    }
+    crate::state_paths::ProjectOwnerLock::acquire(&project_root)
+        .map(Some)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot open project store {} while its resident owns the workspace; connect through the project resident client instead: {error:#}",
+                index_root.display(),
+            )
+        })
 }
 
 impl MemoryService {
@@ -478,12 +587,31 @@ impl MemoryService {
     }
 
     /// Open a persistent memory service without exposing `IndexStore` in the
-    /// application-facing construction API. Hooks and the MCP server open a
-    /// fresh service per invocation against the same index root; a disk-backed
-    /// conversation store lets session state (follow-up context, temporal
-    /// anchors) survive across those invocations.
+    /// application-facing construction API. For an installed project's
+    /// `.membrick` store, this acquires the exclusive project-owner lock and
+    /// retains it for the service lifetime. It fails while the resident owns
+    /// the project; use `Memory::new(project_root)` to connect to that resident.
     pub fn at_path(index_root: impl AsRef<Path>, options: PipelineOptions) -> anyhow::Result<Self> {
         let index_root = index_root.as_ref();
+        let workspace_owner_lock = acquire_owner_lock_for_store(index_root)?;
+        Self::open_at_path(index_root, options, workspace_owner_lock)
+    }
+
+    /// Open a store already protected by the resident's workspace owner lock.
+    /// Keep this crate-private: callers outside the resident must use
+    /// [`MemoryService::at_path`], which acquires and retains the lock itself.
+    pub(crate) fn at_path_without_owner_lock(
+        index_root: impl AsRef<Path>,
+        options: PipelineOptions,
+    ) -> anyhow::Result<Self> {
+        Self::open_at_path(index_root.as_ref(), options, None)
+    }
+
+    fn open_at_path(
+        index_root: &Path,
+        options: PipelineOptions,
+        workspace_owner_lock: Option<crate::state_paths::ProjectOwnerLock>,
+    ) -> anyhow::Result<Self> {
         let mut store = IndexStore::at_path(index_root, options)?;
         let legacy_observations = store
             .source_documents()
@@ -500,6 +628,7 @@ impl MemoryService {
             );
         }
         let mut service = Self::new(store);
+        service.workspace_owner_lock = workspace_owner_lock;
         service.conversation_states = std::sync::Arc::new(std::sync::Mutex::new(
             crate::conversation_state::ConversationStateStore::open_under(index_root),
         ));
@@ -620,6 +749,8 @@ impl MemoryService {
     }
 
     pub(crate) fn new(store: IndexStore) -> Self {
+        crate::extension_host::initialize()
+            .expect("compiled-in extensions must initialize successfully");
         // Eagerly load the WordNet/ConceptNet lexical expansion store at
         // service creation, not on the first query. The store is a
         // process-wide OnceLock; lazy init costs ~2s (decompress + parse
@@ -646,11 +777,12 @@ impl MemoryService {
             .into_iter()
             .filter_map(|doc| {
                 let persisted = doc.filters.get("request_fingerprint")?;
-                let fingerprint = if persisted.starts_with("v2:") {
+                let fingerprint = if persisted.starts_with("v2:") || persisted.starts_with("v3:") {
                     persisted.clone()
                 } else {
                     let messages = serde_json::from_str::<Vec<Message>>(persisted).ok()?;
-                    request_fingerprint(doc.group_id.as_deref()?, &messages).ok()?
+                    request_fingerprint(doc.group_id.as_deref()?, &messages, &BTreeMap::new())
+                        .ok()?
                 };
                 Some((
                     (
@@ -663,6 +795,7 @@ impl MemoryService {
             .collect();
         Self {
             store,
+            workspace_owner_lock: None,
             workspace_store: None,
             published_search_view: None,
             superseded_ids,
@@ -680,7 +813,6 @@ impl MemoryService {
             relations_cache: Mutex::new(RelationsCache::default()),
             enrichment: std::sync::Arc::new(Mutex::new(KeyPhraseEnrichment::default())),
             project_rules: None,
-            board_state: Mutex::new(BoardState::default()),
             search_history_index: Arc::new(SearchHistoryIndex::default()),
             search_review_state: Arc::new(Mutex::new(SearchReviewStateIndex::default())),
         }
@@ -706,9 +838,32 @@ impl MemoryService {
     }
 
     pub fn add(&mut self, request: AddRequest) -> anyhow::Result<AddResponse> {
+        self.add_with_metadata(AddRequestWithMetadata {
+            request,
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    pub fn add_with_metadata(
+        &mut self,
+        request: AddRequestWithMetadata,
+    ) -> anyhow::Result<AddResponse> {
+        self.add_with_metadata_context(AddRequestContext {
+            request,
+            session_id_was_omitted: false,
+        })
+    }
+
+    pub(crate) fn add_with_metadata_context(
+        &mut self,
+        context: AddRequestContext,
+    ) -> anyhow::Result<AddResponse> {
         self.drain_enrichment_inbox();
-        let request_key = (request.user_id.clone(), request.request_id.clone());
-        let (mut response, doc_ids) = self.add_unpublished(request)?;
+        let request_key = (
+            context.request.request.user_id.clone(),
+            context.request.request.request_id.clone(),
+        );
+        let (mut response, doc_ids) = self.add_unpublished_with_context(context)?;
         self.flush()?;
         self.attach_receipt(&mut response, request_key, &doc_ids);
         if !doc_ids.is_empty() {
@@ -1050,7 +1205,12 @@ impl MemoryService {
         claim.evidence.clone()
     }
 
-    fn prepare_add(&self, request: &AddRequest) -> anyhow::Result<(String, Vec<SourceDocument>)> {
+    fn prepare_add(
+        &self,
+        request: &mut AddRequest,
+        metadata: &BTreeMap<String, serde_json::Value>,
+        session_id_was_omitted: bool,
+    ) -> anyhow::Result<(String, Vec<SourceDocument>)> {
         validate_identifier(&request.request_id, "request_id")?;
         validate_identifier(&request.user_id, "user_id")?;
         validate_identifier(&request.session_id, "session_id")?;
@@ -1063,11 +1223,43 @@ impl MemoryService {
         for (message_index, message) in request.messages.iter().enumerate() {
             validate_message(message, message_index)?;
         }
-        let fingerprint = request_fingerprint(&request.session_id, &request.messages)?;
+        validate_memory_metadata(metadata)?;
+        let mut fingerprint =
+            request_fingerprint(&request.session_id, &request.messages, metadata)?;
         let request_key = (request.user_id.clone(), request.request_id.clone());
         if let Some(previous) = self.request_fingerprints.get(&request_key) {
             if previous != &fingerprint {
-                anyhow::bail!("request_id was already used with different content");
+                // Before omitted-session retries used a deterministic session,
+                // the client generated a fresh session for each attempt. On a
+                // later retry, recover that persisted session only when the
+                // request uses today's canonical derived session and the full
+                // incoming payload still matches the original fingerprint.
+                // Explicit unrelated session changes and changed payloads
+                // therefore remain conflicts.
+                let canonical_retry_session =
+                    crate::memory_client::retry_session_id(&request.user_id, &request.request_id);
+                if session_id_was_omitted && request.session_id == canonical_retry_session {
+                    if let Some(stored_session) = self
+                        .store
+                        .source_documents()
+                        .into_iter()
+                        .filter(|document| {
+                            document.filters.get(USER_FILTER) == Some(&request.user_id)
+                                && document.filters.get("request_id") == Some(&request.request_id)
+                        })
+                        .filter_map(|document| document.group_id.clone())
+                        .find(|session_id| {
+                            request_fingerprint(session_id, &request.messages, metadata)
+                                .is_ok_and(|candidate| candidate == *previous)
+                        })
+                    {
+                        request.session_id = stored_session;
+                        fingerprint = previous.clone();
+                    }
+                }
+                if previous != &fingerprint {
+                    return Err(RequestFingerprintConflict.into());
+                }
             }
             return Ok((fingerprint, Vec::new()));
         }
@@ -1082,6 +1274,9 @@ impl MemoryService {
             filters.insert(USER_FILTER.to_string(), request.user_id.clone());
             filters.insert("request_id".to_string(), request.request_id.clone());
             filters.insert("request_fingerprint".to_string(), fingerprint.clone());
+            for (key, value) in metadata {
+                filters.insert(key.clone(), encode_metadata_value(value)?);
+            }
             if let Some(expires_at_ms) = message.expires_at_ms {
                 filters.insert("expires_at_ms".to_string(), expires_at_ms.to_string());
             }
@@ -1129,7 +1324,29 @@ impl MemoryService {
         &mut self,
         request: AddRequest,
     ) -> anyhow::Result<(AddResponse, Vec<String>)> {
-        let (fingerprint, new_docs) = self.prepare_add(&request)?;
+        self.add_unpublished_with_metadata(AddRequestWithMetadata {
+            request,
+            metadata: BTreeMap::new(),
+        })
+    }
+
+    fn add_unpublished_with_metadata(
+        &mut self,
+        request: AddRequestWithMetadata,
+    ) -> anyhow::Result<(AddResponse, Vec<String>)> {
+        self.add_unpublished_with_context(AddRequestContext {
+            request,
+            session_id_was_omitted: false,
+        })
+    }
+
+    fn add_unpublished_with_context(
+        &mut self,
+        context: AddRequestContext,
+    ) -> anyhow::Result<(AddResponse, Vec<String>)> {
+        let omitted_session = context.session_id_was_omitted;
+        let (mut request, metadata) = (context.request.request, context.request.metadata);
+        let (fingerprint, new_docs) = self.prepare_add(&mut request, &metadata, omitted_session)?;
         let request_key = (request.user_id.clone(), request.request_id.clone());
         // The documents are written; key phrases arrive asynchronously.
         // `upsert` queues each document for background enrichment.
@@ -1167,6 +1384,17 @@ impl MemoryService {
     }
 
     pub fn list(&self, request: ListRequest) -> anyhow::Result<ListResponse> {
+        self.list_with_filter_ast(request, None)
+    }
+
+    pub fn list_with_filter_ast(
+        &self,
+        request: ListRequest,
+        filter_ast: Option<&Mem0FilterExpr>,
+    ) -> anyhow::Result<ListResponse> {
+        if let Some(filter_ast) = filter_ast {
+            filter_ast.validate_mem0_fields()?;
+        }
         validate_identifier(&request.user_id, "user_id")?;
         if let Some(session_id) = &request.session_id {
             validate_identifier(session_id, "session_id")?;
@@ -1186,7 +1414,9 @@ impl MemoryService {
                 })
             })
             .filter(|doc| request.include_inactive || self.is_visible(doc))
+            .filter(|doc| filter_ast.is_none_or(|ast| ast.matches(doc)))
             .collect::<Vec<_>>();
+        let total_count = documents.len();
         documents.sort_by(|left, right| left.doc_id.cmp(&right.doc_id));
         if let Some(cursor) = &request.cursor {
             validate_identifier(cursor, "cursor")?;
@@ -1200,10 +1430,27 @@ impl MemoryService {
         Ok(ListResponse {
             data: documents.into_iter().map(memory_record).collect(),
             next_cursor,
+            total_count,
         })
     }
 
     pub fn update(&mut self, request: UpdateRequest) -> anyhow::Result<Option<MemoryRecord>> {
+        self.update_with_metadata(UpdateRequestWithMetadata {
+            request,
+            metadata: None,
+            preserve_expiration: false,
+        })
+    }
+
+    pub fn update_with_metadata(
+        &mut self,
+        wrapped: UpdateRequestWithMetadata,
+    ) -> anyhow::Result<Option<MemoryRecord>> {
+        let UpdateRequestWithMetadata {
+            request,
+            metadata,
+            preserve_expiration,
+        } = wrapped;
         validate_identifier(&request.user_id, "user_id")?;
         validate_identifier(&request.memory_id, "memory_id")?;
         let Some(mut document) = self
@@ -1245,8 +1492,18 @@ impl MemoryService {
                     .filters
                     .insert("expires_at_ms".to_string(), expires_at.to_string());
             }
-            None => {
+            None if !preserve_expiration => {
                 document.filters.remove("expires_at_ms");
+            }
+            None => {}
+        }
+        if let Some(metadata) = metadata {
+            validate_memory_metadata(&metadata)?;
+            document
+                .filters
+                .retain(|key, _| !is_user_metadata_filter(key));
+            for (key, value) in metadata {
+                document.filters.insert(key, encode_metadata_value(&value)?);
             }
         }
         self.drain_enrichment_inbox();
@@ -1371,6 +1628,7 @@ impl MemoryService {
         crate::preload_lexical_store();
         Ok(Self {
             store: composed,
+            workspace_owner_lock: None,
             workspace_store: None,
             published_search_view: None,
             superseded_ids,
@@ -1386,7 +1644,6 @@ impl MemoryService {
             relations_cache: Mutex::new(RelationsCache::default()),
             enrichment: Arc::new(Mutex::new(KeyPhraseEnrichment::default())),
             project_rules: workspace.project_rules,
-            board_state: Mutex::new(BoardState::default()),
             search_history_index,
             search_review_state,
         })
@@ -1695,7 +1952,18 @@ impl MemoryService {
         session_id: Option<&str>,
         top_k: usize,
     ) -> anyhow::Result<Vec<crate::SearchResult>> {
-        self.search_with_filters(
+        self.search_for_hook_with_comparison_operands(query, scope, session_id, top_k)
+            .map(|(results, _)| results)
+    }
+
+    pub(crate) fn search_for_hook_with_comparison_operands(
+        &mut self,
+        query: &str,
+        scope: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+    ) -> anyhow::Result<(Vec<crate::SearchResult>, Vec<String>)> {
+        self.search_with_filters_and_comparison_operands(
             query,
             scope,
             session_id.filter(|id| !id.trim().is_empty()),
@@ -1748,6 +2016,28 @@ impl MemoryService {
         feature = "muse-code",
         feature = "roo-runtime"
     ))]
+    pub(crate) fn search_results_payload_with_comparison_operands(
+        &self,
+        query: &str,
+        results: Vec<crate::SearchResult>,
+        comparison_operands: &[String],
+    ) -> serde_json::Value {
+        crate::integrations::mcp_tools::search_results_for_query_with_comparison_operands(
+            self,
+            query,
+            results,
+            comparison_operands,
+        )
+    }
+
+    #[cfg(any(
+        feature = "claude-code",
+        feature = "codex",
+        feature = "gemini-cli",
+        feature = "agy",
+        feature = "muse-code",
+        feature = "roo-runtime"
+    ))]
     pub(crate) fn search_agent_cached(
         &self,
         query: &str,
@@ -1756,11 +2046,18 @@ impl MemoryService {
         top_k: usize,
         filters: &BTreeMap<String, String>,
     ) -> anyhow::Result<serde_json::Value> {
-        let results =
-            self.search_with_filters_cached(query, scope, session_id, top_k, filters, None)?;
-        Ok(crate::integrations::mcp_tools::search_results_for_query(
-            self, query, results,
-        ))
+        let (results, comparison_operands) = self
+            .search_with_filters_cached_and_comparison_operands(
+                query, scope, session_id, top_k, filters, None,
+            )?;
+        Ok(
+            crate::integrations::mcp_tools::search_results_for_query_with_comparison_operands(
+                self,
+                query,
+                results,
+                &comparison_operands,
+            ),
+        )
     }
 
     #[cfg(any(
@@ -1810,17 +2107,23 @@ impl MemoryService {
                 self.store
                     .source_document_by_id(&result.doc_id)
                     .filter(|doc| self.is_visible(doc))
-                    .map(|doc| SearchMemory {
-                        id: result.doc_id.clone(),
-                        content: doc.content.to_string(),
-                        score: result.score,
-                        created_at: doc.timestamp.clone(),
-                        role: doc.author_agent.clone(),
-                        user_id: doc.filters.get(USER_FILTER).cloned(),
-                        session_id: doc.group_id.clone(),
-                        relation_evidence: result.relation_evidence.clone(),
-                        comparison_operands: result.comparison_operands.clone(),
-                        claim_states: self.store.semantic_claim_states(&result.doc_id),
+                    .map(|doc| {
+                        let record = memory_record(doc);
+                        SearchMemory {
+                            id: result.doc_id.clone(),
+                            content: record.content,
+                            score: result.score,
+                            created_at: record.created_at,
+                            role: record.role,
+                            user_id: Some(record.user_id),
+                            session_id: record.session_id,
+                            metadata: record.metadata,
+                            expires_at_ms: record.expires_at_ms,
+                            supersedes_id: record.supersedes_id,
+                            relation_evidence: result.relation_evidence.clone(),
+                            comparison_operands: result.comparison_operands.clone(),
+                            claim_states: self.store.semantic_claim_states(&result.doc_id),
+                        }
                     })
             })
             .collect();
@@ -1954,11 +2257,8 @@ pub(crate) fn memory_document_id(user_id: &str, request_id: &str, message_index:
 
 fn memory_record(doc: &SourceDocument) -> MemoryRecord {
     let mut metadata = doc.filters.clone();
-    metadata.retain(|key, _| {
-        !matches!(
-            key.as_str(),
-            USER_FILTER | "request_id" | "request_fingerprint" | "expires_at_ms" | "supersedes_id"
-        )
+    metadata.retain(|key, value| {
+        is_user_metadata_filter(key) && value.starts_with(MEMORY_METADATA_PREFIX)
     });
     MemoryRecord {
         id: doc.doc_id.clone(),
@@ -2075,10 +2375,98 @@ fn should_conversational_rerank(enabled: bool, session_id: Option<&str>, query: 
     enabled && session_id.is_some() && is_follow_up(query)
 }
 
-fn request_fingerprint(session_id: &str, messages: &[Message]) -> anyhow::Result<String> {
-    let canonical = serde_json::to_vec(&(session_id, messages))?;
+fn request_fingerprint(
+    session_id: &str,
+    messages: &[Message],
+    metadata: &BTreeMap<String, serde_json::Value>,
+) -> anyhow::Result<String> {
+    let canonical = if metadata.is_empty() {
+        serde_json::to_vec(&(session_id, messages))?
+    } else {
+        serde_json::to_vec(&(session_id, messages, metadata))?
+    };
     let digest = Sha256::digest(canonical);
-    Ok(format!("v2:{digest:x}"))
+    Ok(if metadata.is_empty() {
+        format!("v2:{digest:x}")
+    } else {
+        format!("v3:{digest:x}")
+    })
+}
+
+const MEMORY_METADATA_PREFIX: &str = "mem0-json:";
+
+fn validate_memory_metadata(metadata: &BTreeMap<String, serde_json::Value>) -> anyhow::Result<()> {
+    for (key, value) in metadata {
+        anyhow::ensure!(
+            !key.is_empty()
+                && key.len() <= MAX_IDENTIFIER_BYTES
+                && !key.chars().any(char::is_control),
+            "metadata key must be non-empty, at most {MAX_IDENTIFIER_BYTES} bytes, and contain no control characters"
+        );
+        anyhow::ensure!(
+            is_user_metadata_filter(key),
+            "metadata key '{key}' is reserved"
+        );
+        let encoded = serde_json::to_vec(value)?;
+        anyhow::ensure!(
+            encoded.len() <= MAX_MESSAGE_CONTENT_BYTES,
+            "metadata value for '{key}' is too large"
+        );
+    }
+    Ok(())
+}
+
+fn encode_metadata_value(value: &serde_json::Value) -> anyhow::Result<String> {
+    Ok(format!(
+        "{MEMORY_METADATA_PREFIX}{}",
+        serde_json::to_string(value)?
+    ))
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn decode_mem0_metadata(metadata: BTreeMap<String, String>) -> serde_json::Value {
+    serde_json::Value::Object(
+        metadata
+            .into_iter()
+            .map(|(key, value)| {
+                let decoded = value
+                    .strip_prefix(MEMORY_METADATA_PREFIX)
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or(serde_json::Value::String(value));
+                (key, decoded)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn decode_mem0_metadata_value(value: String) -> serde_json::Value {
+    value
+        .strip_prefix(MEMORY_METADATA_PREFIX)
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or(serde_json::Value::String(value))
+}
+
+#[cfg(feature = "python")]
+pub(crate) fn encode_mem0_metadata_filter(value: &str) -> String {
+    format!(
+        "{MEMORY_METADATA_PREFIX}{}",
+        serde_json::to_string(&serde_json::Value::String(value.to_owned()))
+            .expect("JSON string serialization is infallible")
+    )
+}
+
+pub(crate) fn is_user_metadata_filter(key: &str) -> bool {
+    !key.starts_with("membrick_")
+        && !matches!(
+            key,
+            USER_FILTER
+                | "session_id"
+                | "request_id"
+                | "request_fingerprint"
+                | "expires_at_ms"
+                | "supersedes_id"
+        )
 }
 
 fn unix_time_ms() -> u64 {

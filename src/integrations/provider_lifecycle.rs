@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// A provider-issued instance identity, distinct from its resumable conversation ID.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -125,7 +127,94 @@ pub(crate) fn end_session(root: &Path, session: &SessionToken) -> Result<()> {
             fs::write(path, serde_json::to_vec(&owners)?)?;
         }
     }
+    let _ = fs::remove_file(activity_path(
+        root,
+        &session.provider,
+        Some(&session.session),
+    ));
     Ok(())
+}
+
+/// Keeps the project resident alive for the lifetime of one provider MCP
+/// connection. The OS releases the lease if the adapter exits or crashes.
+pub(crate) struct ResidentConnectionLease {
+    lease: Mutex<Option<crate::local_ipc::ProviderSessionLease>>,
+}
+
+impl ResidentConnectionLease {
+    /// Acquire the lease before the resident starts serving the MCP client.
+    pub(crate) fn start(root: &Path, provider: &str) -> Result<Self> {
+        let lease = crate::local_ipc::acquire_provider_session_lease(root, provider)?;
+        Ok(Self {
+            lease: Mutex::new(Some(lease)),
+        })
+    }
+
+    /// Release the lease when a provider lifecycle signal ends this adapter.
+    pub(crate) fn end(&self) {
+        match self.lease.lock() {
+            Ok(mut lease) => *lease = None,
+            Err(error) => {
+                tracing::warn!("resident connection lease lock poisoned: {error}");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn holds_lease(&self) -> bool {
+        self.lease.lock().unwrap().is_some()
+    }
+}
+
+/// Record that a provider session is active now. Hooks run in their own
+/// processes, so adapters read these records to see hook activity. Each hook
+/// marks both its session and its provider. A failure only warns: a hook must
+/// never fail because its activity could not be recorded.
+pub(crate) fn note_activity(root: &Path, provider: &str, session: Option<&str>) {
+    let now = SystemTime::now();
+    let session = session.filter(|session| !session.trim().is_empty());
+    let record = |path: PathBuf| -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?
+            .set_modified(now)?;
+        Ok(())
+    };
+    for path in [
+        Some(activity_path(root, provider, None)),
+        session.map(|session| activity_path(root, provider, Some(session))),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(error) = record(path) {
+            tracing::warn!(provider, "could not record provider activity: {error:#}");
+        }
+    }
+}
+
+/// The activity record for one session, or for the whole provider.
+fn activity_path(root: &Path, provider: &str, session: Option<&str>) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(provider.as_bytes());
+    hash.update([0]);
+    if let Some(session) = session {
+        hash.update(session.as_bytes());
+    }
+    let name: String = hash.finalize()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let kind = if session.is_some() { "s" } else { "p" };
+    directory(root)
+        .join("activity")
+        .join(format!("{kind}-{name}"))
 }
 
 fn directory(root: &Path) -> PathBuf {
@@ -194,6 +283,20 @@ mod tests {
         end_session(&root, &other).unwrap();
         assert!(provider.stopped());
         drop((ended, resumed, shared, provider));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn connection_lease_is_held_until_adapter_ends() {
+        let root = std::env::temp_dir().join(format!("mb-connection-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let connection = ResidentConnectionLease::start(&root, "codex").unwrap();
+        assert!(connection.holds_lease());
+        connection.end();
+        assert!(!connection.holds_lease());
+        drop(connection);
         fs::remove_dir_all(root).unwrap();
     }
 

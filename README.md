@@ -1,14 +1,27 @@
-# Membrick
+<p align="center">
+  <img src="docs/assets/og-membrick.png" alt="Membrick: evidence-aware memory for AI agents" width="800">
+</p>
 
-**Open-source agent memory for coding agents.**
+<p align="center">
+  <a href="https://github.com/RooAGI/Membrick/releases/latest"><img src="https://img.shields.io/github/v/release/RooAGI/Membrick?style=flat-square" alt="Latest GitHub release"></a>
+  <a href="https://pypi.org/project/membrick/"><img src="https://img.shields.io/pypi/v/membrick?style=flat-square" alt="PyPI version"></a>
+  <a href="https://pypistats.org/packages/membrick"><img src="https://img.shields.io/pypi/dm/membrick?style=flat-square" alt="Monthly PyPI downloads"></a>
+  <a href="https://github.com/RooAGI/Membrick/blob/main/LICENSE"><img src="https://img.shields.io/github/license/RooAGI/Membrick?style=flat-square" alt="Apache-2.0 license"></a>
+</p>
 
-> **AI memory that knows what is still true.** Your agent doesn't just forget; it can confidently remember outdated decisions.
+<p align="center">
+  <a href="https://rooagi.github.io/Membrick/">Documentation</a> ·
+  <a href="docs/quickstart.md">Quickstart</a> ·
+  <a href="docs/agents.md">Agent integrations</a> ·
+  <a href="#benchmark-highlights">Benchmarks</a> ·
+  <a href="https://github.com/RooAGI/Membrick/discussions">Discussions</a>
+</p>
 
-Membrick is an open-source **persistent agent memory** layer for Claude Code, Codex, Gemini CLI, Antigravity CLI (AGY), and Muse Code. It turns project history — sessions, documents, decisions, traces, notes, and code — into **current, evidence-backed context** when an agent needs it.
+Membrick is open-source **persistent memory for AI coding agents**. It turns project history — sessions, documents, decisions, traces, notes, and code — into **current, evidence-backed context** when an agent needs it.
 
 Search can find the right topic. Membrick helps an agent answer the harder question: **is this information still true?** It uses relevance, time, and semantic relationships to distinguish the latest truth from old-but-still-relevant history.
 
-[Agent memory guide](docs/agent-memory.md) · [Quickstart](docs/quickstart.md) · [Reproducible demo](#reproducible-terminal-demo) · [Agent integrations](docs/agents.md) · [Benchmarks](#benchmark-highlights) · [Documentation](https://rooagi.github.io/Membrick/)
+Membrick supports Claude Code, Codex, Gemini CLI, Antigravity CLI (AGY), and Muse Code.
 
 **Current benchmark:** 500-question LongMemEval-S. See the
 [latest benchmark results](#benchmark-highlights) for metrics and the source report.
@@ -58,8 +71,6 @@ membrick query \
 Current-state retrieval returns the newer decision with `semantic_status: current`, and `membrick context` excludes the stale value.
 
 ### Reproducible terminal demo
-
-![Membrick reproducible terminal demo](docs/assets/membrick-real-terminal.gif)
 
 The repository includes a reproducible **asciinema PTY recording** that builds the actual `membrick` binary, sets deterministic file mtimes for a controlled stale-memory scenario, runs the neutral query above, verifies the result, and renders the captured terminal session.
 
@@ -421,27 +432,26 @@ wheel is written under `target/wheels/`.
 ```python
 import membrick
 
-memory = membrick.Memory(path="./memory-index")
+memory = membrick.Memory(path=".")  # Connects to this project's resident.
 memory.add(
-    "request-1",
-    "user-1",
-    "session-1",
     [{"role": "user", "content": "Docker runs on Ubuntu hosts"}],
+    user_id="user-1",
 )
-print(memory.search("docker ubuntu", "user-1", 5))
+print(memory.search("docker ubuntu", user_id="user-1", top_k=5))
 
-# Use the same API against a running membrick server:
-# NOTE: base_url must be passed by keyword. A positional first argument
-# is `path` and would silently create a local index instead of connecting.
+# Select another project's resident or connect to a remote server:
+project = membrick.Memory(path="/path/to/project")
 remote = membrick.Memory(base_url="http://127.0.0.1:8080", api_key="local-token")
-print(remote.search("docker ubuntu", "user-1", 5))
+print(remote.search("docker ubuntu", user_id="user-1", top_k=5))
 ```
 
 ### Rust
 
-`MemoryService` is the only public memory access API. Request, response, document,
-and configuration types are public; stores, indexes, snapshots, builders, and
-persistence modules are internal. See [the API migration guide](docs/memory-service-api.md).
+Application clients use `Memory` to connect to a resident or remote server.
+Rust applications that deliberately embed Membrick can use `MemoryService`
+directly. Request, response, document, and configuration types are public;
+stores, indexes, snapshots, builders, and persistence modules are internal.
+See [the service API guide](docs/memory-service-api.md).
 
 ```rust
 use membrick::{MemoryService, PipelineOptions, SourceDocument};

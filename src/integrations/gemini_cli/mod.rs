@@ -51,6 +51,7 @@ pub struct GeminiCliServerOptions<'a> {
 }
 
 pub(crate) struct GeminiMcp {
+    backend: mcp_tools::MemoryBackend,
     root: PathBuf,
     store: Mutex<Option<crate::memory_api::MemoryService>>,
     provider: RecordingProvider,
@@ -143,9 +144,14 @@ pub fn run_server_for(
     provider_display_name: &'static str,
     options: GeminiCliServerOptions<'_>,
 ) -> Result<()> {
+    let _resident_lease = crate::integrations::provider_lifecycle::ResidentConnectionLease::start(
+        root,
+        provider_label,
+    )?;
     crate::local_ipc::ensure_provider_resident(root, provider_label)?;
     tracing::debug!("MCP server starting");
     let server = GeminiMcp {
+        backend: mcp_tools::MemoryBackend::Resident,
         root: root.to_path_buf(),
         store: Mutex::new(None),
         provider,
@@ -156,14 +162,7 @@ pub fn run_server_for(
         max_depth: options.max_depth,
         max_total_bytes: options.max_total_bytes,
         ignore_paths: options.ignore_paths.to_vec(),
-        workspace_watcher: if cfg!(test) {
-            Some(mcp_index::WorkspaceWatcher::new(
-                root,
-                options.ignore_paths,
-            )?)
-        } else {
-            None
-        },
+        workspace_watcher: None,
     };
     server.serve()
 }
@@ -179,6 +178,7 @@ pub(crate) fn test_handle(
     provider_display_name: &'static str,
 ) -> GeminiMcp {
     GeminiMcp {
+        backend: mcp_tools::MemoryBackend::InProcess,
         root,
         store: Mutex::new(None),
         provider,
@@ -202,7 +202,7 @@ impl GeminiMcp {
             .lock()
             .map_err(|_| anyhow::anyhow!("Gemini MCP store lock poisoned"))?;
         anyhow::ensure!(
-            !mcp_tools::resident_backend_enabled(),
+            !self.backend.is_resident(),
             "MCP memory indexes are owned by the resident Membrick server"
         );
         let file_changes = self
@@ -219,6 +219,7 @@ impl GeminiMcp {
                     self.provider,
                     &self.root,
                     file_changes,
+                    self.backend,
                 )
             {
                 tracing::warn!("failed to save workspace file changes: {error:#}");
@@ -334,20 +335,13 @@ impl GeminiMcp {
             return mcp_tools::call_update_tool(id, &args);
         }
 
-        if mcp_tools::resident_backend_enabled()
-            && (mcp_tools::is_flow_tool_name(name)
+        if self.backend.is_resident()
+            && (mcp_tools::is_extension_tool_name(name)
                 || matches!(
                     name,
                     "search"
                         | "info"
                         | "list_memories"
-                        | "board_open"
-                        | "board_list"
-                        | "board_info"
-                        | "board_post"
-                        | "board_read"
-                        | "board_get"
-                        | "board_search"
                         | "add_memory"
                         | "get_memory"
                         | "delete_memory"
@@ -362,16 +356,17 @@ impl GeminiMcp {
             );
         }
         match name {
-            flow_name if mcp_tools::is_flow_tool_name(flow_name) => {
+            extension_name if mcp_tools::is_extension_tool_name(extension_name) => {
                 let mut service = self.store()?;
                 let service = service.as_mut().expect("initialized");
-                mcp_tools::call_board_or_memory_tool(
-                    flow_name,
+                mcp_tools::call_mcp_tool_with_backend(
+                    extension_name,
                     id,
                     &args,
                     service,
                     &self.root,
                     self.provider.as_str(),
+                    self.backend,
                 )
             }
             "search" => {
@@ -500,18 +495,18 @@ impl GeminiMcp {
                 };
                 Ok(text_response(id, &serde_json::to_string_pretty(&state)?))
             }
-            "board_open" | "board_list" | "board_info" | "board_post" | "board_read"
-            | "board_get" | "board_search" | "add_memory" | "get_memory" | "delete_memory"
-            | "review_search" | "search_feedback" | "enrich_doc" => {
+            "add_memory" | "get_memory" | "delete_memory" | "review_search" | "search_feedback"
+            | "enrich_doc" => {
                 let mut service = self.store()?;
                 let service = service.as_mut().expect("initialized");
-                mcp_tools::call_board_or_memory_tool(
+                mcp_tools::call_mcp_tool_with_backend(
                     name,
                     id,
                     &args,
                     service,
                     &self.root,
                     self.provider.as_str(),
+                    self.backend,
                 )
             }
             _ => Ok(error_response(id, -32602, "unknown tool")),
@@ -562,8 +557,7 @@ fn tool_definitions(provider_display_name: &str) -> Vec<ToolDefinition> {
         },
     ];
     let mut tools = tools;
-    tools.extend(mcp_tools::board_tool_definitions());
-    tools.extend(mcp_tools::flow_tool_definitions());
+    tools.extend(mcp_tools::extension_tool_definitions());
     tools.extend(mcp_tools::memory_tool_definitions());
     tools.push(mcp_tools::update_tool_definition());
     tools
@@ -725,6 +719,7 @@ mod tests {
             drop(memory);
 
             let mcp = GeminiMcp {
+                backend: mcp_tools::MemoryBackend::InProcess,
                 root: root.clone(),
                 store: Mutex::new(None),
                 provider,
@@ -809,6 +804,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(feature = "flowboard-tests")]
     #[test]
     fn gemini_compatible_mcp_contract_applies_to_all_adapters() {
         for (provider, label, display_name) in [
@@ -839,6 +835,7 @@ mod tests {
             drop(memory);
 
             let mcp = GeminiMcp {
+                backend: mcp_tools::MemoryBackend::InProcess,
                 root: root.clone(),
                 store: Mutex::new(None),
                 provider,
@@ -926,6 +923,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "flowboard-tests")]
     #[test]
     fn board_and_memory_tools_round_trip_for_gemini_compatible_providers() {
         let providers = [
@@ -936,6 +934,7 @@ mod tests {
         for (provider, label, display_name) in providers {
             let root = temp_root(label);
             let mcp = GeminiMcp {
+                backend: mcp_tools::MemoryBackend::InProcess,
                 root: root.clone(),
                 store: Mutex::new(None),
                 provider,
@@ -1007,6 +1006,60 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "flowboard-tests")]
+    #[test]
+    fn board_post_edit_routes_through_gemini_mcp() {
+        let root = temp_root("board-post-edit");
+        let mcp = GeminiMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
+            root: root.clone(),
+            store: Mutex::new(None),
+            provider: RecordingProvider::Gemini,
+            provider_label: "gemini-cli",
+            provider_display_name: "Gemini",
+            max_bytes: 5_000_000,
+            max_files: 50_000,
+            max_depth: 20,
+            max_total_bytes: 100_000_000,
+            ignore_paths: vec![],
+            workspace_watcher: None,
+        };
+        let session = "gemini-board-post-edit";
+        let posted = call_tool(
+            &mcp,
+            "board_post",
+            json!({
+                "content": "Original checkpoint text.",
+                "request_id": "gemini-post-edit-1",
+                "session_id": session,
+            }),
+        );
+        let board_id = posted["board_id"].as_str().unwrap().to_string();
+        let post_id = posted["post_id"].as_str().unwrap().to_string();
+
+        let edited = call_tool(
+            &mcp,
+            "board_post_edit",
+            json!({
+                "board_id": board_id,
+                "post_id": post_id,
+                "content": "Edited checkpoint text.",
+                "session_id": session,
+            }),
+        );
+        assert_eq!(edited["post_id"], post_id);
+        assert_eq!(edited["content"], "Edited checkpoint text.");
+
+        let fetched = call_tool(
+            &mcp,
+            "board_get",
+            json!({"board_id": board_id, "post_id": post_id}),
+        );
+        assert_eq!(fetched["content"], "Edited checkpoint text.");
+        drop(mcp);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn shared_search_scopes_conversation_state_to_adapter_provider() {
         // The shared Gemini-compatible search must scope conversation state
@@ -1021,6 +1074,7 @@ mod tests {
         )
         .unwrap();
         let make_mcp = |provider, label: &'static str, display_name: &'static str| GeminiMcp {
+            backend: mcp_tools::MemoryBackend::InProcess,
             root: root.clone(),
             store: Mutex::new(None),
             provider,

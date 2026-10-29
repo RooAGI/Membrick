@@ -1,7 +1,7 @@
 //! One bounded queue and one resident MemoryService own all workspace writes.
 use super::*;
 use crate::memory_api::MemoryStore;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use tokio::sync::oneshot;
 
@@ -59,6 +59,7 @@ pub(super) struct CaptureAudit {
 
 enum Command {
     Add(Vec<AddRequest>, bool, Reply),
+    AddWithMetadata(Vec<crate::memory_api::AddRequestContext>, bool, Reply),
     Upsert(Vec<crate::SourceDocument>, Option<CaptureAudit>, Reply),
     ReplaceGroup(String, String, Vec<crate::SourceDocument>, Reply),
     ReplaceWorkspace(Vec<crate::SourceDocument>, Reply),
@@ -81,19 +82,33 @@ impl WriterSender {
 
 enum BarrierWork {
     Add(MemoryStore, Vec<AddRequest>),
+    AddWithMetadata(MemoryStore, Vec<crate::memory_api::AddRequestContext>),
     None,
 }
 struct BarrierReply {
     revisions: [u64; 2],
+    // Journaled adds are durable before admission returns; they only need a
+    // published view. Other barriers still require a checkpoint.
+    require_checkpoint: bool,
     work: BarrierWork,
     reply: Reply,
 }
 impl BarrierReply {
     fn for_store(target: MemoryStore, revision: u64, work: BarrierWork, reply: Reply) -> Self {
+        Self::for_store_with_checkpoint(target, revision, true, work, reply)
+    }
+    fn for_store_with_checkpoint(
+        target: MemoryStore,
+        revision: u64,
+        require_checkpoint: bool,
+        work: BarrierWork,
+        reply: Reply,
+    ) -> Self {
         let mut revisions = [0; 2];
         revisions[target.slot()] = revision;
         Self {
             revisions,
+            require_checkpoint,
             work,
             reply,
         }
@@ -103,6 +118,15 @@ impl BarrierReply {
             BarrierWork::Add(target, requests) => owner
                 .memory_store(target)
                 .completed_add_responses(&requests)
+                .and_then(|responses| Ok(serde_json::to_value(responses)?)),
+            BarrierWork::AddWithMetadata(target, requests) => owner
+                .memory_store(target)
+                .completed_add_responses_with_metadata(
+                    &requests
+                        .into_iter()
+                        .map(|context| context.request)
+                        .collect::<Vec<_>>(),
+                )
                 .and_then(|responses| Ok(serde_json::to_value(responses)?)),
             BarrierWork::None => Ok(Value::Null),
         };
@@ -226,7 +250,7 @@ fn run_writer(
                 let slot = target.slot();
                 match command {
                     Command::Add(requests, wait, reply) => {
-                        let result = (|| -> anyhow::Result<(Value, u64)> {
+                        let result = (|| -> anyhow::Result<(Value, u64, bool)> {
                             anyhow::ensure!(
                                 !wait || barriers.len() < QUEUE_CAPACITY,
                                 PendingWriteLimit
@@ -253,16 +277,73 @@ fn run_writer(
                             Ok((
                                 serde_json::to_value(responses)?,
                                 store.publication_revisions().0,
+                                !store.has_staged_journal(),
                             ))
                         })();
                         match result {
-                            Ok((_, revision)) if wait => barriers.push(BarrierReply::for_store(
-                                target,
-                                revision,
-                                BarrierWork::Add(target, requests),
-                                reply,
-                            )),
-                            Ok((value, _)) => {
+                            Ok((_, revision, require_checkpoint)) if wait => {
+                                barriers.push(BarrierReply::for_store_with_checkpoint(
+                                    target,
+                                    revision,
+                                    require_checkpoint,
+                                    BarrierWork::Add(target, requests),
+                                    reply,
+                                ))
+                            }
+                            Ok((value, _, _)) => {
+                                let _ = reply.send(Ok(value));
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    }
+                    Command::AddWithMetadata(requests, wait, reply) => {
+                        let result = (|| -> anyhow::Result<(Value, u64, bool)> {
+                            anyhow::ensure!(
+                                !wait || barriers.len() < QUEUE_CAPACITY,
+                                PendingWriteLimit
+                            );
+                            let mut owner = service
+                                .write()
+                                .map_err(|_| anyhow::anyhow!("memory writer poisoned"))?;
+                            let pending: usize = targets
+                                .iter()
+                                .map(|&t| owner.memory_store(t).pending_document_count())
+                                .sum();
+                            anyhow::ensure!(
+                                pending
+                                    + requests
+                                        .iter()
+                                        .map(|r| r.request.request.messages.len())
+                                        .sum::<usize>()
+                                    <= MAX_PENDING_DOCUMENTS,
+                                PendingWriteLimit
+                            );
+                            let store = owner.memory_store_mut(target);
+                            let responses = store.stage_add_batch_with_context(requests.clone())?;
+                            if store.pending_document_count() > 0
+                                && schedules[slot].first_pending.is_none()
+                            {
+                                schedules[slot].first_pending = Some(Instant::now());
+                            }
+                            Ok((
+                                serde_json::to_value(responses)?,
+                                store.publication_revisions().0,
+                                !store.has_staged_journal(),
+                            ))
+                        })();
+                        match result {
+                            Ok((_, revision, require_checkpoint)) if wait => {
+                                barriers.push(BarrierReply::for_store_with_checkpoint(
+                                    target,
+                                    revision,
+                                    require_checkpoint,
+                                    BarrierWork::AddWithMetadata(target, requests),
+                                    reply,
+                                ))
+                            }
+                            Ok((value, _, _)) => {
                                 let _ = reply.send(Ok(value));
                             }
                             Err(error) => {
@@ -439,6 +520,7 @@ fn run_writer(
                             }
                             barriers.push(BarrierReply {
                                 revisions,
+                                require_checkpoint: true,
                                 work: BarrierWork::None,
                                 reply,
                             });
@@ -530,7 +612,7 @@ fn run_writer(
                     let (_, published_revision, durable) =
                         owner.memory_store(target).publication_revisions();
                     let revision = barriers[index].revisions[target.slot()];
-                    revision <= durable
+                    (!barriers[index].require_checkpoint || revision <= durable)
                         && revision <= published_revision
                         && revision <= schedules[target.slot()].visible_revision
                 });
@@ -569,25 +651,26 @@ fn run_writer(
             let due = schedules[slot]
                 .first_pending
                 .is_some_and(|first| first.elapsed() >= schedule.refresh_interval);
-            let checkpoint = barriers
+            let visibility_due = barriers
                 .iter()
-                .any(|b| b.revisions[slot] > schedules[slot].visible_revision)
-                || barriers.iter().any(|b| {
-                    service.read().is_ok_and(|owner| {
+                .any(|b| b.revisions[slot] > schedules[slot].visible_revision);
+            let checkpoint = barriers.iter().any(|b| {
+                b.require_checkpoint
+                    && service.read().is_ok_and(|owner| {
                         b.revisions[slot] > owner.memory_store(target).publication_revisions().2
                     })
-                })
-                || (schedules[slot].last_checkpoint.elapsed() >= schedule.checkpoint_interval
-                    && service.read().is_ok_and(|owner| {
-                        let (accepted, _, durable) =
-                            owner.memory_store(target).publication_revisions();
-                        accepted > durable
-                    }));
+            }) || (schedules[slot].last_checkpoint.elapsed()
+                >= schedule.checkpoint_interval
+                && service.read().is_ok_and(|owner| {
+                    let (accepted, _, durable) = owner.memory_store(target).publication_revisions();
+                    accepted > durable
+                }));
             let can_retry = schedules[slot]
                 .retry_after
                 .is_none_or(|deadline| Instant::now() >= deadline);
             if can_retry
                 && ((pending > 0 && (due || pending >= schedule.batch_size))
+                    || visibility_due
                     || checkpoint
                     || enrichment_ready)
             {
@@ -609,7 +692,9 @@ fn run_writer(
                         schedules[slot].retry_after = None;
                     }
                     Err(error) => {
-                        tracing::error!("memory publication capture failed; durable journal retained: {error:#}");
+                        tracing::error!(
+                            "memory publication capture failed; durable journal retained: {error:#}"
+                        );
                         fail_barriers(&mut barriers, &format!("{error:#}"));
                         schedules[slot].retry_after =
                             Some(Instant::now() + schedule.refresh_interval);
@@ -730,6 +815,10 @@ impl StagedWriter {
     fn status(error: anyhow::Error) -> StatusCode {
         if error.is::<PendingWriteLimit>() {
             StatusCode::TOO_MANY_REQUESTS
+        } else if error.is::<crate::memory_api::RequestFingerprintConflict>() {
+            // Reusing an id with a different payload is a definitive client
+            // conflict, not a transient staged-writer failure.
+            StatusCode::CONFLICT
         } else {
             tracing::error!("staged mutation failed: {error:#}");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -742,6 +831,26 @@ impl StagedWriter {
     ) -> Result<Value, StatusCode> {
         let (reply, receive) = oneshot::channel();
         self.send(Command::Add(requests, wait, reply))?;
+        receive
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map_err(Self::status)
+    }
+
+    pub(super) async fn add_with_metadata(
+        &self,
+        request: crate::memory_api::AddRequestContext,
+        wait: bool,
+    ) -> Result<Value, StatusCode> {
+        self.add_with_metadata_batch(vec![request], wait).await
+    }
+    pub(super) async fn add_with_metadata_batch(
+        &self,
+        requests: Vec<crate::memory_api::AddRequestContext>,
+        wait: bool,
+    ) -> Result<Value, StatusCode> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::AddWithMetadata(requests, wait, reply))?;
         receive
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
@@ -855,6 +964,21 @@ fn publish_view(published: &RwLock<Arc<MemoryService>>, view: MemoryService) -> 
 mod tests {
     use super::*;
     use crate::memory_api::Message;
+
+    #[test]
+    fn fingerprint_conflicts_are_rejected_without_text_matching() {
+        assert_eq!(
+            StagedWriter::status(crate::memory_api::RequestFingerprintConflict.into()),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            StagedWriter::status(anyhow::anyhow!(
+                "internal error mentioning request_id was already used with different content"
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     fn request(i: usize) -> AddRequest {
         AddRequest {
             request_id: format!("r{i}"),
@@ -887,6 +1011,100 @@ mod tests {
             ..Default::default()
         })))
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn journaled_visibility_adds_do_not_force_a_checkpoint() {
+        let root = super::super::tests::security_test_root();
+        let path = root.join("memory");
+        let owner = Arc::new(RwLock::new(
+            MemoryService::at_path(
+                &path,
+                PipelineOptions {
+                    key_phrase_enrichment: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        ));
+        let worker = StagedWriter::start_with_schedule(
+            owner.clone(),
+            WriteSchedule {
+                refresh_interval: Duration::from_secs(60),
+                batch_size: 10000,
+                checkpoint_interval: Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), worker.add(vec![request(1)], true))
+                .await
+                .unwrap()
+                .unwrap();
+        let responses: Vec<crate::memory_api::AddResponse> =
+            serde_json::from_value(response).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].adjudication.is_some());
+        assert_eq!(
+            worker
+                .read_view()
+                .unwrap()
+                .search_cached(query())
+                .unwrap()
+                .data
+                .len(),
+            1
+        );
+        let (accepted, published, checkpoint) = owner.read().unwrap().publication_revisions();
+        assert_eq!(published, accepted);
+        assert!(
+            checkpoint < accepted,
+            "a visibility wait forced a checkpoint"
+        );
+        assert!(path.join("pending-adds.jsonl").metadata().unwrap().len() > 0);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            worker.add_with_metadata(
+                crate::memory_api::AddRequestContext {
+                    request: crate::memory_api::AddRequestWithMetadata::new(
+                        request(2),
+                        Default::default(),
+                    ),
+                    session_id_was_omitted: false,
+                },
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let responses: Vec<crate::memory_api::AddResponse> =
+            serde_json::from_value(response).unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].adjudication.is_some());
+        assert_eq!(
+            worker
+                .read_view()
+                .unwrap()
+                .search_cached(query())
+                .unwrap()
+                .data
+                .len(),
+            2
+        );
+        let (accepted, published, checkpoint) = owner.read().unwrap().publication_revisions();
+        assert_eq!(published, accepted);
+        assert!(
+            checkpoint < accepted,
+            "a metadata visibility wait forced a checkpoint"
+        );
+
+        worker.flush().await.unwrap();
+        let (accepted, _, checkpoint) = owner.read().unwrap().publication_revisions();
+        assert_eq!(checkpoint, accepted);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_adds_share_publication_and_retained_views_stay_stable() {
         let owner = owner();
