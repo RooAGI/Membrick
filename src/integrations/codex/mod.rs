@@ -1350,7 +1350,7 @@ mod tests {
         store.refresh().unwrap();
         CodexMcp {
             backend: mcp_tools::MemoryBackend::InProcess,
-            lifecycle: lifecycle::AdapterLifecycle::new(&root),
+            lifecycle: lifecycle::AdapterLifecycle::new(&root).unwrap(),
             root,
             max_bytes: 0,
             max_files: 0,
@@ -1413,7 +1413,7 @@ mod tests {
 
         let mcp = CodexMcp {
             backend: mcp_tools::MemoryBackend::InProcess,
-            lifecycle: lifecycle::AdapterLifecycle::new(&root),
+            lifecycle: lifecycle::AdapterLifecycle::new(&root).unwrap(),
             root: root.clone(),
             max_bytes: 5_000_000,
             max_files: 50_000,
@@ -1795,7 +1795,7 @@ args = ["old"]
         let root = temp_dir("mcp-lazy-store");
         let mcp = CodexMcp {
             backend: mcp_tools::MemoryBackend::InProcess,
-            lifecycle: lifecycle::AdapterLifecycle::new(&root),
+            lifecycle: lifecycle::AdapterLifecycle::new(&root).unwrap(),
             root: root.clone(),
             max_bytes: 1_000_000,
             max_files: 100,
