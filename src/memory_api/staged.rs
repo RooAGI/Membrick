@@ -351,6 +351,10 @@ impl MemoryService {
             .map(|p| p.with_file_name("pending-adds.jsonl"))
     }
 
+    pub(crate) fn has_staged_journal(&self) -> bool {
+        self.staged_journal_path().is_some()
+    }
+
     /// Persist a validated batch before changing mutable state. No index refresh.
     /// A single owner must serialize mutations to a disk-backed service.
     pub fn stage_add_batch(
