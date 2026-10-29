@@ -1089,8 +1089,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             "resident starting"
         );
         let shutdown = async move {
-            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal())
-                .await
+            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal()).await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(
             app,

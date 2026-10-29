@@ -228,6 +228,7 @@ pub(crate) async fn serve(
             None
         }
     };
+    let mut connections = ResidentConnections::default();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -323,7 +324,7 @@ pub(crate) async fn serve(
                         None => std::future::pending().await,
                     }
                 } => match accepted {
-                    Ok(Some((stream, _))) => serve_stream(router.clone(), stream, true),
+                    Ok(Some((stream, _))) => connections.serve_stream(router.clone(), stream, true),
                     Ok(None) => unreachable!(),
                     Err(error) => {
                         tracing::warn!("resident IPC listener failed; continuing with file queue: {error}");
@@ -336,7 +337,7 @@ pub(crate) async fn serve(
                         None => std::future::pending().await,
                     }
                 } => match accepted {
-                    Ok(Some((stream, _))) => serve_stream(router.clone(), stream, http_bind_is_loopback(http_bind)),
+                    Ok(Some((stream, _))) => connections.serve_stream(router.clone(), stream, http_bind_is_loopback(http_bind)),
                     Ok(None) => unreachable!(),
                     Err(error) => {
                         tracing::warn!("resident HTTP listener stopped: {error}");
@@ -360,10 +361,17 @@ pub(crate) async fn serve(
                         Err(error) => tracing::warn!("file-queue cleanup worker failed: {error}"),
                     }
                 }
+                result = connections.tasks.join_next(), if !connections.tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::warn!("resident connection task failed: {error}");
+                    }
+                }
                 gate = &mut shutdown => break gate,
             }
         };
+        drop(http_listener);
         drop(listener);
+        connections.shutdown().await;
         if bound_inode.is_some()
             && std::fs::metadata(&endpoint)
                 .is_ok_and(|metadata| Some(metadata.ino()) == bound_inode)
@@ -395,7 +403,7 @@ pub(crate) async fn serve(
             tokio::select! {
                 connected = server.connect() => {
                     connected?;
-                    serve_stream(router.clone(), server, true);
+                    connections.serve_stream(router.clone(), server, true);
                 }
                 accepted = async {
                     match http_listener.as_ref() {
@@ -404,7 +412,7 @@ pub(crate) async fn serve(
                     }
                 } => match accepted {
                     Ok(Some((stream, _))) => {
-                        serve_stream(router.clone(), stream, http_bind_is_loopback(http_bind))
+                        connections.serve_stream(router.clone(), stream, http_bind_is_loopback(http_bind))
                     }
                     Ok(None) => unreachable!(),
                     Err(error) => {
@@ -429,9 +437,16 @@ pub(crate) async fn serve(
                         Err(error) => tracing::warn!("file-queue cleanup worker failed: {error}"),
                     }
                 }
+                result = connections.tasks.join_next(), if !connections.tasks.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::warn!("resident connection task failed: {error}");
+                    }
+                }
                 gate = &mut shutdown => break gate,
             }
         };
+        drop(http_listener);
+        connections.shutdown().await;
         Ok(shutdown_gate)
     }
 }
@@ -530,6 +545,69 @@ fn persist_resident_http_bind(settings_path: &Path, bind: std::net::SocketAddr) 
     Ok(())
 }
 
+#[derive(Default)]
+struct ResidentConnections {
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl ResidentConnections {
+    fn serve_stream<S>(&mut self, router: Router, stream: S, trusted_local: bool)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let shutdown = self
+            .shutdown
+            .get_or_insert_with(|| tokio::sync::watch::channel(false).0);
+        let mut shutdown = shutdown.subscribe();
+        self.tasks.spawn(async move {
+            let service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                let router = router.clone();
+                async move {
+                    let mut request = request.map(Body::new);
+                    if trusted_local {
+                        request.extensions_mut().insert(LocalIpcRequest);
+                    }
+                    let response = router
+                        .oneshot(request)
+                        .await
+                        .unwrap_or_else(|never| match never {});
+                    Ok::<Response<Body>, std::convert::Infallible>(response)
+                }
+            });
+            let io = TokioIo::new(stream);
+            let connection =
+                hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+            tokio::pin!(connection);
+            tokio::select! {
+                result = &mut connection => {
+                    if let Err(error) = result {
+                        tracing::debug!("resident connection ended: {error}");
+                    }
+                }
+                _ = shutdown.changed() => {
+                    connection.as_mut().graceful_shutdown();
+                    if let Err(error) = connection.await {
+                        tracing::debug!("resident connection ended during graceful shutdown: {error}");
+                    }
+                }
+            }
+        });
+    }
+
+    async fn shutdown(&mut self) {
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.send_replace(true);
+        }
+        while let Some(result) = self.tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!("resident connection task failed: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn serve_stream<S>(router: Router, stream: S, trusted_local: bool)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1085,6 +1163,95 @@ mod tests {
         assert_eq!(result["value"], "resident-http");
         assert_eq!(handled.load(Ordering::SeqCst), 1);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_shutdown_waits_for_an_in_flight_resident_http_request() {
+        let directory = TempDir::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let route_entered = entered.clone();
+        let route_release = release.clone();
+        let app = Router::new().route(
+            "/slow",
+            post(move || {
+                let entered = route_entered.clone();
+                let release = route_release.clone();
+                async move {
+                    entered.notify_one();
+                    let _permit = release.acquire().await.unwrap();
+                    axum::Json(serde_json::json!({"completed": true}))
+                }
+            }),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let root = directory.0.clone();
+        let server_bind = bind.clone();
+        let mut server = tokio::spawn(async move {
+            serve(
+                app,
+                &root,
+                async move {
+                    let _ = shutdown_rx.await;
+                    None
+                },
+                Some(&server_bind),
+                false,
+                None,
+            )
+            .await
+        });
+
+        let mut stream = None;
+        for _ in 0..100 {
+            match tokio::net::TcpStream::connect(&bind).await {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        let stream = stream.expect("resident HTTP listener should start");
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/slow")
+            .header(hyper::header::HOST, "resident.local")
+            .body(Full::new(hyper::body::Bytes::new()))
+            .unwrap();
+        let request_task = tokio::spawn(async move { sender.send_request(request).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("HTTP handler should start");
+
+        shutdown_tx.send(()).unwrap();
+        let stayed_up_for_request = tokio::time::timeout(Duration::from_millis(100), &mut server)
+            .await
+            .is_err();
+        release.add_permits(1);
+
+        let response = tokio::time::timeout(Duration::from_secs(10), request_task)
+            .await
+            .expect("HTTP response should complete")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            stayed_up_for_request,
+            "resident shut down before its in-flight HTTP request completed"
+        );
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
