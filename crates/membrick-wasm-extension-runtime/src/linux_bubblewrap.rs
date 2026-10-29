@@ -192,20 +192,20 @@ struct Namespaces {
 }
 
 impl SandboxProbe {
-    fn verify(self, limits: &RuntimeLimits) -> Result<(), ()> {
+    fn verify(&self, limits: &RuntimeLimits) -> Result<(), ()> {
         let host = namespace_ids().map_err(|_| ())?;
         let guest = [
-            self.namespaces.user,
-            self.namespaces.mount,
-            self.namespaces.pid,
-            self.namespaces.ipc,
-            self.namespaces.uts,
-            self.namespaces.net,
+            &self.namespaces.user,
+            &self.namespaces.mount,
+            &self.namespaces.pid,
+            &self.namespaces.ipc,
+            &self.namespaces.uts,
+            &self.namespaces.net,
         ];
         if guest
             .iter()
             .zip(host)
-            .any(|(inside, outside)| inside == &outside)
+            .any(|(inside, outside)| *inside == &outside)
         {
             return Err(());
         }
