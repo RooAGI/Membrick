@@ -154,9 +154,11 @@ impl BubblewrapSandbox {
 
         let report: SandboxProbe =
             serde_json::from_slice(&output.stdout).map_err(|_| RuntimeError::SandboxProbeFailed)?;
-        report
-            .verify(limits)
-            .map_err(|_| RuntimeError::SandboxProbeFailed)
+        if report.verify(limits).is_err() {
+            eprintln!("Bubblewrap sandbox probe failed verification: {report:?}");
+            return Err(RuntimeError::SandboxProbeFailed);
+        }
+        Ok(())
     }
 }
 
