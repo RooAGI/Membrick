@@ -105,9 +105,7 @@ impl Memory {
     #[napi(factory)]
     pub fn init(options: MemoryOptions) -> Result<Self> {
         let path = options.path.ok_or_else(|| {
-            Error::from_reason(
-                "[MEMBRICK_ERROR code=CONFIGURATION] Memory.init requires path",
-            )
+            Error::from_reason("[MEMBRICK_ERROR code=CONFIGURATION] Memory.init requires path")
         })?;
         if options.base_url.is_some() {
             return Err(Error::from_reason(
@@ -160,6 +158,22 @@ impl Memory {
                 )
                 .map_err(memory_client_error)?;
             to_value(receipt)
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn add_transaction(&self, requests: Vec<Value>) -> Result<Vec<Value>> {
+        let requests = requests
+            .into_iter()
+            .map(from_value::<membrick::AddRequestWithMetadata>)
+            .collect::<Result<Vec<_>>>()?;
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            let responses = client
+                .add_transaction(requests)
+                .map_err(memory_client_error)?;
+            to_values(responses)
         })
         .await
     }

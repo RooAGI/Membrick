@@ -70,23 +70,20 @@ lock files may remain and are reused by the next owner. Different project roots
 therefore use separate runtime state and endpoints without requiring access to
 the user's home directory.
 
-The provider-launched MCP adapter requests resident startup when its stdio MCP
-process begins. That warm-up uses a short-lived kernel-locked lease in
-`.membrick/runtime/provider-leases/`. Hooks and other one-shot clients hold
-leases while a request is in flight. Every provider adapter (Claude, Codex,
-Gemini CLI, AGY, Hermes, OpenClaw and Muse) also holds a keepalive lease while
-it is in use, and releases it after five minutes with no tool call or hook it
-can attribute to its sessions. Hooks mark activity under
-`.membrick/runtime/provider-adapters/activity/`, once for their session and
-once for their provider. An adapter that has seen session IDs (Codex threads)
-follows only those sessions. An adapter that has not seen any follows every
-hook from its provider in the project. Hosts can keep adapters and threads
-open long after the user leaves without sending an end event, so no adapter
-holds a lease for its whole process lifetime. The resident is shared by every
-provider using the same project. After all request and keepalive leases
-are released, the resident waits for `resident_idle_timeout_seconds` (60
-seconds by default, clamped to 5–3600) before flushing its writer and shutting
+The provider-launched MCP adapter acquires a kernel-locked lease before
+requesting resident startup. The lease lives as long as the adapter's stdio
+connection, and the OS releases it if the adapter exits or crashes. Project
+`Memory` clients and sessions also hold leases for their handle lifetime;
+one-shot hooks hold a lease while their request is in flight. The resident is
+shared by every provider using the same project. When all client, adapter, and
+request leases are released, the resident flushes pending writes and shuts
 down. A later provider or hook request starts a fresh resident automatically.
+
+Codex can retain an MCP adapter in its long-lived daemon after the TUI or
+desktop closes. Its session-end hook stops the adapter after the last tracked
+conversation ends. If Codex closes the UI without sending that hook and keeps
+the adapter connection open, the adapter cannot observe the UI exit and its
+lease remains until the connection closes.
 Stale lease files are detected by testing the kernel lock and removed during
 the resident's lease scan. Lease registration and the resident's final
 empty-lease check share the kernel lock at
@@ -158,7 +155,6 @@ one possible assignment:
 bind = "127.0.0.1:8080"
 resident_http_bind = "127.0.0.1:8465"
 resident_http_auto_port = true
-resident_idle_timeout_seconds = 60
 dashboard_url = "http://127.0.0.1:8465/dashboard"
 ```
 

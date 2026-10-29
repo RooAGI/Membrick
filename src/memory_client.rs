@@ -686,6 +686,54 @@ impl Memory {
         decode(body)
     }
 
+    /// Add several memory requests as one durable transaction. The resident
+    /// validates and journals the whole batch before applying any request;
+    /// every request must use the same `user_id`. Each request keeps its own
+    /// `request_id`, which makes a retry safe and detects changed contents.
+    /// The call waits until the complete batch is checkpointed and visible.
+    pub fn add_transaction(
+        &self,
+        requests: Vec<AddRequestWithMetadata>,
+    ) -> Result<Vec<AddResponse>, MemoryError> {
+        let client = self.clone();
+        run_sync(async move { client.add_transaction_async(requests).await })
+    }
+
+    /// Async form of [`Memory::add_transaction`].
+    pub async fn add_transaction_async(
+        &self,
+        requests: Vec<AddRequestWithMetadata>,
+    ) -> Result<Vec<AddResponse>, MemoryError> {
+        if requests.is_empty() || requests.len() > 128 {
+            return Err(MemoryError::Configuration {
+                message: "transaction must contain between 1 and 128 requests".to_string(),
+            });
+        }
+        let user_id = requests[0].request.user_id.as_str();
+        if requests
+            .iter()
+            .any(|request| request.request.user_id != user_id)
+        {
+            return Err(MemoryError::Configuration {
+                message: "all transaction requests must have the same user_id".to_string(),
+            });
+        }
+        let payload = requests
+            .into_iter()
+            .map(|request| serde_json::to_value(request).map_err(config_error))
+            .collect::<Result<Vec<_>, MemoryError>>()?;
+        let (status, body) = self
+            .request_async(
+                "POST",
+                "/add/batch?wait_for_visibility=true",
+                Some(&Value::Array(payload)),
+                true,
+            )
+            .await?;
+        ensure_success(status, &body)?;
+        decode(body)
+    }
+
     pub fn update(
         &self,
         memory_id: &str,

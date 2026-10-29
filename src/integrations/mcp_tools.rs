@@ -1892,7 +1892,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn memory_tool_definitions_expose_add_and_get() {
         let defs = memory_tool_definitions();
         let names: Vec<_> = defs.iter().map(|t| t.name.as_str()).collect();

@@ -103,8 +103,9 @@ own reference, so closing the client does not release the resident while a
 session is still open. Call `close()` when a handle no longer needs to keep the
 resident warm; it is idempotent and later calls remain usable with
 request-scoped leases. Dropping the last client or session also releases the
-lease. The resident shuts down after its idle timeout, and a later request
-starts it again. Remote clients need no local lease.
+lease. Once all local client and provider adapter leases close, the resident
+flushes pending writes and shuts down. A later request starts it again. Remote
+clients need no local lease.
 
 ```js
 const session = memory.session('alice', savedSessionId)

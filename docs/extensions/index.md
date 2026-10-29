@@ -39,3 +39,7 @@ See [Board and Post](board-post.md), [FlowRun](flowrun.md), or the
 [security guide](security.md) explains the trust boundary for compiled-in
 extensions. The separate [experimental Wasm worker](runtime.md) is not an
 extension loader and is not used to activate extensions.
+
+Flowboard now has a separate stdio MCP process in its own repository. It uses
+`membrick::Memory` to reach the resident. Board/Post REST routes still use the
+compiled-in host path. See the [independent Flowboard design](independent-flowboard.md).

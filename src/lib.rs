@@ -144,8 +144,8 @@ pub use crate::memory_api::{
     UpdateRequest,
 };
 pub use crate::memory_api::{
-    AddResponse, ListResponse, MemoryRecord, Message, SearchMemory, SearchResponse,
-    StagedAddResponse,
+    AddRequestWithMetadata, AddResponse, ListResponse, MemoryRecord, Message, SearchMemory,
+    SearchResponse, StagedAddResponse,
 };
 #[deprecated(note = "use MemoryError")]
 #[allow(deprecated)]
@@ -170,8 +170,8 @@ pub mod agent {
 /// Project applications should use [`Memory`] so the resident remains the sole writer.
 pub mod embedded {
     pub use crate::memory_api::{
-        AddRequest, DeleteRequest, GetRequest, ListRequest, MemoryService, SearchRequest,
-        SupersedeRequest, UpdateRequest,
+        AddRequest, AddRequestWithMetadata, DeleteRequest, GetRequest, ListRequest, MemoryService,
+        SearchRequest, SupersedeRequest, UpdateRequest,
     };
     pub use crate::pipeline::PipelineOptions;
 }
@@ -477,6 +477,17 @@ impl PySdkMemoryClient {
             })
             .map_err(|error| memory_client_error(py, error))?;
         json_to_python(py, &response)
+    }
+
+    fn add_transaction(&self, py: Python<'_>, requests: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let requests = python_value_to_json(py, requests)?;
+        let requests = serde_json::from_value::<Vec<memory_api::AddRequestWithMetadata>>(requests)
+            .map_err(json_error)?;
+        let client = self.client.clone();
+        let responses = py
+            .detach(move || client.add_transaction(requests))
+            .map_err(|error| memory_client_error(py, error))?;
+        json_to_python(py, &responses)
     }
 
     #[pyo3(signature = (query, user_id, top_k=10, session_id=None, filters=None, scope=None, reference_date=None, options=None))]

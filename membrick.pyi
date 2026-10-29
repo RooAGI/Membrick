@@ -53,6 +53,10 @@ class Memory:
         wait_for_visibility: bool = ...,
     ) -> Dict[str, Any]: ...
 
+    def add_transaction(
+        self, requests: Sequence[Mapping[str, Any]]
+    ) -> List[Dict[str, Any]]: ...
+
     def search(
         self,
         query: str,

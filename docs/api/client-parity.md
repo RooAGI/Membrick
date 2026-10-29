@@ -13,6 +13,7 @@ APIs. They are not aliases for the application's `Memory` operations.
 | Operation | REST | Rust `Memory` | Python `Memory` | Node.js `Memory` |
 | --- | --- | --- | --- | --- |
 | Add | `POST /v1/memories` | `add(messages, user_id, AddOptions)` | `add(messages, user_id, request_id=None, session_id=None, wait_for_visibility=False)` | `add(messages, userId, options?)` |
+| Atomic add transaction | `POST /add/batch?wait_for_visibility=true` | `add_transaction(requests)` | `add_transaction(requests)` | `addTransaction(requests)` |
 | Search | `POST /v1/memories/search` | `search(query, user_id, SearchOptions)` | `search(query, user_id, top_k=10, ...)` | `search(query, userId, options?)` |
 | Get | `GET /v1/memories/{id}?user_id=...` | `get(id, user_id, GetOptions)` | `get(memory_id, user_id, include_inactive=False)` | `get(memoryId, userId, includeInactive?)` |
 | List | `GET /v1/memories?user_id=...` | `list(user_id, ListOptions)` | `list(user_id, session_id=None, limit=100, cursor=None, include_inactive=False)` | `list(userId, options?)` |

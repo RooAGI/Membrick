@@ -70,7 +70,6 @@ fn initialize_default_settings(workspace: &Path) -> anyhow::Result<PathBuf> {
 bind = \"127.0.0.1:8080\"\n\
 resident_http_bind = \"127.0.0.1:{port}\"\n\
 resident_http_auto_port = true\n\
-resident_idle_timeout_seconds = 60\n\
 dashboard_url = \"http://127.0.0.1:{port}/dashboard\"\n"
     );
     let temporary = settings_temporary_path(&state)?;

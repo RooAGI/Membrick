@@ -107,8 +107,19 @@ pub fn install_local_config(root: &Path, config_path: Option<&Path>) -> Result<P
         }
     }
     // The manager now lives at user scope under the same name as the project
-    // entry, which Claude's local scope overrides inside this project.
-    migrate_legacy_manager_entry(&mut config, &executable);
+    // entry, which Claude's local scope overrides inside this project. Refresh
+    // its executable path to match this project install when it already exists.
+    if config
+        .mcp_servers
+        .get(SERVER_NAME)
+        .is_some_and(is_manager_entry)
+    {
+        config
+            .mcp_servers
+            .insert(SERVER_NAME.to_string(), manager_entry(&executable));
+    } else {
+        migrate_legacy_manager_entry(&mut config, &executable);
+    }
 
     let projects = config
         .extra
@@ -586,6 +597,8 @@ pub fn run_status_line() -> Result<()> {
 }
 
 pub fn run_server(root: &Path, options: ClaudeCodeServerOptions<'_>) -> Result<()> {
+    let _resident_lease =
+        crate::integrations::provider_lifecycle::ResidentConnectionLease::start(root, "claude")?;
     crate::local_ipc::ensure_provider_resident(root, "claude")?;
     tracing::debug!("MCP server starting");
     let mcp = ClaudeMcp {
@@ -599,7 +612,7 @@ pub fn run_server(root: &Path, options: ClaudeCodeServerOptions<'_>) -> Result<(
         workspace_watcher: None,
         store: Mutex::new(None),
     };
-    mcp.serve(&crate::integrations::provider_lifecycle::ResidentKeepalive::start(root, "claude"))
+    mcp.serve()
 }
 
 impl ClaudeMcp {
@@ -663,10 +676,7 @@ impl ClaudeMcp {
         Ok(store)
     }
 
-    fn serve(
-        self,
-        keepalive: &crate::integrations::provider_lifecycle::ResidentKeepalive,
-    ) -> Result<()> {
+    fn serve(self) -> Result<()> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
@@ -675,12 +685,7 @@ impl ClaudeMcp {
         mcp_transport::serve_requests(
             &mut reader,
             &mut writer,
-            |request| {
-                if request.method == "tools/call" {
-                    keepalive.tool_call(None);
-                }
-                self.handle_request(request)
-            },
+            |request| self.handle_request(request),
             |method| tracing::debug!(method, "MCP request received"),
             |method, error| tracing::debug!(method, "MCP request failed: {error:#}"),
             || tracing::debug!("MCP response written"),
@@ -1575,6 +1580,48 @@ mod tests {
                 .unwrap(),
             vec!["--claude-code-serve", root.to_string_lossy().as_ref()]
         );
+    }
+
+    #[test]
+    fn project_install_refreshes_existing_global_manager_executable_path() {
+        let config_path = temp_path("claude-install-refreshes-manager-path");
+        let root = temp_dir("claude-install-refreshes-manager-root");
+        fs::write(
+            &config_path,
+            json!({"mcpServers": {
+                "membrick": {
+                    "command": "old-membrick",
+                    "args": ["--manager-serve"],
+                    "custom": "keep"
+                },
+                "other": {"command": "other-tool"}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        install_local_config(&root, Some(&config_path)).unwrap();
+        let value: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let executable = env::current_exe().unwrap().to_string_lossy().into_owned();
+        let project_key = root.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert_eq!(value["mcpServers"][SERVER_NAME]["command"], executable);
+        assert_eq!(
+            value["mcpServers"][SERVER_NAME]["args"],
+            json!(["--manager-serve"])
+        );
+        assert_eq!(value["mcpServers"][SERVER_NAME]["custom"], "keep");
+        assert_eq!(value["mcpServers"]["other"]["command"], "other-tool");
+        assert_eq!(
+            value["projects"][&project_key]["mcpServers"][SERVER_NAME]["command"],
+            executable
+        );
+        assert_eq!(
+            value["projects"][&project_key]["mcpServers"][SERVER_NAME]["args"],
+            json!(["--claude-code-serve", project_key])
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

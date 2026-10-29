@@ -110,16 +110,10 @@ test('client and session leases keep resident warm, then close allows restart', 
   t.after(() => rm(directory, { recursive: true, force: true }))
   const client = Memory.init({ path: directory })
   t.after(() => client.close())
-  const settingsPath = path.join(directory, '.membrick', 'server.toml')
-  const settings = await readFile(settingsPath, 'utf8')
-  const shortTimeout = /^resident_idle_timeout_seconds\s*=.*$/m.test(settings)
-    ? settings.replace(/^resident_idle_timeout_seconds\s*=.*$/m, 'resident_idle_timeout_seconds = 5')
-    : `resident_idle_timeout_seconds = 5\n${settings}`
-  await writeFile(settingsPath, shortTimeout)
   const logPath = path.join(directory, '.membrick', 'runtime', 'resident.log')
 
   const first = await client.add(
-    [{ role: 'user', content: 'Before the managed resident idles out.' }],
+    [{ role: 'user', content: 'Before the managed resident connection closes.' }],
     'sdk-idle-user',
     { requestId: 'node-idle-before' },
   )
@@ -140,7 +134,7 @@ test('client and session leases keep resident warm, then close allows restart', 
   )
   session.close()
   const firstShutdownLog = await waitForResidentShutdowns(logPath, 1)
-  assert.match(firstShutdownLog, /resident idle timeout elapsed; shutting down/)
+  assert.match(firstShutdownLog, /no client connections remain; shutting down resident/)
 
   const reopened = new Memory({ path: directory })
   t.after(() => reopened.close())

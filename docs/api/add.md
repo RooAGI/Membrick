@@ -174,6 +174,53 @@ curl -X POST "http://127.0.0.1:8080/v1/memories?wait_for_visibility=true" \
     )?;
     ```
 
-Rust, Python, and Node.js clients also expose batch-add methods. The REST API
-accepts one add request per call; see the [language guides](../index.md#related-references)
-for SDK details.
+## Atomic add transaction
+
+`POST /add/batch?wait_for_visibility=true` adds up to 128 requests as one
+durable transaction. The resident validates the full batch and writes it as
+one journal entry before applying any request, then returns after the batch is
+checkpointed and searchable. Every request in one transaction must use the
+same `user_id`. Each request must have a stable `request_id`; retry the same
+batch with the same IDs and contents if the response is lost.
+
+The clients expose this as `add_transaction` in Python,
+`addTransaction` in Node.js, and `add_transaction` / `add_transaction_async`
+in Rust. Each accepts an array of request objects with `request_id`,
+`user_id`, `session_id`, `messages`, and optional `metadata`, and returns the
+normal add receipts. This transaction operation covers adds. It does not
+combine adds with updates or deletes and does not provide expected-version
+checks for records read earlier.
+
+```python
+receipts = memory.add_transaction([
+    {
+        "request_id": "board-1",
+        "user_id": "workspace-1",
+        "session_id": "board-1",
+        "messages": [{"role": "user", "content": "{\"kind\":\"board\"}"}],
+    },
+    {
+        "request_id": "post-1",
+        "user_id": "workspace-1",
+        "session_id": "board-1",
+        "messages": [{"role": "user", "content": "{\"kind\":\"post\"}"}],
+    },
+])
+```
+
+```js
+const receipts = await memory.addTransaction([
+  {
+    request_id: 'board-1',
+    user_id: 'workspace-1',
+    session_id: 'board-1',
+    messages: [{ role: 'user', content: '{"kind":"board"}' }],
+  },
+  {
+    request_id: 'post-1',
+    user_id: 'workspace-1',
+    session_id: 'board-1',
+    messages: [{ role: 'user', content: '{"kind":"post"}' }],
+  },
+])
+```

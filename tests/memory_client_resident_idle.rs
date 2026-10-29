@@ -1,5 +1,5 @@
 use membrick::{AddOptions, Memory, MemoryOptions, Message};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn project_root() -> PathBuf {
@@ -8,25 +8,6 @@ fn project_root() -> PathBuf {
         .expect("system clock should be after the Unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("membrick-sdk-idle-{}-{nonce}", std::process::id()))
-}
-
-fn set_short_idle_timeout(root: &Path) {
-    let settings = root.join(".membrick/server.toml");
-    let current = std::fs::read_to_string(&settings).expect("project settings should exist");
-    let rest = current
-        .lines()
-        .filter(|line| {
-            !line
-                .trim_start()
-                .starts_with("resident_idle_timeout_seconds")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    std::fs::write(
-        settings,
-        format!("resident_idle_timeout_seconds = 5\n{rest}\n"),
-    )
-    .expect("the test project should use the minimum idle timeout");
 }
 
 fn wait_for_shutdowns(root: &Path, expected: usize) -> String {
@@ -70,11 +51,10 @@ fn client_and_session_leases_keep_resident_warm_then_release_and_restart() {
         },
     )
     .expect("SDK should initialize the test project");
-    set_short_idle_timeout(&root);
 
     let first = client
         .add(
-            vec![message("before the managed resident idles out")],
+            vec![message("before the managed resident connection closes")],
             "sdk-idle-user",
             AddOptions {
                 request_id: Some("sdk-idle-before".into()),
@@ -111,7 +91,7 @@ fn client_and_session_leases_keep_resident_warm_then_release_and_restart() {
 
     session.close();
     let first_shutdown_log = wait_for_shutdowns(&root, 1);
-    assert!(first_shutdown_log.contains("resident idle timeout elapsed; shutting down"));
+    assert!(first_shutdown_log.contains("no client connections remain; shutting down resident"));
 
     let reopened = Memory::with_options(
         &root,

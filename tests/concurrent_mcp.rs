@@ -20,18 +20,10 @@ fn short_temp_root() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
-/// Register `root` as an installed project whose resident stops 5 s, the
-/// shortest allowed idle timeout, after its last provider session ends.
+/// Register `root` as an installed project.
 fn install_test_project(root: &std::path::Path) {
     membrick::state_paths::record_install_settings(root)
         .expect("temporary project should be registered as installed");
-    let settings = root.join(".membrick/server.toml");
-    let text = fs::read_to_string(&settings).expect("install should write server.toml");
-    fs::write(
-        &settings,
-        format!("resident_idle_timeout_seconds = 5\n{text}"),
-    )
-    .expect("test idle timeout should be written");
 }
 
 fn send_request(stdin: &mut ChildStdin, request: &Value) {

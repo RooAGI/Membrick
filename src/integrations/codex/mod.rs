@@ -136,13 +136,19 @@ pub fn install_user_config(root: &Path, config_path: Option<&Path>) -> Result<Pa
         .as_table_mut()
         .context("Codex config 'mcp_servers' must be a table")?;
     mcp_servers.remove("lint-ai");
-    // Global setup's manager entry uses the same name, and the project config
-    // overrides it inside the project. Replacing it here would leave every
-    // other folder without the manager.
-    if !mcp_servers
+    // Keep an existing global manager, but refresh its executable path so it
+    // matches the binary installing this project. The project config below
+    // overrides the global entry inside this repository.
+    if mcp_servers
         .get(SERVER_NAME)
         .is_some_and(codex_entry_runs_manager)
     {
+        let entry = mcp_servers
+            .get_mut(SERVER_NAME)
+            .and_then(TomlValue::as_table_mut)
+            .context("Codex manager entry must be a table")?;
+        entry.insert("command".to_string(), TomlValue::String(executable));
+    } else {
         let mut entry = TomlMap::new();
         entry.insert("command".to_string(), TomlValue::String(executable));
         entry.insert(
@@ -528,11 +534,12 @@ pub fn install_hook_settings(root: &Path, settings_path: Option<&Path>) -> Resul
 }
 
 pub fn run_server(root: &Path, options: CodexServerOptions<'_>) -> Result<()> {
+    let lifecycle = lifecycle::AdapterLifecycle::new(root)?;
     crate::local_ipc::ensure_provider_resident(root, "codex")?;
     tracing::debug!("MCP server starting");
     let mcp = CodexMcp {
         backend: mcp_tools::MemoryBackend::Resident,
-        lifecycle: lifecycle::AdapterLifecycle::new(root),
+        lifecycle,
         root: root.to_path_buf(),
         max_bytes: options.max_bytes,
         max_files: options.max_files,
@@ -658,8 +665,6 @@ impl CodexMcp {
                     if let Err(error) = self.lifecycle.bind(session) {
                         tracing::warn!("could not bind Codex adapter session: {error:#}");
                     }
-                } else {
-                    self.lifecycle.tool_call();
                 }
                 let tool = params
                     .get("name")
@@ -1297,6 +1302,38 @@ mod tests {
         assert_eq!(manager["enabled"].as_bool(), Some(true));
         assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn project_install_refreshes_global_manager_executable_path() {
+        let path = temp_path("codex-install-refreshes-manager-path");
+        let root = temp_dir("codex-install-refreshes-manager-root");
+        fs::write(
+            &path,
+            "[mcp_servers.membrick]\ncommand = 'old-membrick'\nargs = ['--manager-serve']\nenabled = true\ncustom = 'keep'\n",
+        )
+        .unwrap();
+
+        install_user_config(&root, Some(&path)).unwrap();
+        let config: TomlValue = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let manager = &config["mcp_servers"][SERVER_NAME];
+        assert_eq!(
+            manager["command"].as_str(),
+            Some(env::current_exe().unwrap().to_string_lossy().as_ref())
+        );
+        assert_eq!(manager["args"][0].as_str(), Some("--manager-serve"));
+        assert_eq!(manager["enabled"].as_bool(), Some(true));
+        assert_eq!(manager["custom"].as_str(), Some("keep"));
+
+        let project_config = install_project_config(&root).unwrap();
+        let project: TomlValue = fs::read_to_string(project_config).unwrap().parse().unwrap();
+        assert_eq!(
+            project["mcp_servers"][SERVER_NAME]["command"].as_str(),
+            Some(env::current_exe().unwrap().to_string_lossy().as_ref())
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_mcp(root: PathBuf, documents: Vec<SourceDocument>) -> CodexMcp {

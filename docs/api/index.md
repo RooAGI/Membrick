@@ -37,8 +37,9 @@ directory. Rust applications that deliberately embed Membrick can use
 Project clients hold a resident lease while a client or session handle is open.
 `close()` releases only that handle's warm lease and does not disable later
 calls; each project request still gets a request-scoped lease. Dropping the
-last handle releases the lease automatically. The resident shuts down after
-its idle timeout and starts again on a later request. Remote clients do not
+last handle releases the lease automatically. When all local client and
+provider adapter leases close, the resident shuts down and starts again on a
+later request. Remote clients do not
 hold local leases. After a client process crashes, the OS releases its lock
 and the resident recovers the stale lease before shutting down.
 See [HTTP server setup](../server.md).
@@ -152,7 +153,7 @@ response limits, and status codes.
 
 | Capability | Rust | Python | Node.js | HTTP |
 | --- | --- | --- | --- | --- |
-| Add batch | Yes | `add_batch` | `addBatch` | No batch endpoint |
+| Atomic add transaction | `add_transaction` | `add_transaction` | `addTransaction` | `POST /add/batch` |
 | Search `filters`, `scope` | Yes | Yes | Yes | Yes |
 | Search `reference_date` and `options` | Yes | Yes | Yes | Yes |
 | Supersede / expire | `MemoryService` | No | No | No |

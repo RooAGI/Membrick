@@ -144,6 +144,10 @@ pub fn run_server_for(
     provider_display_name: &'static str,
     options: GeminiCliServerOptions<'_>,
 ) -> Result<()> {
+    let _resident_lease = crate::integrations::provider_lifecycle::ResidentConnectionLease::start(
+        root,
+        provider_label,
+    )?;
     crate::local_ipc::ensure_provider_resident(root, provider_label)?;
     tracing::debug!("MCP server starting");
     let server = GeminiMcp {
@@ -160,9 +164,7 @@ pub fn run_server_for(
         ignore_paths: options.ignore_paths.to_vec(),
         workspace_watcher: None,
     };
-    server.serve(
-        &crate::integrations::provider_lifecycle::ResidentKeepalive::start(root, provider.as_str()),
-    )
+    server.serve()
 }
 
 /// Build a [`GeminiMcp`] handle for adapter unit tests without starting the
@@ -256,10 +258,7 @@ impl GeminiMcp {
         Ok(store)
     }
 
-    fn serve(
-        &self,
-        keepalive: &crate::integrations::provider_lifecycle::ResidentKeepalive,
-    ) -> Result<()> {
+    fn serve(&self) -> Result<()> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
@@ -267,12 +266,7 @@ impl GeminiMcp {
         mcp_transport::serve_requests(
             &mut reader,
             &mut writer,
-            |request| {
-                if request.method == "tools/call" {
-                    keepalive.tool_call(None);
-                }
-                self.handle_request(request)
-            },
+            |request| self.handle_request(request),
             |_| {},
             |_, _| {},
             || {},

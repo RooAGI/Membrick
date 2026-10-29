@@ -132,7 +132,6 @@ struct ServerSettings {
     bind: Option<String>,
     resident_http_bind: Option<String>,
     resident_http_auto_port: Option<bool>,
-    resident_idle_timeout_seconds: Option<u64>,
     index: Option<PathBuf>,
     project_root: Option<PathBuf>,
     server_token: Option<String>,
@@ -779,12 +778,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let settings = load_server_settings(&settings_file)?;
     let resident_http_bind = settings.resident_http_bind.clone();
     let resident_http_auto_port = settings.resident_http_auto_port.unwrap_or(false);
-    let resident_idle_timeout = std::time::Duration::from_secs(
-        settings
-            .resident_idle_timeout_seconds
-            .unwrap_or(60)
-            .clamp(5, 3600),
-    );
     if !bind_was_set {
         if let Some(bind) = settings.bind {
             args.bind = bind;
@@ -873,7 +866,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         bind = %args.bind,
         resident_http_bind = ?resident_http_bind,
         resident_http_auto_port,
-        resident_idle_timeout_seconds = resident_idle_timeout.as_secs(),
         index = ?args.index,
         tenant_id = ?args.tenant_id,
         adaptive_segment_max_n = ?args.adaptive_segment_max_n,
@@ -1084,7 +1076,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     if args.resident_server {
         let root = state.project_root.clone();
         let managed = args.managed_resident;
-        let idle_timeout = resident_idle_timeout;
         let (log_level, log_level_source) = crate::logging::active_level()
             .map_or(("unset".to_owned(), "none"), |(level, source)| {
                 (level.to_string(), source)
@@ -1098,7 +1089,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             "resident starting"
         );
         let shutdown = async move {
-            crate::local_ipc::resident_shutdown(&root, managed, idle_timeout, shutdown_signal())
+            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal())
                 .await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(

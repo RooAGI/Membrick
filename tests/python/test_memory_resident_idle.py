@@ -18,13 +18,6 @@ class TestPythonResidentLifecycle(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="membrick-python-resident-") as temporary:
             root = Path(temporary)
             client = membrick.Memory.init(path=str(root))
-            settings = root / ".membrick" / "server.toml"
-            lines = [
-                line
-                for line in settings.read_text().splitlines()
-                if not line.lstrip().startswith("resident_idle_timeout_seconds")
-            ]
-            settings.write_text("resident_idle_timeout_seconds = 5\n" + "\n".join(lines) + "\n")
             log = root / ".membrick" / "runtime" / "resident.log"
 
             def add(request_id, content):
@@ -69,7 +62,7 @@ class TestPythonResidentLifecycle(unittest.TestCase):
             )
             session.close()
             first_log = wait_for_shutdowns(1)
-            self.assertIn("resident idle timeout elapsed; shutting down", first_log)
+            self.assertIn("no client connections remain; shutting down resident", first_log)
 
             client = membrick.Memory(path=str(root))
             add("python-resident-after-idle", "A new Python client restarts the resident.")

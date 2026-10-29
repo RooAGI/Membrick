@@ -111,20 +111,19 @@ pub(crate) fn ensure_provider_resident(root: &Path, provider: &str) -> Result<()
 }
 
 /// Completes when the resident should stop: on `signal`, or for a managed
-/// resident once no client request holds a lease through the idle timeout. Returns the lifecycle
-/// lock when one is held, so no new client registers until this resident has
-/// flushed and exited.
+/// resident once no client request or connection holds a lease. Returns the
+/// lifecycle lock when one is held, so no new client registers until this
+/// resident has flushed and exited.
 pub(crate) async fn resident_shutdown(
     root: &Path,
     managed: bool,
-    idle_timeout: Duration,
     signal: impl std::future::Future<Output = ()>,
 ) -> Option<fs::File> {
     if managed {
         tokio::select! {
             _ = signal => {}
-            gate = wait_for_no_provider_sessions(root, idle_timeout) => {
-                tracing::info!(idle_timeout_seconds = idle_timeout.as_secs(), "resident idle timeout elapsed; shutting down");
+            gate = wait_for_no_provider_sessions(root) => {
+                tracing::info!("no client connections remain; shutting down resident");
                 return Some(gate);
             }
         }
@@ -153,40 +152,35 @@ pub(crate) async fn resident_shutdown(
     }
 }
 
-/// Wait until every client request and provider session has released its
-/// lease for the idle timeout. Crashed clients release the OS lock; leftover
-/// lease files are removed here.
-pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) -> fs::File {
+/// Wait until every client request and provider connection has released its
+/// lease. Crashed clients release the OS lock; leftover lease files are
+/// removed here.
+pub(crate) async fn wait_for_no_provider_sessions(root: &Path) -> fs::File {
     let directory = root.join(".membrick/runtime/provider-leases");
-    let mut empty_since = None;
     loop {
         match provider_session_is_active(&directory) {
-            Ok(true) => empty_since = None,
+            Ok(true) => {}
             Ok(false) => {
-                let since = empty_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= grace {
-                    match open_lifecycle_gate(root) {
-                        Ok(gate) => match gate.try_lock() {
+                match open_lifecycle_gate(root) {
+                    Ok(gate) => {
+                        match gate.try_lock() {
                             Ok(()) => match remove_released_provider_leases(&directory)
                                 .and_then(|()| provider_session_is_active(&directory))
                             {
                                 Ok(false) => return gate,
-                                Ok(true) => empty_since = None,
+                                Ok(true) => {}
                                 Err(error) => {
                                     tracing::warn!("provider lease recheck failed; keeping resident alive: {error:#}");
-                                    empty_since = None;
                                 }
                             },
-                            Err(fs::TryLockError::WouldBlock) => empty_since = None,
+                            Err(fs::TryLockError::WouldBlock) => {}
                             Err(fs::TryLockError::Error(error)) => {
                                 tracing::warn!("provider lifecycle lock failed; keeping resident alive: {error}");
-                                empty_since = None;
                             }
-                        },
-                        Err(error) => {
-                            tracing::warn!("provider lifecycle lock unavailable; keeping resident alive: {error:#}");
-                            empty_since = None;
                         }
+                    }
+                    Err(error) => {
+                        tracing::warn!("provider lifecycle lock unavailable; keeping resident alive: {error:#}");
                     }
                 }
             }
@@ -194,7 +188,6 @@ pub(crate) async fn wait_for_no_provider_sessions(root: &Path, grace: Duration) 
                 // A scan error must never stop a resident while a provider
                 // may still be connected.
                 tracing::warn!("provider lease scan failed; keeping resident alive: {error:#}");
-                empty_since = None;
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;

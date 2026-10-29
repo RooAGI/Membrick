@@ -94,10 +94,19 @@ export interface AddResponse {
   adjudication?: unknown
 }
 
+export interface AddTransactionRequest {
+  request_id: string
+  user_id: string
+  session_id: string
+  messages: Message[]
+  metadata?: Record<string, unknown>
+}
+
 export declare class Memory {
   static init(options: MemoryOptions): Memory
   constructor(options: MemoryOptions)
   add(messages: Message[], userId: string, options?: AddOptions): Promise<AddResponse>
+  addTransaction(requests: AddTransactionRequest[]): Promise<AddResponse[]>
   search(query: string, userId: string, options?: SearchOptions): Promise<SearchMemory[]>
   get(memoryId: string, userId: string, includeInactive?: boolean): Promise<MemoryRecord | null>
   list(userId: string, options?: ListOptions): Promise<ListResponse>

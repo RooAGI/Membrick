@@ -4,10 +4,10 @@
 //! cannot distinguish a delayed end from an earlier resume of the same thread.
 //! Do not infer an incarnation from a PID or a timeout.
 //!
-//! The resident lease is separate: Codex keeps threads open across app and CLI
-//! exits, so it follows thread activity through the shared keepalive rather
-//! than waiting for a SessionEnd that may never arrive.
-use crate::integrations::provider_lifecycle::{self, ResidentKeepalive, SessionToken};
+//! The resident lease follows the MCP adapter connection. Codex may retain
+//! that connection in its daemon after the UI exits, so SessionEnd also stops
+//! the adapter after its last owning conversation ends.
+use crate::integrations::provider_lifecycle::{self, ResidentConnectionLease, SessionToken};
 use anyhow::Result;
 use std::path::Path;
 
@@ -15,28 +15,23 @@ const PROVIDER: &str = "codex";
 
 pub(super) struct AdapterLifecycle {
     lifecycle: provider_lifecycle::AdapterLifecycle,
-    keepalive: ResidentKeepalive,
+    resident_lease: ResidentConnectionLease,
 }
 impl AdapterLifecycle {
-    pub(super) fn new(root: &Path) -> Self {
-        Self {
+    pub(super) fn new(root: &Path) -> Result<Self> {
+        Ok(Self {
             lifecycle: provider_lifecycle::AdapterLifecycle::new(root),
-            keepalive: ResidentKeepalive::start(root, PROVIDER),
-        }
+            resident_lease: ResidentConnectionLease::start(root, PROVIDER)?,
+        })
     }
     pub(super) fn bind(&self, session: &str) -> Result<()> {
         self.lifecycle.bind(&token(session)?)?;
-        self.keepalive.tool_call(Some(session));
         Ok(())
-    }
-    /// A tool call that names no thread.
-    pub(super) fn tool_call(&self) {
-        self.keepalive.tool_call(None);
     }
     pub(super) fn stopped(&self) -> bool {
         let stopped = self.lifecycle.stopped();
         if stopped {
-            self.keepalive.end();
+            self.resident_lease.end();
         }
         stopped
     }

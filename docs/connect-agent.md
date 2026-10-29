@@ -139,15 +139,19 @@ provider guide for connection-removal details.
 
 ## Migrate from Lint-AI
 
-Existing Lint-AI users can install Membrick and update one agent connection in
-one step. From the project directory, run:
+Existing Lint-AI users can update one agent connection with an existing
+Membrick executable. The migration script does not install or download a
+Membrick binary. If Membrick is not installed yet, install it separately with
+the [installation instructions](quickstart.md#install-membrick), then run this
+from the project directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/RooAGI/Membrick/main/scripts/migrate-lint-ai.sh | sh -s -- --agent codex --project .
 ```
 
 Replace `codex` with `claude`, `gemini`, or `agy` for another supported agent.
-The migration installs Membrick, updates that agent's configuration while
+The script uses `membrick` from `PATH`; pass `--membrick-bin /path/to/membrick`
+if it is installed elsewhere. It updates that agent's configuration while
 preserving unrelated settings, and verifies the MCP connection. During agent
 setup, existing `.lint-ai` project state is moved to `.membrick` with its
 contents preserved. Membrick also checks for legacy state when it first accesses

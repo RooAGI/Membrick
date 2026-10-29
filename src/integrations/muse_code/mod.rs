@@ -294,6 +294,8 @@ pub fn install_memory_policy(root: &Path) -> Result<PathBuf> {
 }
 
 pub fn run_server(root: &Path, options: MuseServerOptions<'_>) -> Result<()> {
+    let _resident_lease =
+        crate::integrations::provider_lifecycle::ResidentConnectionLease::start(root, "muse")?;
     crate::local_ipc::ensure_provider_resident(root, "muse")?;
     tracing::debug!("MCP server starting");
     let mcp = MuseMcp {
@@ -307,7 +309,7 @@ pub fn run_server(root: &Path, options: MuseServerOptions<'_>) -> Result<()> {
         workspace_watcher: None,
         store: Mutex::new(None),
     };
-    mcp.serve(&crate::integrations::provider_lifecycle::ResidentKeepalive::start(root, "muse"))
+    mcp.serve()
 }
 
 impl MuseMcp {
@@ -371,10 +373,7 @@ impl MuseMcp {
         Ok(store)
     }
 
-    fn serve(
-        self,
-        keepalive: &crate::integrations::provider_lifecycle::ResidentKeepalive,
-    ) -> Result<()> {
+    fn serve(self) -> Result<()> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
@@ -383,12 +382,7 @@ impl MuseMcp {
         mcp_transport::serve_requests(
             &mut reader,
             &mut writer,
-            |request| {
-                if request.method == "tools/call" {
-                    keepalive.tool_call(None);
-                }
-                self.handle_request(request)
-            },
+            |request| self.handle_request(request),
             |method| tracing::debug!(method, "MCP request received"),
             |method, error| tracing::debug!(method, "MCP request failed: {error:#}"),
             || tracing::debug!("MCP response written"),

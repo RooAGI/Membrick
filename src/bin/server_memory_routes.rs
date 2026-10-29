@@ -108,6 +108,17 @@ pub(super) async fn add_batch(
         )
             .into_response();
     }
+    let transaction_user = requests[0].user_id.as_str();
+    if requests
+        .iter()
+        .any(|request| request.user_id != transaction_user)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"detail":"all transaction requests must have the same user_id"})),
+        )
+            .into_response();
+    }
     for request in &requests {
         let value = match serde_json::to_value(request) {
             Ok(value) => value,

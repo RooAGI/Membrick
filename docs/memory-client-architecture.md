@@ -46,8 +46,8 @@ An open project client or session holds a lease that keeps its resident warm.
 The lease lasts for the handle's lifetime, not just for one request. Call
 `close()` to release it explicitly; dropping the last handle releases it
 automatically. Remote HTTP clients do not hold a project-resident lease. After
-all local leases end, the managed resident can shut down after its configured
-idle timeout. A later project request starts it again.
+all local client and provider adapter leases end, the managed resident flushes
+pending writes and shuts down. A later project request starts it again.
 
 Errors distinguish a rejected operation, an uncertain outcome, an unavailable
 service, and invalid configuration. Treat uncertain writes as possibly

@@ -696,8 +696,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    #[test]
     fn shared_memory_lock_preserves_concurrent_provider_writes() {
         const WRITERS: usize = 6;
         let root = board_test_root("provider-memory-race");

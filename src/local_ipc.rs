@@ -15,7 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tower::ServiceExt;
 
 #[derive(Clone, Copy)]
@@ -768,12 +768,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(resident_shutdown(
-                &directory.0,
-                true,
-                Duration::from_secs(3),
-                async {},
-            ));
+            .block_on(resident_shutdown(&directory.0, true, async {}));
 
         assert!(
             gate.is_some(),
