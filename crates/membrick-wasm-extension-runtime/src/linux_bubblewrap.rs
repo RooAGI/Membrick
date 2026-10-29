@@ -137,13 +137,7 @@ impl BubblewrapSandbox {
             .arg("--membrick-sandbox-probe")
             .arg(host_secret.path().as_os_str())
             .arg(&self.worker)
-            .arg(
-                self.runtime_files
-                    .iter()
-                    .find(|file| file.target != self.worker)
-                    .map(|file| &file.target)
-                    .unwrap_or(&self.worker),
-            );
+            .arg(&self.worker);
         install_process_limits(&mut command, limits)?;
         let output = command
             .output()
@@ -173,8 +167,9 @@ struct SandboxProbe {
     exec_denied: bool,
     address_space_growth_denied: bool,
     root_read_only: bool,
-    library_read_only: bool,
+    bound_file_read_only: bool,
     extra_fds_closed: bool,
+    open_fds: Vec<String>,
     cpu_soft_seconds: u64,
     cpu_hard_seconds: u64,
     address_space_soft_bytes: u64,
@@ -217,7 +212,7 @@ impl SandboxProbe {
             || !self.exec_denied
             || !self.address_space_growth_denied
             || !self.root_read_only
-            || !self.library_read_only
+            || !self.bound_file_read_only
             || !self.extra_fds_closed
         {
             return Err(());
@@ -387,7 +382,7 @@ fn namespace_ids() -> Result<[String; 6], ()> {
 pub(super) fn worker_sandbox_probe(
     secret: &OsStr,
     worker: &OsStr,
-    library: &OsStr,
+    bound_file: &OsStr,
 ) -> Result<Vec<u8>, RuntimeError> {
     let secret_visible = Path::new(secret).exists();
     let passwd_visible = Path::new("/etc/passwd").exists();
@@ -403,15 +398,27 @@ pub(super) fn worker_sandbox_probe(
         std::process::id()
     ));
     let root_read_only = readonly_creation_denied(&root_probe);
-    let library_read_only = readonly_open_denied(Path::new(library));
-    let extra_fds_closed = fs::read_dir("/proc/self/fd")
+    // The worker binary is owned by the runner user. Testing this bind avoids
+    // treating a system library's ordinary DAC write denial as mount proof.
+    let bound_file_read_only = readonly_open_denied(Path::new(bound_file));
+    let open_fds = fs::read_dir("/proc/self/fd")
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
-                .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
-                .all(|fd| fd <= 3)
+                .filter_map(|entry| {
+                    let fd = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
+                    let target = fs::read_link(entry.path()).ok()?;
+                    Some(format!("{fd}:{}", target.display()))
+                })
+                .collect::<Vec<_>>()
         })
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let extra_fds_closed = open_fds.iter().all(|entry| {
+        entry
+            .split_once(':')
+            .and_then(|(fd, _)| fd.parse::<i32>().ok())
+            .is_some_and(|fd| fd <= 3)
+    });
 
     // SAFETY: this probe uses only direct syscalls and exits any unexpected
     // forked child immediately; the required seccomp filter should deny it.
@@ -501,8 +508,9 @@ pub(super) fn worker_sandbox_probe(
         "exec_denied": exec_denied,
         "address_space_growth_denied": address_space_growth_denied,
         "root_read_only": root_read_only,
-        "library_read_only": library_read_only,
+        "bound_file_read_only": bound_file_read_only,
         "extra_fds_closed": extra_fds_closed,
+        "open_fds": open_fds,
         "cpu_soft_seconds": cpu.rlim_cur,
         "cpu_hard_seconds": cpu.rlim_max,
         "address_space_soft_bytes": address_space.rlim_cur,
