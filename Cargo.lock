@@ -1902,6 +1902,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "uuid",
  "walkdir",
  "zstd 0.14.3",
 ]

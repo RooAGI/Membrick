@@ -2,26 +2,35 @@
 
 ## Installer telemetry
 
-The shell and PowerShell installers can report a successful installation to
-RooAGI's license service. Without an explicit sharing flag, interactive runs
-ask first with No as the default, while unattended runs send nothing. Passing
-`--share-telemetry` (shell) or `-ShareTelemetry` (PowerShell) opts in directly.
-Reporting is best-effort and cannot fail an installation.
+The shell and PowerShell installers report after a successful installation.
+Cargo, PyPI, and npm installs report on the first interactive CLI use because
+those package managers do not provide a reliable post-install hook. Without an
+explicit sharing flag, interactive runs ask first with No as the default, and
+unattended runs send nothing. Passing `--share-telemetry` (shell) or
+`-ShareTelemetry` (PowerShell) opts in directly. Reporting is best-effort and
+cannot fail installation or CLI use.
 
 With consent, the installer sends the Membrick version, operating system, CPU
-architecture, installer type, selected agent, install result, and timestamps.
-It creates a random install ID in the user's config directory to count repeat
-install events without an account. The payload excludes names, email addresses,
-project paths, and memory data. The service necessarily sees the request's
-network address; configure the service and proxy logs to avoid retaining it if
-that is not needed.
+architecture, installer type (`install_sh`, `install_ps1`, `cargo`,
+`cargo_build`, `pip`, or `npm`), selected agent, install result, and timestamp.
+Release binaries built in a Cargo `target/release` directory are reported as
+`cargo_build`; debug builds do not prompt. It creates a random
+install ID in the user's config directory to count repeat install events
+without an account. The payload excludes names, email addresses, project paths,
+and memory data. The service necessarily sees the request's network address;
+configure the service and proxy logs to avoid retaining it if that is not
+needed. Cargo/PyPI/npm installs that are never run interactively cannot be
+counted by this client.
 
 The receiver is `POST /v1/telemetry/install` on `license.rooagi.com`. The
 `license_server` service needs its `membrick_install_events` PostgreSQL table,
-created by `migrations/20261030_membrick_install_events.sql`, and the updated
-Axum service deployed with that schema. `queries/membrick-install-telemetry.sql`
-contains starter reports for install runs and distinct successful installs.
-Those reports count pseudonymous install IDs, not verified people or devices.
+created by `migrations/20261030_membrick_install_events.sql`, plus the
+`migrations/20261030_membrick_installers.sql` constraint update covering Cargo,
+Cargo release builds, pip, and npm sources. Deploy the updated Axum service with
+both migrations applied.
+`queries/membrick-install-telemetry.sql` contains starter reports for install
+runs and distinct successful installs. Those reports count pseudonymous install
+IDs, not verified people or devices.
 
 Membrick telemetry is local operational data used to understand query behavior
 and provider activity. It is separate from indexed memory and session archives.
