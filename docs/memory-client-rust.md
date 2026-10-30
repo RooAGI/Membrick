@@ -157,7 +157,6 @@ The optional `membrick::agent` API provides typed capture and workspace search
 operations for adapters. `AgentOperationContext` carries the provider,
 workspace, and host session identity. Capture acknowledgements let adapters
 advance transcript cursors only after durable acceptance. Host event parsing
-and response formatting remain in the adapters. Board/Post and FlowRun are
-provided by the [extensions](extensions/index.md); their read-only HTTP routes
-are documented as the [Board/Post](api/boards/index.md) and
-[FlowRun](api/flows/index.md) APIs.
+and response formatting remain in the adapters. The read-only routes for boards
+and flows are documented in the [Boards](api/boards/index.md) and
+[Flows](api/flows/index.md) API references.
