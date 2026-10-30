@@ -2,7 +2,8 @@ param(
     [ValidateSet('', 'codex', 'claude', 'gemini', 'agy')]
     [string]$Agent = '',
     [string]$Project = '.',
-    [string]$InstallDir = "$HOME\.local\bin"
+    [string]$InstallDir = "$HOME\.local\bin",
+    [switch]$ShareTelemetry
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,6 +14,49 @@ $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("membrick-" + [guid]::Ne
 $BinaryTemp = Join-Path $TempDir $Asset
 $ChecksumTemp = Join-Path $TempDir 'SHA256SUMS'
 $InstalledBinary = Join-Path $InstallDir 'membrick.exe'
+$InstallTelemetryUrl = 'https://license.rooagi.com/v1/telemetry/install'
+
+function Send-InstallTelemetry {
+    $share = [bool]$ShareTelemetry
+    if (-not $share -and [Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost') {
+        try {
+            $answer = Read-Host 'Share pseudonymous install details with RooAGI? This sends version, OS, CPU architecture, installer type, selected agent, and a random install ID. It excludes names, email, project paths, and memory data. [y/N]'
+            $share = $answer -match '^(y|yes)$'
+        } catch {
+            $share = $false
+        }
+    }
+    if (-not $share) { return }
+
+    try {
+        $configRoot = if ($env:APPDATA) { Join-Path $env:APPDATA 'Membrick' } else { Join-Path $HOME '.config\membrick' }
+        New-Item -ItemType Directory -Force -Path $configRoot | Out-Null
+        $idPath = Join-Path $configRoot 'install-id'
+        $installId = if (Test-Path -LiteralPath $idPath) { (Get-Content -Raw -LiteralPath $idPath).Trim() } else { '' }
+        if ($installId -notmatch '^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$') {
+            $installId = [guid]::NewGuid().ToString('N')
+            [IO.File]::WriteAllText($idPath, $installId, [Text.Encoding]::ASCII)
+        }
+        $versionTag = (($Version -split '\s+')[-1])
+        if ($versionTag -notmatch '^[A-Za-z0-9._+-]{1,32}$') { $versionTag = 'unknown' }
+        $event = @{
+            schema_version = 1
+            event_id = [guid]::NewGuid().ToString('N')
+            install_id = $installId
+            installed_at_unix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            version = $versionTag
+            os = 'windows'
+            architecture = 'x86_64'
+            installer = 'install_ps1'
+            agent = $(if ($Agent) { $Agent } else { 'none' })
+            outcome = 'success'
+            failure_stage = 'none'
+        } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Method Post -Uri $InstallTelemetryUrl -ContentType 'application/json' -Body $event -TimeoutSec 4 | Out-Null
+    } catch {
+        # Install telemetry is best-effort and must not change the installation result.
+    }
+}
 
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 try {
@@ -65,6 +109,8 @@ try {
     } else {
         Write-Host 'Membrick is installed. Re-run with -Agent codex|claude|gemini|agy to configure an agent.'
     }
+
+    Send-InstallTelemetry
 }
 finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $TempDir

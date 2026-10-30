@@ -6,6 +6,8 @@ BASE_URL="https://github.com/${REPO}/releases/latest/download"
 INSTALL_DIR="${MEMBRICK_INSTALL_DIR:-${HOME}/.local/bin}"
 AGENT=""
 PROJECT="."
+SHARE_INSTALL_TELEMETRY=0
+INSTALL_TELEMETRY_URL="https://license.rooagi.com/v1/telemetry/install"
 
 usage() {
   cat <<'EOF'
@@ -13,11 +15,13 @@ Install the latest official Membrick release and optionally configure an agent.
 
 Usage:
   install.sh [--agent codex|claude|gemini|agy] [--project PATH] [--install-dir DIR]
+            [--share-telemetry]
 
 Examples:
   install.sh
   install.sh --agent codex --project .
   install.sh --agent claude --project /path/to/project
+  install.sh --share-telemetry
 EOF
 }
 
@@ -37,6 +41,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo "--install-dir requires a value" >&2; exit 2; }
       INSTALL_DIR="$2"
       shift 2
+      ;;
+    --share-telemetry)
+      SHARE_INSTALL_TELEMETRY=1
+      shift
       ;;
     -h|--help)
       usage
@@ -162,3 +170,44 @@ if [ -n "$AGENT" ]; then
 else
   echo "Membrick is installed. To configure an agent, rerun with --agent codex|claude|gemini|agy."
 fi
+
+share_install_telemetry() {
+  if [ "$SHARE_INSTALL_TELEMETRY" -ne 1 ]; then
+    [ -r /dev/tty ] && [ -w /dev/tty ] || return 0
+    printf '\nShare pseudonymous install details with RooAGI? This sends the Membrick version, OS, CPU architecture, installer type, selected agent, and a random install ID. It does not send names, email, project paths, or memory data. [y/N] ' >/dev/tty
+    IFS= read -r answer </dev/tty || return 0
+    case "$answer" in y|Y|yes|YES|Yes) ;; *) return 0 ;; esac
+  fi
+
+  command -v curl >/dev/null 2>&1 || return 0
+  config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/membrick"
+  id_file="${config_dir}/install-id"
+  mkdir -p "$config_dir" 2>/dev/null || return 0
+  if [ ! -s "$id_file" ]; then
+    install_id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [ "${#install_id}" -eq 32 ] || return 0
+    (umask 077; printf '%s\n' "$install_id" > "$id_file") || return 0
+  else
+    install_id="$(cat "$id_file" 2>/dev/null || :)"
+    case "$install_id" in
+      *[!A-Fa-f0-9]*|'') install_id="" ;;
+    esac
+    [ "${#install_id}" -eq 32 ] || install_id=""
+    if [ -z "$install_id" ]; then
+      install_id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+      [ "${#install_id}" -eq 32 ] || return 0
+      (umask 077; printf '%s\n' "$install_id" > "$id_file") || return 0
+    fi
+  fi
+  event_id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  [ "${#event_id}" -eq 32 ] || return 0
+  version="$(printf '%s\n' "$VERSION" | sed -n '1s/.* //p')"
+  case "$version" in ''|*[!A-Za-z0-9._+-]*) version="unknown" ;; esac
+  case "$OS" in Darwin) os="macos" ;; Linux) os="linux" ;; *) os="other" ;; esac
+  case "$ARCH" in x86_64|amd64) architecture="x86_64" ;; arm64|aarch64) architecture="aarch64" ;; *) architecture="other" ;; esac
+  agent="${AGENT:-none}"
+  payload="{\"schema_version\":1,\"event_id\":\"${event_id}\",\"install_id\":\"${install_id}\",\"installed_at_unix\":$(date +%s),\"version\":\"${version}\",\"os\":\"${os}\",\"architecture\":\"${architecture}\",\"installer\":\"install_sh\",\"agent\":\"${agent}\",\"outcome\":\"success\",\"failure_stage\":\"none\"}"
+  curl --silent --fail --max-time 4 -H 'Content-Type: application/json' -d "$payload" "$INSTALL_TELEMETRY_URL" >/dev/null 2>&1 || :
+}
+
+share_install_telemetry || :

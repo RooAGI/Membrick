@@ -1,5 +1,28 @@
 # Telemetry
 
+## Installer telemetry
+
+The shell and PowerShell installers can report a successful installation to
+RooAGI's license service. Without an explicit sharing flag, interactive runs
+ask first with No as the default, while unattended runs send nothing. Passing
+`--share-telemetry` (shell) or `-ShareTelemetry` (PowerShell) opts in directly.
+Reporting is best-effort and cannot fail an installation.
+
+With consent, the installer sends the Membrick version, operating system, CPU
+architecture, installer type, selected agent, install result, and timestamps.
+It creates a random install ID in the user's config directory to count repeat
+install events without an account. The payload excludes names, email addresses,
+project paths, and memory data. The service necessarily sees the request's
+network address; configure the service and proxy logs to avoid retaining it if
+that is not needed.
+
+The receiver is `POST /v1/telemetry/install` on `license.rooagi.com`. The
+`license_server` service needs its `membrick_install_events` PostgreSQL table,
+created by `migrations/20261030_membrick_install_events.sql`, and the updated
+Axum service deployed with that schema. `queries/membrick-install-telemetry.sql`
+contains starter reports for install runs and distinct successful installs.
+Those reports count pseudonymous install IDs, not verified people or devices.
+
 Membrick telemetry is local operational data used to understand query behavior
 and provider activity. It is separate from indexed memory and session archives.
 Aggregate telemetry is bounded. Each detailed MCP tool history entry is capped
