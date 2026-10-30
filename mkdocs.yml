@@ -137,6 +137,7 @@ nav:
               - Cross-system comparison: comparison.md
   - Releases:
       - Unreleased: releases/unreleased.md
+      - 0.8.1: releases/0.8.1.md
       - 0.8.0: releases/0.8.0.md
       - 0.7.3: releases/0.7.3.md
       - 0.7.2: releases/0.7.2.md
