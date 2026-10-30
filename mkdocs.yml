@@ -63,12 +63,6 @@ nav:
           - Hermes: hermes.md
           - RooAGI AgentFlow: roo-runtime.md
           - Other agent frameworks: agent-frameworks.md
-  - Extensions:
-      - Overview: extensions/index.md
-      - Build an extension: extensions/building.md
-      - Extension security: extensions/security.md
-      - Board and Post: extensions/board-post.md
-      - FlowRun: extensions/flowrun.md
   - API reference:
       - Overview: api/http-overview.md
       - Memories:
@@ -86,10 +80,9 @@ nav:
           - Add a batch: api/provider/add-batch.md
           - Search: api/provider/search.md
           - Submit a transcript capture: api/provider/captures.md
-      - Extensions:
-          - Board/Post HTTP API: api/boards/index.md
-          - FlowRun HTTP API: api/flows/index.md
-          - Change stream: api/extensions/events.md
+      - Boards and flows:
+          - Boards: api/boards/index.md
+          - Flows: api/flows/index.md
       - Dashboard telemetry:
           - Overview: api/dashboard/index.md
           - Status: api/dashboard/status.md
@@ -171,6 +164,8 @@ nav:
   - Contact: contact.md
 
 exclude_docs: |
+  extensions/**
+  api/extensions/**
   security-review-2026-10-11.md
   show-concepts.md
   show-headings.md

@@ -23,12 +23,11 @@ non-loopback address requires `--allow-non-loopback` and a configured
 | Group | Routes | Auth |
 | --- | --- | --- |
 | [Memories](index.md) | `/v1/memories`, `/v1/memories/{memory_id}`, `/v1/memories/search`, `/v1/memories/refresh` | Token or JWT |
-| [Board/Post extension](boards/index.md) | `/api/boards`, `/api/boards/{board_id}` | Server token |
-| [FlowRun extension](flows/index.md) | `/api/flows`, `/api/flows/{flow_id}` | Server token |
+| [Boards](boards/index.md) | `/api/boards`, `/api/boards/{board_id}` | Server token |
+| [Flows](flows/index.md) | `/api/flows`, `/api/flows/{flow_id}` | Server token |
 | [Provider memory](provider/index.md) | `/provider-memory/add/batch`, `/provider-memory/search`, `/provider-memory/captures`; internal adapter routes `/provider-memory/mcp/tools/call`, `/provider-memory/mcp/documents/upsert`; OpenClaw hooks `/integrations/openclaw/hooks/{kind}` | Token or JWT; adapter routes and hooks need the server token |
 | [Operations](operations/index.md) | `/health`, `/metrics` | None for `/health`; token for `/metrics` |
 | [Dashboard telemetry](dashboard/index.md) | `/api/status`, `/api/timeseries`, `/api/events`, `/api/sessions`, `/api/integrations`, `/api/search-reviews`, `/api/metrics`, `/api/captures` | Server token only |
-| [Extension change stream](extensions/events.md) | `/api/extensions/events` (SSE) | Server token only |
 
 The provider routes exist only in builds that include an agent integration
 feature. `/provider-memory/captures` and `/api/captures` exist only in builds

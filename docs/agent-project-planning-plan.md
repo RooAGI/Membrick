@@ -1,6 +1,6 @@
 # Typed boards for agent-led project planning
 
-**Status: Implementation and independent review complete.** Work remains isolated on branch `feat/agent-project-planning` in a separate worktree. This document covers the board and template layer. The generic lifecycle built on top of boards is specified in [FlowRuns](extensions/flowrun.md).
+**Status: Implementation and independent review complete.** Work remains isolated on branch `feat/agent-project-planning` in a separate worktree. This document covers the board and template layer. The generic lifecycle built on top of boards is documented in the [Flows API reference](api/flows/index.md).
 
 ## Implementation progress
 
