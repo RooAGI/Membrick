@@ -6,6 +6,7 @@ BASE_URL="https://github.com/${REPO}/releases/latest/download"
 INSTALL_DIR="${MEMBRICK_INSTALL_DIR:-${HOME}/.local/bin}"
 AGENT=""
 PROJECT="."
+SHARE_INSTALL_TELEMETRY=0
 
 usage() {
   cat <<'EOF'
@@ -13,11 +14,13 @@ Install the latest official Membrick release and optionally configure an agent.
 
 Usage:
   install.sh [--agent codex|claude|gemini|agy] [--project PATH] [--install-dir DIR]
+            [--share-telemetry]
 
 Examples:
   install.sh
   install.sh --agent codex --project .
   install.sh --agent claude --project /path/to/project
+  install.sh --share-telemetry
 EOF
 }
 
@@ -37,6 +40,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { echo "--install-dir requires a value" >&2; exit 2; }
       INSTALL_DIR="$2"
       shift 2
+      ;;
+    --share-telemetry)
+      SHARE_INSTALL_TELEMETRY=1
+      shift
       ;;
     -h|--help)
       usage
@@ -161,4 +168,10 @@ if [ -n "$AGENT" ]; then
   echo "Membrick is installed, configured for ${AGENT}, and MCP verification passed."
 else
   echo "Membrick is installed. To configure an agent, rerun with --agent codex|claude|gemini|agy."
+fi
+
+if [ "$SHARE_INSTALL_TELEMETRY" -eq 1 ]; then
+  "$BIN" __record-install-telemetry install_sh "${AGENT:-none}" --share-telemetry || :
+else
+  "$BIN" __record-install-telemetry install_sh "${AGENT:-none}" || :
 fi

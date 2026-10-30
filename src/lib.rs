@@ -202,12 +202,16 @@ pub(crate) use crate::tier1::DEFAULT_SPACY_MODEL;
 pub(crate) use crate::tier1_ner_daemon::NerDaemon;
 
 mod executables;
+mod install_telemetry;
 mod local_ipc;
 
 /// Launch a bundled executable. This process entry point exposes no memory internals.
 #[doc(hidden)]
 pub fn run_binary(name: &str) -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if install_telemetry::handle_invocation(name, &args) {
+        return Ok(());
+    }
     let role = if name == "server" {
         logging::Role::Server
     } else {

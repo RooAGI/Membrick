@@ -82,8 +82,9 @@ fs4 = "0.13.1"
 rayon = "1.11"
 libflate = "1.4"
 pyo3 = { version = "0.29", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 self_update = { version = "1.3", default-features = false, features = ["reqwest", "rustls", "github", "checksums"] }
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

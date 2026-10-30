@@ -2,7 +2,8 @@ param(
     [ValidateSet('', 'codex', 'claude', 'gemini', 'agy')]
     [string]$Agent = '',
     [string]$Project = '.',
-    [string]$InstallDir = "$HOME\.local\bin"
+    [string]$InstallDir = "$HOME\.local\bin",
+    [switch]$ShareTelemetry
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +38,7 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Force $BinaryTemp $InstalledBinary
     New-Item -ItemType File -Force -Path (Join-Path $InstallDir '.membrick-managed') | Out-Null
+    Set-Content -NoNewline -Path (Join-Path $InstallDir 'membrick-install-method') -Value 'install_ps1'
 
     $Version = & $InstalledBinary --version
     Write-Host "Installed $Version to $InstalledBinary"
@@ -65,6 +67,11 @@ try {
     } else {
         Write-Host 'Membrick is installed. Re-run with -Agent codex|claude|gemini|agy to configure an agent.'
     }
+
+    $telemetryArgs = @('__record-install-telemetry', 'install_ps1', $(if ($Agent) { $Agent } else { 'none' }))
+    if ($ShareTelemetry) { $telemetryArgs += '--share-telemetry' }
+    & $InstalledBinary @telemetryArgs
+    if ($LASTEXITCODE -ne 0) { Write-Verbose 'Install telemetry was skipped.' }
 }
 finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $TempDir
