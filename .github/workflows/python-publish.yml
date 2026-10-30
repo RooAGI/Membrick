@@ -118,10 +118,6 @@ jobs:
 
           root = Path(sys.argv[1])
           client = membrick.Memory.init(path=str(root))
-          settings = root / ".membrick" / "server.toml"
-          lines = settings.read_text().splitlines()
-          lines = [line for line in lines if not line.lstrip().startswith("resident_idle_timeout_seconds")]
-          settings.write_text("resident_idle_timeout_seconds = 5\n" + "\n".join(lines) + "\n")
           log = root / ".membrick" / "runtime" / "resident.log"
 
           def add(request_id, content):
@@ -146,10 +142,13 @@ jobs:
                   time.sleep(0.05)
               raise AssertionError(f"resident did not shut down {expected} times: {contents}")
 
-          add("wheel-resident-before-idle", "First write starts the bundled resident.")
+          add("wheel-resident-before-close", "First write starts the bundled resident.")
+          client.close()
           first_log = wait_for_shutdowns(1)
-          assert "resident idle timeout elapsed; shutting down" in first_log
-          add("wheel-resident-after-idle", "Second write restarts the bundled resident.")
+          assert "no client connections remain; shutting down resident" in first_log
+          client = membrick.Memory(path=str(root))
+          add("wheel-resident-after-shutdown", "Second write restarts the bundled resident.")
+          client.close()
           final_log = wait_for_shutdowns(2)
           assert final_log.count("Membrick resident IPC listening") >= 2
           PY
