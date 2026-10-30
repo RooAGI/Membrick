@@ -134,7 +134,15 @@ pub(crate) fn call_resident_tool(
 ) -> anyhow::Result<JsonRpcResponse> {
     let root = root.canonicalize()?;
     let workspace = root.to_string_lossy().into_owned();
-    let client = match crate::memory_client::Memory::new(&root) {
+    // This code runs inside a provider-local Membrick CLI process, so use
+    // that exact executable when a tool call needs to start the resident.
+    // Relying on PATH races with provider startup and fails for CLI installs
+    // whose executable directory is not on PATH.
+    let options = crate::memory_client::MemoryOptions {
+        resident_executable: std::env::current_exe().ok(),
+        ..crate::memory_client::MemoryOptions::default()
+    };
+    let client = match crate::memory_client::Memory::with_options(&root, options) {
         Ok(client) => client,
         Err(error) => return Ok(resident_error_response(id, -32602, &error.to_string())),
     };
