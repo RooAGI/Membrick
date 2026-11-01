@@ -180,7 +180,16 @@ pub(crate) fn request_with_transport_safe(
                     Some(Ok(None)) | None => {}
                 }
                 if !marker.exists() {
-                    return Err(ClientTransportError::BeforeDispatch(last_error));
+                    // The starter records the socket and then removes the
+                    // marker, so the resident may have become ready after the
+                    // attempt above. Try once more before giving up.
+                    return match call() {
+                        Ok(response) => Ok(response),
+                        Err(ClientTransportError::BeforeDispatch(_)) => {
+                            Err(ClientTransportError::BeforeDispatch(last_error))
+                        }
+                        Err(error) => Err(error),
+                    };
                 }
             }
             if let Some(owner) = startup_owner.take() {
@@ -317,7 +326,24 @@ pub(crate) async fn request_with_transport_async(
                     .await
                     .map_err(|error| ClientTransportError::BeforeDispatch(error.to_string()))?;
                     if !marker_exists {
-                        return Err(ClientTransportError::BeforeDispatch(last_error));
+                        // The starter records the socket and then removes the
+                        // marker, so the resident may have become ready after
+                        // the attempt above. Try once more before giving up.
+                        return match request_for_memory_client(
+                            &root,
+                            &path,
+                            body.clone(),
+                            method.clone(),
+                            may_mutate,
+                        )
+                        .await
+                        {
+                            Ok(response) => Ok(response),
+                            Err(ClientTransportError::BeforeDispatch(_)) => {
+                                Err(ClientTransportError::BeforeDispatch(last_error))
+                            }
+                            Err(error) => Err(error),
+                        };
                     }
                 }
             }
