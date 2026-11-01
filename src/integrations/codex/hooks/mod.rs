@@ -23,7 +23,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_CONTEXT_BYTES: usize = 8_000;
 const MAX_EXCERPT_BYTES: usize = 800;
-const MIN_TOOL_QUERY_TERMS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexHookKind {
@@ -134,10 +133,9 @@ fn write_timing_record(
     let operation = match kind {
         CodexHookKind::SessionStart
         | CodexHookKind::UserPromptSubmit
-        | CodexHookKind::PreToolUse
-        | CodexHookKind::PostToolUse
         | CodexHookKind::UserPromptExpansion
         | CodexHookKind::SubagentStart => "retrieve",
+        CodexHookKind::PreToolUse | CodexHookKind::PostToolUse => "observe",
         CodexHookKind::PreCompact
         | CodexHookKind::PostCompact
         | CodexHookKind::Stop
@@ -299,20 +297,8 @@ fn handle_hook_with_backend(
             input.prompt.as_deref().unwrap_or_default(),
             backend,
         ),
-        CodexHookKind::PreToolUse => retrieve(
-            &root,
-            kind.event_name(),
-            &input.session_id,
-            &tool_query(&input),
-            backend,
-        ),
-        CodexHookKind::PostToolUse => {
-            let query = tool_query(&input);
-            if query_terms(&query).len() < MIN_TOOL_QUERY_TERMS {
-                return Ok(CodexHookOutput::default());
-            }
-            retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
-        }
+        // Tool hooks are recorded for telemetry only; they never retrieve.
+        CodexHookKind::PreToolUse | CodexHookKind::PostToolUse => Ok(CodexHookOutput::default()),
         CodexHookKind::UserPromptExpansion => {
             let query = [
                 input.expansion_type.as_deref(),
@@ -359,8 +345,6 @@ fn is_retrieval_hook(kind: CodexHookKind) -> bool {
         kind,
         CodexHookKind::SessionStart
             | CodexHookKind::UserPromptSubmit
-            | CodexHookKind::PreToolUse
-            | CodexHookKind::PostToolUse
             | CodexHookKind::UserPromptExpansion
             | CodexHookKind::SubagentStart
     )
@@ -493,66 +477,6 @@ fn retrieve(
         event_name,
         capture_text::mark_memory_context(&context),
     ))
-}
-
-fn tool_query(input: &CodexHookInput) -> String {
-    let mut parts = Vec::new();
-    if let Some(value) = input
-        .turn_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .agent_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .agent_type
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .tool_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .permission_mode
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .trigger
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .reason
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input.tool_input.as_ref() {
-        parts.push(truncate_utf8(&value.to_string(), MAX_EXCERPT_BYTES));
-    }
-    if let Some(value) = input.tool_response.as_ref() {
-        parts.push(truncate_utf8(&value.to_string(), MAX_EXCERPT_BYTES));
-    }
-    parts.join(" ")
 }
 
 fn relevant_excerpt(content: &str, query: &str, matched_terms: &[String]) -> String {

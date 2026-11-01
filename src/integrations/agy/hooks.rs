@@ -171,7 +171,11 @@ fn handle_hook_with_backend(
         }
         return Ok(AgyHookOutput::default());
     }
-    if matches!(kind, AgyHookKind::PostToolUse | AgyHookKind::PostInvocation) {
+    // Tool hooks are recorded for telemetry only; they never retrieve.
+    if matches!(
+        kind,
+        AgyHookKind::PreToolUse | AgyHookKind::PostToolUse | AgyHookKind::PostInvocation
+    ) {
         return Ok(AgyHookOutput::default());
     }
     if is_retrieval_hook(kind)
@@ -361,7 +365,7 @@ fn extract_latest_user_prompt(transcript_path: &Path) -> Option<String> {
 }
 
 fn is_retrieval_hook(kind: AgyHookKind) -> bool {
-    matches!(kind, AgyHookKind::PreToolUse | AgyHookKind::PreInvocation)
+    matches!(kind, AgyHookKind::PreInvocation)
 }
 
 fn capture_transcript(

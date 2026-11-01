@@ -192,6 +192,10 @@ fn handle_hook_with_backend(
         GeminiHookKind::SessionEnd => {
             return capture(_root, input, provider, "session-summary", backend);
         }
+        // Tool hooks are recorded for telemetry only; they never retrieve.
+        GeminiHookKind::BeforeTool | GeminiHookKind::AfterTool => {
+            return Ok(GeminiHookOutput::default());
+        }
         _ => {}
     }
     if is_retrieval_hook(kind)
@@ -301,8 +305,6 @@ fn is_retrieval_hook(kind: GeminiHookKind) -> bool {
         GeminiHookKind::BeforeAgent
             | GeminiHookKind::BeforeModel
             | GeminiHookKind::BeforeToolSelection
-            | GeminiHookKind::BeforeTool
-            | GeminiHookKind::AfterTool
     )
 }
 

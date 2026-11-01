@@ -2,7 +2,7 @@ pub(crate) mod protocol;
 
 use super::document::{ClaudeCodeDocument, ClaudeCodeDocumentType};
 use crate::ids::stable_doc_id_from_source;
-use crate::integrations::recall::{query_terms, relevant_excerpt, truncate_utf8};
+use crate::integrations::recall::relevant_excerpt;
 use crate::integrations::session_recording::{
     membrick_enabled, provider_state_dir, record_event_if_enabled,
     record_transcript_usage_if_available, RecordingProvider,
@@ -24,7 +24,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_CONTEXT_BYTES: usize = 8_000;
 const MAX_EXCERPT_BYTES: usize = 800;
-const MIN_TOOL_QUERY_TERMS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeHookKind {
@@ -133,9 +132,8 @@ fn write_timing_record(
         ClaudeHookKind::SessionStart
         | ClaudeHookKind::UserPromptSubmit
         | ClaudeHookKind::UserPromptExpansion
-        | ClaudeHookKind::PreToolUse
-        | ClaudeHookKind::PostToolUse
         | ClaudeHookKind::SubagentStart => "retrieve",
+        ClaudeHookKind::PreToolUse | ClaudeHookKind::PostToolUse => "observe",
         ClaudeHookKind::PreCompact
         | ClaudeHookKind::Stop
         | ClaudeHookKind::SessionEnd
@@ -300,20 +298,8 @@ fn handle_hook_with_backend(
             .join(" ");
             retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
         }
-        ClaudeHookKind::PostToolUse => {
-            let query = tool_query(&input);
-            if query_terms(&query).len() < MIN_TOOL_QUERY_TERMS {
-                return Ok(ClaudeHookOutput::default());
-            }
-            retrieve(&root, kind.event_name(), &input.session_id, &query, backend)
-        }
-        ClaudeHookKind::PreToolUse => retrieve(
-            &root,
-            kind.event_name(),
-            &input.session_id,
-            &tool_query(&input),
-            backend,
-        ),
+        // Tool hooks are recorded for telemetry only; they never retrieve.
+        ClaudeHookKind::PreToolUse | ClaudeHookKind::PostToolUse => Ok(ClaudeHookOutput::default()),
         ClaudeHookKind::PreCompact => {
             capture(&root, input, ClaudeCodeDocumentType::Checkpoint, backend)
         }
@@ -352,8 +338,6 @@ fn is_retrieval_hook(kind: ClaudeHookKind) -> bool {
         ClaudeHookKind::SessionStart
             | ClaudeHookKind::UserPromptSubmit
             | ClaudeHookKind::UserPromptExpansion
-            | ClaudeHookKind::PreToolUse
-            | ClaudeHookKind::PostToolUse
             | ClaudeHookKind::SubagentStart
     )
 }
@@ -832,45 +816,6 @@ fn affected_paths(extra: &serde_json::Map<String, Value>) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_string)
         .collect()
-}
-
-fn tool_query(input: &ClaudeHookInput) -> String {
-    let mut parts = Vec::new();
-    if let Some(value) = input
-        .turn_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .agent_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .agent_type
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input
-        .tool_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(value.to_string());
-    }
-    if let Some(value) = input.tool_input.as_ref() {
-        parts.push(truncate_utf8(&value.to_string(), MAX_EXCERPT_BYTES));
-    }
-    if let Some(value) = input.tool_response.as_ref() {
-        parts.push(truncate_utf8(&value.to_string(), MAX_EXCERPT_BYTES));
-    }
-    parts.join(" ")
 }
 
 fn current_timestamp() -> String {
@@ -1416,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_retrieves_relevant_memory_by_tool_name() {
+    fn tool_hooks_never_retrieve_memory() {
         let root = temp_dir("post-tool-use");
         let transcript = root.join("transcript.jsonl");
         fs::write(
@@ -1440,12 +1385,13 @@ mod tests {
         let mut post_tool = input(&root, None, "PostToolUse");
         post_tool.tool_name = Some("Bash".to_string());
         post_tool.tool_input = Some(serde_json::json!({"command": "cargo test search"}));
-        let output = handle_hook_test(ClaudeHookKind::PostToolUse, post_tool, &root).unwrap();
-        assert!(output.hook_specific_output.is_some());
-        let context = output.hook_specific_output.unwrap().additional_context;
-        assert!(context.contains("search"));
-        assert!(context.contains("Memory status:"));
-        assert!(context.contains("Relation evidence:"));
+        let output =
+            handle_hook_test(ClaudeHookKind::PostToolUse, post_tool.clone(), &root).unwrap();
+        assert!(output.hook_specific_output.is_none());
+        let mut pre_tool = post_tool;
+        pre_tool.hook_event_name = "PreToolUse".to_string();
+        let output = handle_hook_test(ClaudeHookKind::PreToolUse, pre_tool, &root).unwrap();
+        assert!(output.hook_specific_output.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
