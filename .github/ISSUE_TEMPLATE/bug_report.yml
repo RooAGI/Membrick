@@ -1,0 +1,36 @@
+name: Bug report
+description: Report something that is not working
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Membrick version
+    validations:
+      required: true
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      options: [CLI, Python, Node, HTTP, MCP, Agent integration, Dashboard, Other]
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Do not include private prompts, credentials, or user memory content.
+    validations:
+      required: true
