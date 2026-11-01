@@ -578,8 +578,7 @@ response to stdout.
 - hook failures do not interrupt normal Claude use by default
 - installation preserves unrelated Claude configuration
 - tests cover every supported hook payload and response shape
-- `PostToolUse` retrieval uses tool name and truncated input/response as query
-- `PreToolUse` retrieval uses the planned tool call as query
+- `PostToolUse` and `PreToolUse` record telemetry only and never retrieve
 - `SubagentStart` retrieval uses the subagent prompt
 - `SubagentStop` capture is idempotent and stores an `outcome` document type
 

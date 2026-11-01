@@ -77,7 +77,7 @@ sequenceDiagram
 ```text
 1. User submits a prompt
 2. Retrieval hook queries the existing MemoryService
-3. Agent may call tools (pre-tool and post-tool hooks can retrieve context)
+3. Agent may call tools (pre-tool and post-tool hooks record telemetry and do not retrieve context)
 4. Agent finishes the turn
 5. Stop/AfterAgent captures the turn outcome and refreshes MemoryService
 6. The next prompt can retrieve that captured outcome
