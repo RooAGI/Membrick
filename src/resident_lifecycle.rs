@@ -439,7 +439,9 @@ pub(crate) fn wait_for_startup<T>(
         // own marker if launch fails. If it vanished while the endpoint is
         // still unavailable, fail promptly and let the next request retry.
         if !marker.exists() {
-            return Ok(None);
+            // The starter binds before it removes the marker, so the endpoint
+            // may have come up after the attempt above. Try once more.
+            return Ok(try_request());
         }
     }
     // A timed-out client must not release its startup lock while the child it
