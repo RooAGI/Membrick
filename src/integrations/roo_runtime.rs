@@ -1,4 +1,4 @@
-//! Roo Runtime process hook adapter. All durable writes use MemoryService's
+//! RooAGI Runtime process hook adapter. All durable writes use MemoryService's
 //! shared workspace memory store, so MCP and hook callers see one index.
 use crate::cli::RooRuntimeHook;
 use crate::integrations::capture_text;
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Roo accepts at most 6,000 bytes of hook context per turn
+// RooAGI accepts at most 6,000 bytes of hook context per turn
 // (`MAX_TURN_CONTEXT_BYTES`) and cuts anything longer, which would drop the
 // closing memory marker.
 const MAX_CONTEXT_BYTES: usize = 6_000;
@@ -27,7 +27,7 @@ struct HookInvocation {
     run_id: String,
     #[serde(default)]
     timestamp: Option<String>,
-    /// The agent node the event belongs to. Roo omits it when the hook
+    /// The agent node the event belongs to. RooAGI omits it when the hook
     /// policy does not grant `workspace_identity`.
     #[serde(default)]
     node_id: Option<String>,
@@ -45,17 +45,17 @@ struct HookResult {
 pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
     let result = (|| -> Result<HookResult> {
         let mut invocation: HookInvocation = crate::integrations::read_bounded_json()
-            .context("failed to parse Roo Runtime hook input")?;
+            .context("failed to parse RooAGI Runtime hook input")?;
         let expected = event_name(kind);
         if invocation.schema_version != 1 {
             anyhow::bail!(
-                "unsupported Roo Runtime hook schema version {}",
+                "unsupported RooAGI Runtime hook schema version {}",
                 invocation.schema_version
             );
         }
         if invocation.event != expected {
             anyhow::bail!(
-                "Roo Runtime hook event mismatch: expected {expected}, got {}",
+                "RooAGI Runtime hook event mismatch: expected {expected}, got {}",
                 invocation.event
             );
         }
@@ -67,22 +67,24 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
         let root = match (kind, root_value) {
             (RooRuntimeHook::PreToolUse | RooRuntimeHook::PostToolUse, Some(root)) => root,
             (RooRuntimeHook::PreToolUse | RooRuntimeHook::PostToolUse, None) => {
-                anyhow::bail!("Roo tool hook payload is missing workspaceRoot")
+                anyhow::bail!("RooAGI tool hook payload is missing workspaceRoot")
             }
             (_, Some(root)) => root,
             (RooRuntimeHook::RunStart | RooRuntimeHook::RunEnd, None) => {
                 return Ok(HookResult::default());
             }
-            (_, None) => anyhow::bail!("Roo memory hook payload is missing workspaceRoot"),
+            (_, None) => anyhow::bail!("RooAGI memory hook payload is missing workspaceRoot"),
         };
         let root = match crate::state_paths::find_project_root(&root) {
             Ok(Some(root)) => root,
             Ok(None) => {
-                tracing::warn!("Membrick Roo hook skipped: no installed project covers workspace");
+                tracing::warn!(
+                    "Membrick RooAGI hook skipped: no installed project covers workspace"
+                );
                 return Ok(HookResult::default());
             }
             Err(error) => {
-                tracing::warn!("Membrick Roo hook skipped: {error:#}");
+                tracing::warn!("Membrick RooAGI hook skipped: {error:#}");
                 return Ok(HookResult::default());
             }
         };
@@ -169,7 +171,7 @@ pub fn run_hook(kind: RooRuntimeHook) -> Result<()> {
         }
     })();
     let result = result.unwrap_or_else(|error| {
-        tracing::warn!("Roo Runtime Membrick hook failed open: {error:#}");
+        tracing::warn!("RooAGI Runtime Membrick hook failed open: {error:#}");
         HookResult::default()
     });
     serde_json::to_writer(std::io::stdout().lock(), &result)?;
@@ -362,7 +364,7 @@ fn memory_session_id(project: &str, input: &HookInvocation) -> String {
     format!("rooagi_runtime:{project}:{session}")
 }
 
-/// Segment group for one Roo capture. Roo compacts each agent's transcript on
+/// Segment group for one RooAGI capture. RooAGI compacts each agent's transcript on
 /// its own and reports that agent's count as `compactionEpoch`. Captures made
 /// before an agent's first compaction stay in the session's group; later ones
 /// go to a group for that agent and epoch, so earlier epochs stop changing.
@@ -432,7 +434,7 @@ fn capture_with_backend(
             return Ok(());
         }
         format!(
-            "Roo Runtime completed turn\n\nUser: {user}\n\nAssistant: {assistant}\n\nStatus: {}",
+            "RooAGI Runtime completed turn\n\nUser: {user}\n\nAssistant: {assistant}\n\nStatus: {}",
             input
                 .payload
                 .get("status")
@@ -446,7 +448,7 @@ fn capture_with_backend(
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         format!(
-            "Roo Runtime run {} ended with status: {status}",
+            "RooAGI Runtime run {} ended with status: {status}",
             input.run_id
         )
     };
@@ -565,9 +567,11 @@ fn capture_tool_event_with_backend(
     }
 
     let content = if let Some(result) = result {
-        format!("Roo Runtime tool result\nTool: {tool_name}\nInput: {tool_input}\nResult: {result}")
+        format!(
+            "RooAGI Runtime tool result\nTool: {tool_name}\nInput: {tool_input}\nResult: {result}"
+        )
     } else {
-        format!("Roo Runtime tool call\nTool: {tool_name}\nInput: {tool_input}")
+        format!("RooAGI Runtime tool call\nTool: {tool_name}\nInput: {tool_input}")
     };
     let project = root.to_string_lossy().into_owned();
     let project_id = crate::ids::stable_doc_id_from_source(&project);
@@ -714,7 +718,7 @@ fn capture_compaction_with_backend(
             "checkpoint",
             (!summary.trim().is_empty()).then(|| {
                 format!(
-                    "Roo Runtime compaction summary\nAgent: {node}\nEpoch: {epoch}\n\n{}",
+                    "RooAGI Runtime compaction summary\nAgent: {node}\nEpoch: {epoch}\n\n{}",
                     summary.trim()
                 )
             }),
@@ -723,7 +727,7 @@ fn capture_compaction_with_backend(
             "compacted_transcript",
             (!transcript.is_empty()).then(|| {
                 format!(
-                    "Roo Runtime compacted transcript\nAgent: {node}\nEpoch: {epoch}\n\n{transcript}"
+                    "RooAGI Runtime compacted transcript\nAgent: {node}\nEpoch: {epoch}\n\n{transcript}"
                 )
             }),
         ),
@@ -1386,6 +1390,19 @@ mod tests {
         };
 
         capture(&root, &invocation, "turn").unwrap();
+        MemoryService::with_shared_memory(&root, |memory| {
+            let document = memory
+                .source_documents()
+                .into_iter()
+                .next()
+                .expect("captured turn should be stored");
+            assert!(document
+                .content
+                .starts_with("RooAGI Runtime completed turn"));
+            assert!(document.source.starts_with("roo-runtime://"));
+            Ok(())
+        })
+        .unwrap();
         let result = recall(&root, &invocation).unwrap();
         let context = result
             .additional_context
@@ -1522,6 +1539,10 @@ mod tests {
                 .iter()
                 .find(|doc| doc.filters["capture_type"] == "checkpoint")
                 .unwrap();
+            assert!(summary
+                .content
+                .starts_with("RooAGI Runtime compaction summary"));
+            assert!(summary.source.starts_with("roo-runtime://"));
             assert!(summary.content.contains("compaction-summary-unique-7"));
             let transcript = compaction
                 .iter()

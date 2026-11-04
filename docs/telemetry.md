@@ -5,10 +5,13 @@
 The shell and PowerShell installers report after a successful installation.
 Cargo, PyPI, and npm installs report on the first interactive CLI use because
 those package managers do not provide a reliable post-install hook. Without an
-explicit sharing flag, interactive runs ask first with No as the default, and
+explicit sharing flag, interactive runs ask first with Yes as the default, and
 unattended runs send nothing. Passing `--share-telemetry` (shell) or
 `-ShareTelemetry` (PowerShell) opts in directly. Reporting is best-effort and
-cannot fail installation or CLI use.
+cannot fail installation or CLI use. The choice is saved in the user's Membrick
+configuration and reused across installer types and versions. Remove
+`install-consent` from the `membrick/install-telemetry` configuration directory
+to be prompted again.
 
 With consent, the installer sends the Membrick version, operating system, CPU
 architecture, installer type (`install_sh`, `install_ps1`, `cargo`,

@@ -439,7 +439,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
             Path::new(&args.path),
             crate::integrations::session_recording::RecordingProvider::RooRuntime,
             "rooagi_runtime",
-            "Roo Runtime",
+            "RooAGI Runtime",
             crate::integrations::gemini_cli::GeminiCliServerOptions {
                 max_bytes: args.max_bytes,
                 max_files: args.max_files,
@@ -456,7 +456,7 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         let written = crate::integrations::roo_runtime::install_hooks(
             args.roo_runtime_config.as_deref().map(Path::new),
         )?;
-        println!("Wrote Roo Runtime hooks to {}", written.display());
+        println!("Wrote RooAGI Runtime hooks to {}", written.display());
         return Ok(());
     }
 

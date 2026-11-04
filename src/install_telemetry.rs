@@ -137,7 +137,7 @@ fn ask_to_share() -> Option<bool> {
     let prompt = concat!(
         "Share pseudonymous install details with RooAGI? This sends Membrick version, OS, CPU architecture, ",
         "installer source, selected agent, and a random install ID. It excludes names, email, project paths, ",
-        "and memory data. The service can see your network address. [y/N] "
+        "and memory data. The service can see your network address. [Y/n] "
     );
     #[cfg(unix)]
     {
@@ -150,7 +150,10 @@ fn ask_to_share() -> Option<bool> {
         tty.flush().ok()?;
         let mut answer = String::new();
         BufReader::new(tty).read_line(&mut answer).ok()?;
-        Some(matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+        Some(matches!(
+            answer.trim(),
+            "" | "y" | "Y" | "yes" | "YES" | "Yes"
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -161,7 +164,10 @@ fn ask_to_share() -> Option<bool> {
         io::stderr().flush().ok()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer).ok()?;
-        Some(matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+        Some(matches!(
+            answer.trim(),
+            "" | "y" | "Y" | "yes" | "YES" | "Yes"
+        ))
     }
 }
 
@@ -192,33 +198,42 @@ fn record_install(installer: &str, agent: &str, explicit_share: bool) {
     let Some(receipt_path) = receipt_path(&directory, installer, version) else {
         return;
     };
-    let mut receipt = match fs::read(&receipt_path) {
+    let (mut receipt, previous_consent) = match fs::read(&receipt_path) {
         Ok(bytes) => match serde_json::from_slice::<InstallReceipt>(&bytes) {
-            Ok(receipt) => receipt,
+            Ok(receipt) => {
+                let previous_consent = receipt.consented;
+                (receipt, Some(previous_consent))
+            }
             Err(_) => return,
         },
-        Err(_) => {
-            let consented = if explicit_share {
-                true
-            } else {
-                match ask_to_share() {
-                    Some(consented) => consented,
-                    None => return,
-                }
-            };
+        Err(_) => (
             InstallReceipt {
                 schema_version: SCHEMA_VERSION,
                 installer: installer.to_owned(),
                 version: version.to_owned(),
-                consented,
+                consented: false,
                 install_id: None,
                 event_id: None,
                 agent: Some(agent.to_owned()),
                 installed_at_unix: None,
                 sent: false,
-            }
-        }
+            },
+            None,
+        ),
     };
+
+    let consented = if explicit_share {
+        Some(true)
+    } else {
+        read_consent(&directory)
+            .or(previous_consent)
+            .or_else(ask_to_share)
+    };
+    let Some(consented) = consented else {
+        return;
+    };
+    let _ = write_consent(&directory, consented);
+    receipt.consented = consented;
 
     if !receipt.consented || receipt.sent {
         return;
@@ -240,6 +255,25 @@ fn record_install(installer: &str, agent: &str, explicit_share: bool) {
         receipt.sent = true;
         let _ = write_receipt(&receipt_path, &receipt);
     }
+}
+
+fn consent_path(directory: &Path) -> PathBuf {
+    directory.join("install-consent")
+}
+
+fn read_consent(directory: &Path) -> Option<bool> {
+    match fs::read_to_string(consent_path(directory)).ok()?.trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn write_consent(directory: &Path, consented: bool) -> io::Result<()> {
+    write_private_file(
+        &consent_path(directory),
+        if consented { b"yes\n" } else { b"no\n" },
+    )
 }
 
 fn receipt_path(directory: &Path, installer: &str, version: &str) -> Option<PathBuf> {
