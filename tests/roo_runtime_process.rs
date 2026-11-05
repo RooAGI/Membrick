@@ -185,5 +185,5 @@ fn invalid_workspace_fails_open_without_claiming_capture() {
         json!({"workspaceRoot":"/nonexistent/roo-memory-test-root","toolName":"fetch","toolUseId":"call","toolResponse":{"finding":"evidence"}}),
     );
     assert_eq!(response, json!({}));
-    assert!(stderr.contains("Membrick Roo hook skipped"));
+    assert!(stderr.contains("Membrick RooAGI hook skipped"));
 }

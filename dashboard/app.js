@@ -8,12 +8,10 @@ const VIEWS = {
   overview: { title: 'Overview', sub: 'How the memory index is serving agents right now.' },
   index: { title: 'Index', sub: 'Segment topology and document distribution of the primary query index.' },
   providers: { title: 'Providers', sub: 'Per-integration sessions, tool use, and private memory stores.' },
-  boards: { title: 'Boards', sub: 'Project structure and updates posted by agents.' },
-  flows: { title: 'Flows', sub: 'Provider-neutral workflow stages, board posts, and event history.' },
   reviews: { title: 'Search reviews', sub: 'Submitted feedback and offline ranking evaluation.' }
 };
 
-const state = { view: 'overview', status: null, series: [], provider: null, tool: null, hover: null, reviewOffset: 0, reviewTotal: 0, boards: [], selectedBoardId: null, boardSnapshot: null, boardTrail: [], boardGeneration: 0, boardRenderSeq: 0, boardTick: 0, linkedBoards: new Map(), flows: [], selectedFlowId: null, flowSnapshot: null };
+const state = { view: 'overview', status: null, series: [], provider: null, tool: null, hover: null, reviewOffset: 0, reviewTotal: 0 };
 
 // Browser storage can be blocked or throw (private windows, disabled site
 // data). Every read and write goes through these so the page still works.
@@ -240,10 +238,6 @@ function renderSearchReview(review) {
 
 async function refresh() {
   if (document.hidden) return;
-  // Board and Flow polling is independent of the status request so a slow or
-  // failing status endpoint does not stop live updates.
-  if (state.view === 'boards') refreshBoards();
-  if (state.view === 'flows') pollFlows();
   const pill = document.querySelector('#status-pill');
   try {
     const [status, series] = await Promise.all([api('/api/status'), api('/api/timeseries')]);
