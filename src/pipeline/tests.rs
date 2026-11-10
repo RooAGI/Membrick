@@ -77,16 +77,25 @@ fn workspace_watcher_ignores_access_events_on_the_root() {
     ));
     fs::create_dir_all(&root).unwrap();
     let watcher = WorkspaceWatcher::new(&root, &[]).unwrap();
-    // Drain any startup noise before simulating the rebuild's directory read.
-    thread::sleep(Duration::from_millis(100));
-    let _ = watcher.take_events();
+    // Drain startup noise before simulating the rebuild's directory read.
+    // On a busy machine FSEvents can report the root's own creation well
+    // after the watch starts, so wait until one full debounce window (350ms)
+    // passes with no events, bounded so a noisy machine cannot hang the test.
+    let quiet_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        thread::sleep(Duration::from_millis(500));
+        if watcher.take_events().is_empty() || std::time::Instant::now() > quiet_deadline {
+            break;
+        }
+    }
     let _ = fs::read_dir(&root).unwrap().count();
     // Wait past the 350ms debounce window so the Access event (on platforms
     // that emit one) is delivered, then assert it is not treated as a change.
     thread::sleep(Duration::from_millis(800));
+    let events = watcher.take_events();
     assert!(
-        watcher.take_events().is_empty(),
-        "access events must not invalidate the cached workspace service"
+        events.is_empty(),
+        "access events must not invalidate the cached workspace service: {events:?}"
     );
     // Sanity check: a real modification is still reported.
     fs::write(root.join("notes.md"), "hello").unwrap();
