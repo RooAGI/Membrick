@@ -1337,6 +1337,15 @@ mod tests {
         let relocated = new_socket_path(&long).unwrap();
         assert!(relocated.as_os_str().len() <= MAX_SOCKET_PATH);
         assert_eq!(relocated.parent(), Some(std::env::temp_dir().as_path()));
+
+        // Relocated sockets share one directory, so two long projects served
+        // by the same process must still get different socket files.
+        let other_directory = TempDir::short();
+        let other_long = long_non_english_root(&other_directory);
+        let other_relocated = new_socket_path(&other_long).unwrap();
+        assert!(other_relocated.as_os_str().len() <= MAX_SOCKET_PATH);
+        assert_eq!(other_relocated.parent(), relocated.parent());
+        assert_ne!(other_relocated, relocated);
     }
 
     #[test]
