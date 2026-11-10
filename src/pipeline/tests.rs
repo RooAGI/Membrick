@@ -63,6 +63,34 @@ fn workspace_watcher_publishes_relative_file_change_events_without_content() {
 }
 
 #[test]
+fn workspace_index_changes_cover_every_scanned_source_format() {
+    let change = |file_path: &str| WorkspaceChangeEvent {
+        event: "file_modify".to_string(),
+        file_path: file_path.to_string(),
+        timestamp_ms: 0,
+        before: None,
+        after: None,
+    };
+    let root = Path::new("/project");
+    // An image counts too: adding or removing one decides whether its
+    // sibling `.txt` is indexed as a description or as plain text.
+    for indexed in [
+        "notes.md",
+        "docs/page.html",
+        "old.htm",
+        "log.txt",
+        "photos/IMG_1.JPG",
+        "diagram.png",
+        "<watcher-error>",
+    ] {
+        assert!(change(indexed).affects_workspace_index(root), "{indexed}");
+    }
+    for ignored in ["src/main.rs", "Cargo.toml", "animation.gif", "notes"] {
+        assert!(!change(ignored).affects_workspace_index(root), "{ignored}");
+    }
+}
+
+#[test]
 fn workspace_watcher_ignores_access_events_on_the_root() {
     // Regression test: rebuilding the cached service does read_dir(root),
     // which the OS reports as Access(Open) on the root directory. Treating

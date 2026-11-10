@@ -149,12 +149,7 @@ pub(crate) fn compute_corpus_fingerprint(
                 continue;
             }
         }
-        let ext = entry
-            .path()
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if ext != "md" {
+        if !crate::adapters::is_indexed_source_path(entry.path()) {
             continue;
         }
         files_seen += 1;
@@ -425,5 +420,40 @@ mod tests {
             .join(".membrick-cache");
         assert_eq!(query_cache_dir(&s), expected);
         let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn corpus_fingerprint_tracks_every_scanned_source_format() {
+        let root = std::env::temp_dir().join(format!(
+            "membrick-cache-fingerprint-formats-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("guide.md"), "# Guide").unwrap();
+        let root_str = root.to_str().unwrap();
+        let fingerprint = || compute_corpus_fingerprint(root_str, 50_000, 20, 100_000_000);
+
+        let mut previous = fingerprint();
+        for (name, bytes) in [
+            ("page.html", b"<h1>Page</h1>".as_slice()),
+            ("old.htm", b"<p>Old</p>".as_slice()),
+            ("notes.txt", b"Notes".as_slice()),
+            ("photo.JPG", [0xFF, 0xD8].as_slice()),
+            ("diagram.png", [0x89, 0x50].as_slice()),
+        ] {
+            fs::write(root.join(name), bytes).unwrap();
+            let next = fingerprint();
+            assert_ne!(next, previous, "adding {name} must change the fingerprint");
+            previous = next;
+        }
+        for name in ["main.rs", "animation.gif"] {
+            fs::write(root.join(name), "unrelated").unwrap();
+            assert_eq!(fingerprint(), previous, "adding {name} must not");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }

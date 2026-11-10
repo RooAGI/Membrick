@@ -30,22 +30,14 @@ pub struct WorkspaceChangeEvent {
 }
 
 impl WorkspaceChangeEvent {
-    /// The workspace source index currently contains Markdown documents only.
-    /// Provider activity and source-file changes are still captured separately,
-    /// but must not invalidate the full Markdown index.
+    /// The workspace source index contains the scanned document formats only
+    /// (Markdown and HTML). Provider activity and other source-file changes
+    /// are still captured separately, but must not invalidate the index.
     pub fn affects_workspace_index(&self, _root: &Path) -> bool {
         if self.file_path == "<watcher-error>" {
             return true;
         }
-        let path = Path::new(&self.file_path);
-        let is_markdown = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension == "md");
-        if !is_markdown {
-            return false;
-        }
-        true
+        crate::adapters::is_indexed_source_path(Path::new(&self.file_path))
     }
 }
 

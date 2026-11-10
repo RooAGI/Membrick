@@ -5862,3 +5862,173 @@ fn key_phrase_backfill_covers_gemini_hook_path() {
         "canary phrase",
     );
 }
+
+#[test]
+fn workspace_source_documents_cover_every_scanned_format() {
+    let workspace_file = |path: &str| SourceDocument {
+        source: path.to_string(),
+        ..direct_doc(path, "content")
+    };
+    // Each scanned format counts as a workspace file, so its document is
+    // pruned when the file disappears from disk.
+    for path in [
+        "guide.md",
+        "docs/page.html",
+        "old.htm",
+        "notes.txt",
+        "photos/IMG_1.JPG",
+        "diagram.png",
+    ] {
+        assert!(is_workspace_source_document(&workspace_file(path)), "{path}");
+    }
+    // Other files, and documents whose source is not their own path such as
+    // provider captures, are never treated as workspace files.
+    for path in ["src/main.rs", "animation.gif"] {
+        assert!(!is_workspace_source_document(&workspace_file(path)), "{path}");
+    }
+    assert!(!is_workspace_source_document(&direct_doc("notes.txt", "content")));
+}
+
+/// Open a project through `MemoryService` the way the MCP tools do: the
+/// service runs the project scan through its source-document callback.
+fn open_scanned_workspace(root: &Path) -> MemoryService {
+    MemoryService::open_workspace(
+        root,
+        crate::integrations::mcp_index::SHARED_MEMORY_DIR,
+        &[],
+        || {
+            let input = crate::adapters::AdapterInput {
+                root,
+                max_bytes: 5_000_000,
+                max_files: 50_000,
+                max_depth: 20,
+                max_total_bytes: 100_000_000,
+            };
+            let graph = crate::adapters::build_project_graph(&input)?;
+            Ok(crate::adapters::graph_to_source_documents(&graph))
+        },
+    )
+    .expect("workspace opens through MemoryService")
+}
+
+#[test]
+fn memory_service_indexes_and_searches_html_text_and_image_files() {
+    // Canonical, because the service refuses to write through a symlinked
+    // parent such as macOS `/var`.
+    let temp_base = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let root = temp_base.join(format!(
+        "membrick-service-formats-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("roadmap.html"),
+        "<html><body><h1>Roadmap</h1><p>The zebra migration finishes in March.</p>\
+         <script>var ignored = 'basalt';</script></body></html>",
+    )
+    .unwrap();
+    std::fs::write(root.join("field-log.txt"), "Collected a volcanic basalt sample.").unwrap();
+    std::fs::write(root.join("harbor.png"), [0x89, 0x50]).unwrap();
+    std::fs::write(root.join("harbor.txt"), "A lighthouse beside the harbor at sunset.").unwrap();
+
+    let service = open_scanned_workspace(&root);
+
+    // Each format is stored as one source document keyed by its own path,
+    // and the image description is stored only under its image.
+    let photo = service
+        .source_document_by_id("harbor.png")
+        .expect("image document stored");
+    assert!(photo.content.contains("A lighthouse beside the harbor at sunset."));
+    assert_eq!(
+        photo.filters.get("media_type").map(String::as_str),
+        Some("image/png")
+    );
+    assert!(service.source_document_by_id("roadmap.html").is_some());
+    assert!(service.source_document_by_id("field-log.txt").is_some());
+    assert!(service.source_document_by_id("harbor.txt").is_none());
+
+    for (query, expected) in [
+        ("when does the zebra migration finish", "roadmap.html"),
+        ("volcanic basalt sample", "field-log.txt"),
+        ("lighthouse beside the harbor", "harbor.png"),
+    ] {
+        let payload = service
+            .search_agent_cached(query, "claude-code", None, 3, &BTreeMap::new())
+            .unwrap();
+        let doc_ids: Vec<&str> = payload["results"]
+            .as_array()
+            .expect("search returns a results list")
+            .iter()
+            .filter_map(|result| result["doc_id"].as_str())
+            .collect();
+        assert_eq!(doc_ids.first().copied(), Some(expected), "{query}: {payload}");
+        assert!(!doc_ids.contains(&"harbor.txt"), "{query}: {payload}");
+    }
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn memory_service_hides_superseded_markdown_guidance_from_default_search() {
+    // Canonical, because the service refuses to write through a symlinked
+    // parent such as macOS `/var`.
+    let temp_base = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let root = temp_base.join(format!(
+        "membrick-service-supersession-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("legacy.md"),
+        "# Legacy ownership\nThe old team owns the control surface.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("current.md"),
+        "---\nsupersedes: legacy.md\n---\n# Current ownership\nThe new team is responsible for the control surface.\n",
+    )
+    .unwrap();
+
+    let service = open_scanned_workspace(&root);
+    assert!(
+        service.source_document_by_id("legacy.md").is_some(),
+        "the replaced guidance is still stored, only hidden from default search"
+    );
+
+    let payload = service
+        .search_agent_cached(
+            "who is responsible for the control surface",
+            "claude-code",
+            None,
+            5,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    let doc_ids: Vec<&str> = payload["results"]
+        .as_array()
+        .expect("search returns a results list")
+        .iter()
+        .filter_map(|result| result["doc_id"].as_str())
+        .collect();
+    assert_eq!(doc_ids.first().copied(), Some("current.md"), "{payload}");
+    assert!(
+        !doc_ids.contains(&"legacy.md"),
+        "replaced Markdown guidance should not be returned by default: {payload}"
+    );
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -75,11 +75,9 @@ fn is_session_observation(document: &SourceDocument) -> bool {
         .is_some_and(|kind| kind == SESSION_OBSERVATION_DOCUMENT_TYPE)
 }
 
-fn is_workspace_markdown_document(document: &SourceDocument) -> bool {
+fn is_workspace_source_document(document: &SourceDocument) -> bool {
     document.source == document.doc_id
-        && Path::new(&document.source)
-            .extension()
-            .is_some_and(|extension| extension == "md")
+        && crate::adapters::is_indexed_source_path(Path::new(&document.source))
 }
 
 fn workspace_documents_equal(left: &SourceDocument, right: &SourceDocument) -> bool {
@@ -1811,7 +1809,7 @@ impl MemoryService {
             .collect::<Vec<_>>();
         let mut changed = false;
         for document in &existing {
-            if is_workspace_markdown_document(document)
+            if is_workspace_source_document(document)
                 && !workspace_doc_ids.contains(document.doc_id.as_str())
             {
                 self.remove(&document.doc_id);
