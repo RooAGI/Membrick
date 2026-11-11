@@ -3,12 +3,22 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A fresh folder per call. The clock alone is not enough: on macOS it has
+/// microsecond resolution, so the two tests here, which run in parallel and
+/// write files with the same names, could get the same folder and overwrite
+/// each other's fixtures. The process id and a counter keep names unique
+/// within one run and across concurrent runs.
 fn temp_dir() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("membrick-cli-supersession-{nanos}"));
+    let path = std::env::temp_dir().join(format!(
+        "membrick-cli-supersession-{}-{}-{nanos}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     fs::create_dir_all(&path).unwrap();
     path
 }

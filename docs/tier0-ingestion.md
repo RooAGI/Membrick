@@ -1,6 +1,6 @@
 # Tier0 scan metadata
 
-Tier0 is the lightweight metadata collected while Membrick scans Markdown
+Tier0 is the lightweight metadata collected while Membrick scans project
 files. It is a helper stage for project graph and export workflows. The
 resident's searchable store uses `SourceDocument` and derived `DocRecord`
 values; `Tier0Record` is not the persistent memory API or the full search
@@ -15,14 +15,16 @@ The internal `Tier0Record` in `src/graph.rs` contains:
 | `id` | Stable scan ID, currently the path relative to the scan root |
 | `source` | Relative source path |
 | `timestamp` | Source modified time, normalized to a Unix-seconds timestamp when available |
-| `author_agent` | Author or agent found in supported frontmatter keys |
-| `doc_length` | Source content length in bytes |
-| `metadata` | Lightweight derived values such as concept, extension, heading and link counts, file size, and frontmatter flags |
+| `author_agent` | Author or agent found in supported frontmatter keys, or an HTML `<meta name="author">` value |
+| `doc_length` | Source content length in bytes. For an image, the length of its description file |
+| `metadata` | Lightweight derived values such as concept, extension, heading and link counts, file size, and frontmatter flags. Images also record `media_type` and `description_path` |
 
-Records are joined to parsed Markdown pages by their relative source path.
-Ignored pages are removed together with their Tier0 records. The current
-filesystem adapter scans Markdown; other file types are not indexed through
-this adapter today.
+Records are joined to parsed pages by their relative source path. Ignored pages
+are removed together with their Tier0 records. The scan covers Markdown, HTML,
+plain text, and images that have a `.txt` description next to them
+(`photo1.png.txt` or `photo1.txt` for `photo1.png`); see
+[Ingestion architecture](ingestion-architecture.md#file-types) for how each
+file type is read.
 
 ## Build the searchable project index
 

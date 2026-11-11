@@ -351,14 +351,17 @@ pub(crate) const MAX_SOCKET_PATH: usize = if cfg!(any(target_os = "linux", targe
 /// runtime directory when it fits the platform limit, and otherwise in the
 /// short system temp directory, so a long or non-English project path never
 /// costs the socket. The pid keeps names unique among running residents.
+/// The temp directory is shared by every project, so a socket there is also
+/// named by the project's instance hash; otherwise two long-path residents
+/// in one process would take turns replacing each other's socket.
 #[cfg(unix)]
 pub(crate) fn new_socket_path(root: &Path) -> Result<PathBuf> {
-    let name = format!("mb-{}.sock", std::process::id());
-    let in_project = runtime_dir(root)?.join(&name);
+    let pid = std::process::id();
+    let in_project = runtime_dir(root)?.join(format!("mb-{pid}.sock"));
     if in_project.as_os_str().len() <= MAX_SOCKET_PATH {
         return Ok(in_project);
     }
-    Ok(std::env::temp_dir().join(name))
+    Ok(std::env::temp_dir().join(format!("{}-{pid}.sock", instance_name(root))))
 }
 
 pub(crate) fn endpoint(root: &Path) -> Result<String> {

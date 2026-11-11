@@ -1,3 +1,6 @@
+use crate::adapters::html::build_html_corpus;
+use crate::adapters::image::build_image_corpus;
+use crate::adapters::txt::build_txt_corpus;
 use crate::adapters::markdown::build_markdown_corpus;
 use anyhow::Result;
 use deunicode::deunicode;
@@ -249,7 +252,37 @@ impl Graph {
         max_total_bytes: usize,
     ) -> Result<Self> {
         let root = Path::new(path);
-        let corpus = build_markdown_corpus(root, max_bytes, max_files, max_depth, max_total_bytes)?;
+        let mut corpus =
+            build_markdown_corpus(root, max_bytes, max_files, max_depth, max_total_bytes)?;
+        // The other formats share the scan limits with Markdown: each one gets
+        // whatever file and byte budget the scans before it left unused.
+        type CorpusBuilder =
+            fn(&Path, usize, usize, usize, usize) -> Result<crate::adapters::markdown::MarkdownCorpus>;
+        let other_formats: [CorpusBuilder; 3] =
+            [build_html_corpus, build_txt_corpus, build_image_corpus];
+        for build_corpus in other_formats {
+            let used_bytes: usize = corpus.tier0_records.iter().map(|r| r.doc_length).sum();
+            let more = build_corpus(
+                root,
+                max_bytes,
+                max_files.saturating_sub(corpus.pages.len()),
+                max_depth,
+                max_total_bytes.saturating_sub(used_bytes),
+            )?;
+            corpus.pages.extend(more.pages);
+            corpus.tier0_records.extend(more.tier0_records);
+        }
+        // Membrick's own state is never project content, whatever
+        // `ignore_paths` says; the watcher and fingerprints skip it too.
+        let is_membrick_state = |rel_path: &str| {
+            Path::new(rel_path)
+                .components()
+                .any(|component| component.as_os_str() == ".membrick")
+        };
+        corpus.pages.retain(|page| !is_membrick_state(&page.rel_path));
+        corpus
+            .tier0_records
+            .retain(|record| !is_membrick_state(&record.source));
         let pages: Vec<Page> = corpus
             .pages
             .into_iter()

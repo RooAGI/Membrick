@@ -517,10 +517,10 @@ mod tests {
     #[test]
     fn hermes_search_round_trip_tags_hermes_provider() {
         let root = temp_root("mcp-search");
-        let memory_root = crate::integrations::mcp_index::shared_memory_root(&root);
-        fs::create_dir_all(&memory_root).unwrap();
+        // A project file; the scan never indexes files inside `.membrick`.
+        fs::create_dir_all(&root).unwrap();
         fs::write(
-            memory_root.join("tea-note.md"),
+            root.join("tea-note.md"),
             "# Tea\nLuyi prefers oolong tea from Alishan, Taiwan.",
         )
         .unwrap();
@@ -608,10 +608,10 @@ mod tests {
         // Hermes follow-ups must resolve against Hermes' own conversation
         // state, never Gemini's, even for the same session id.
         let root = temp_root("mcp-scope");
-        let memory_root = crate::integrations::mcp_index::shared_memory_root(&root);
-        fs::create_dir_all(&memory_root).unwrap();
+        // A project file; the scan never indexes files inside `.membrick`.
+        fs::create_dir_all(&root).unwrap();
         fs::write(
-            memory_root.join("tea.md"),
+            root.join("tea.md"),
             "# Tea\nLuyi prefers oolong tea from Alishan, Taiwan.",
         )
         .unwrap();

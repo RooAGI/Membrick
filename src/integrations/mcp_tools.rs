@@ -515,16 +515,7 @@ pub(crate) fn search_hook_documents_with_backend(
     backend: MemoryBackend,
 ) -> anyhow::Result<Value> {
     if !backend.is_resident() {
-        let ignore_paths = [
-            "node_modules",
-            "target",
-            "dist",
-            "build",
-            "vendor",
-            "coverage",
-            ".git",
-        ]
-        .map(str::to_string);
+        let ignore_paths = crate::adapters::project_ignore_paths(root);
         return MemoryService::open_workspace(
             root,
             crate::integrations::mcp_index::SHARED_MEMORY_DIR,

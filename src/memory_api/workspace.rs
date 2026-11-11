@@ -454,8 +454,8 @@ fn workspace_state(root: &Path, ignore_paths: &[String]) -> Result<Value> {
         .iter_mut()
         .for_each(|path| *path = path.to_lowercase());
     ignore_paths.sort();
-    // The graph adapter scans Markdown across the workspace. Match that
-    // corpus while avoiding invalidation from unrelated source files.
+    // The graph adapter scans Markdown and HTML across the workspace. Match
+    // that corpus while avoiding invalidation from unrelated source files.
     let mut entries = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -465,12 +465,7 @@ fn workspace_state(root: &Path, ignore_paths: &[String]) -> Result<Value> {
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "md")
-        })
+        .filter(|entry| crate::adapters::is_indexed_source_path(entry.path()))
         .filter_map(|entry| {
             let relative = entry.path().strip_prefix(root).ok()?.to_path_buf();
             let metadata = entry.metadata().ok()?;
@@ -815,6 +810,36 @@ mod tests {
         assert!(reopened.source_document_by_id("codex-session").is_some());
         assert!(reopened.source_document_by_id("claude-session").is_some());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_state_tracks_every_scanned_source_format() {
+        let root = board_test_root("state-formats");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("guide.md"), "# Guide").unwrap();
+
+        let mut previous = workspace_state(&root, &[]).unwrap();
+        for (name, bytes) in [
+            ("page.html", b"<h1>Page</h1>".as_slice()),
+            ("old.htm", b"<p>Old</p>".as_slice()),
+            ("notes.txt", b"Notes".as_slice()),
+            ("photo.JPG", [0xFF, 0xD8].as_slice()),
+            ("diagram.png", [0x89, 0x50].as_slice()),
+        ] {
+            fs::write(root.join(name), bytes).unwrap();
+            let next = workspace_state(&root, &[]).unwrap();
+            assert_ne!(next, previous, "adding {name} must change the workspace state");
+            previous = next;
+        }
+        for name in ["main.rs", "animation.gif"] {
+            fs::write(root.join(name), "unrelated").unwrap();
+            assert_eq!(
+                workspace_state(&root, &[]).unwrap(),
+                previous,
+                "adding {name} must not"
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 
