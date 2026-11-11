@@ -483,7 +483,8 @@ mod tests {
     #[test]
     fn corpus_scans_only_html_files_with_links_and_tier0_metadata() -> Result<()> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("membrick-html-corpus-{nanos}"));
+        let root = std::env::temp_dir()
+            .join(format!("membrick-html-corpus-{}-{nanos}", std::process::id()));
         fs::create_dir_all(root.join("nested"))?;
         fs::write(
             root.join("guide.html"),

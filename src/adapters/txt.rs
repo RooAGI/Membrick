@@ -246,7 +246,8 @@ mod tests {
     #[test]
     fn corpus_scans_only_txt_files() -> Result<()> {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("membrick-txt-corpus-{nanos}"));
+        let root = std::env::temp_dir()
+            .join(format!("membrick-txt-corpus-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&root)?;
         fs::write(root.join("meeting-notes.txt"), "Decided to ship 0.8.3.\n")?;
         fs::write(root.join("readme.md"), "# Readme\n")?;
