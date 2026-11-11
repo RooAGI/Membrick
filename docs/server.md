@@ -50,6 +50,9 @@ server_token = "replace-with-a-secret"
 tenant_id = "team-a"
 adaptive_segment_max_n = 32
 jwt_secret = "replace-with-a-secret"
+# Allow `bind` or `resident_http_bind` to use a non-loopback address such as
+# 0.0.0.0. Requires server_token, server_token_file, or jwt_secret.
+# allow_non_loopback = true
 
 # Optional freshness override. The default is relative freshness for
 # CurrentState queries only.
@@ -166,10 +169,26 @@ latency harness above measures its route separately. Reports:
 [writes](https://github.com/RooAGI/Membrick/blob/main/comparison/results/throughput-write-only-refactor-2026-10-11.json).
 
 By default the server binds to loopback, such as `127.0.0.1:8080` or
-`[::1]:8080`. To bind another network interface, explicitly pass
-`--allow-non-loopback` and configure `server_token` or `jwt_secret` in the
-server settings file. This option cannot be combined with
-`--allow-unauthenticated`. The listener uses plain HTTP, so keep it on a
+`[::1]:8080`. To bind another network interface, set
+`allow_non_loopback = true` in `.membrick/server.toml` or pass
+`--allow-non-loopback`, and configure `server_token`, `server_token_file`, or
+`jwt_secret` in the server settings file. This option cannot be combined with
+`--allow-unauthenticated`.
+
+A resident that an agent starts automatically gets no command-line flags, so
+for `resident_http_bind` the settings file is the only way to opt in. Without
+it, a non-loopback `resident_http_bind` such as `0.0.0.0:8599` makes the
+resident exit at startup with `refusing non-localhost bind address` in
+`.membrick/runtime/resident.log`. For example:
+
+```toml
+resident_http_bind = "0.0.0.0:8599"
+allow_non_loopback = true
+server_token_file = "/path/to/server-token"
+```
+
+Agents on the same machine keep using the local socket. Requests over the
+network listener must send the token. The listener uses plain HTTP, so keep it on a
 trusted network or place remote access behind an authenticated, encrypted
 proxy. See
 [Run Membrick with Docker](docker.md) for a localhost-only Compose setup.
@@ -738,8 +757,9 @@ The server token accepts `X-Api-Key`, `Authorization: Bearer <token>`, or the
 raw token in `Authorization`. Configure the token in `server_token` or pass
 `--server-token`.
 
-Non-loopback binds require the explicit `--allow-non-loopback` option and
-configured token or JWT authentication. The option is rejected when combined
+Non-loopback binds require an explicit opt-in, either `allow_non_loopback =
+true` in the settings file or `--allow-non-loopback`, and configured token or
+JWT authentication. The option is rejected when combined
 with `--allow-unauthenticated`. `--allow-unauthenticated` is intended for
 single-user localhost use only.
 

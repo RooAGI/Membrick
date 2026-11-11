@@ -138,8 +138,19 @@ struct ServerSettings {
     server_token_file: Option<PathBuf>,
     tenant_id: Option<String>,
     jwt_secret: Option<String>,
+    /// Allow `bind` and `resident_http_bind` to use a non-loopback address.
+    /// The same rule as `--allow-non-loopback` applies: a server token or JWT
+    /// secret must be configured. This is the only way to opt in for a
+    /// resident started automatically by an agent, since those get no flags.
+    allow_non_loopback: Option<bool>,
     adaptive_segment_max_n: Option<usize>,
     freshness: Option<crate::temporal::FreshnessPolicy>,
+}
+
+/// The command-line flag turns non-loopback binding on; otherwise the
+/// settings file decides, and the default is loopback only.
+fn effective_allow_non_loopback(flag: bool, settings: &ServerSettings) -> bool {
+    flag || settings.allow_non_loopback.unwrap_or(false)
 }
 
 fn settings_path(args: &Args) -> anyhow::Result<PathBuf> {
@@ -778,6 +789,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let settings = load_server_settings(&settings_file)?;
     let resident_http_bind = settings.resident_http_bind.clone();
     let resident_http_auto_port = settings.resident_http_auto_port.unwrap_or(false);
+    args.allow_non_loopback = effective_allow_non_loopback(args.allow_non_loopback, &settings);
     if !bind_was_set {
         if let Some(bind) = settings.bind {
             args.bind = bind;
@@ -2012,7 +2024,8 @@ fn ensure_bind_allowed(
         resolved = true;
         if !address.ip().is_loopback() && !allow_non_loopback {
             anyhow::bail!(
-                "refusing non-localhost bind address {}; pass --allow-non-loopback to opt in",
+                "refusing non-localhost bind address {}; set allow_non_loopback = true in \
+                 .membrick/server.toml or pass --allow-non-loopback to opt in",
                 address
             );
         }
@@ -2021,7 +2034,9 @@ fn ensure_bind_allowed(
     if allow_non_loopback {
         anyhow::ensure!(
             authentication_configured && !allow_unauthenticated,
-            "--allow-non-loopback requires token or JWT authentication and cannot be combined with --allow-unauthenticated"
+            "allow_non_loopback requires server_token, server_token_file, or jwt_secret in \
+             .membrick/server.toml (or --server-token), and cannot be combined with \
+             --allow-unauthenticated"
         );
     }
     Ok(())
@@ -4403,6 +4418,17 @@ mod tests {
         assert!(token_is_valid("Token secret", "secret"));
         assert!(!token_is_valid("Bearer other", "secret"));
         assert!(!token_is_valid("", &"\0".repeat(256)));
+    }
+
+    #[test]
+    fn settings_file_can_allow_non_loopback_binds() {
+        let parse = |raw: &str| -> ServerSettings { toml::from_str(raw).unwrap() };
+        assert!(!effective_allow_non_loopback(false, &parse("")));
+        assert!(!effective_allow_non_loopback(false, &parse("allow_non_loopback = false\n")));
+        assert!(effective_allow_non_loopback(false, &parse("allow_non_loopback = true\n")));
+        // The flag still opts in on its own, and the file cannot turn it off.
+        assert!(effective_allow_non_loopback(true, &parse("")));
+        assert!(effective_allow_non_loopback(true, &parse("allow_non_loopback = false\n")));
     }
 
     #[test]
