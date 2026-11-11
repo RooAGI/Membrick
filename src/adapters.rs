@@ -49,6 +49,9 @@ pub(crate) struct ScannedFile {
     pub size_bytes: usize,
     pub modified: Option<std::time::SystemTime>,
     pub text: String,
+    /// Relative path of the file the text was read from. Equals `rel_path`
+    /// unless the text came from another file, such as an image description.
+    pub text_rel_path: String,
 }
 
 /// Walk the scan base for `root` and read every UTF-8 file whose extension
@@ -153,6 +156,7 @@ pub(crate) fn scan_files_with_text(
             size_bytes,
             modified,
             text,
+            text_rel_path: crate::graph::rel_path(rel_root, &text_path),
         });
     }
     files

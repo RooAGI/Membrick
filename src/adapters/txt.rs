@@ -7,9 +7,9 @@
 //! bounded parts under `<name> (part N)` headings. Lines that start with `#`
 //! are escaped so they are not read as headings.
 //!
-//! A `.txt` file next to a same-named image (`photo1.txt` beside
-//! `photo1.jpg`) is that image's description. The image adapter indexes it,
-//! so this adapter skips it.
+//! A `.txt` file that an image next to it picked as its description
+//! (`photo1.png.txt`, or `photo1.txt` when there is no full-name file) is
+//! indexed by the image adapter, so this adapter skips it.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, HashSet};

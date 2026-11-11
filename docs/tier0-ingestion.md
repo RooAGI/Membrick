@@ -21,7 +21,8 @@ The internal `Tier0Record` in `src/graph.rs` contains:
 
 Records are joined to parsed pages by their relative source path. Ignored pages
 are removed together with their Tier0 records. The scan covers Markdown, HTML,
-plain text, and images that have a same-named `.txt` description; see
+plain text, and images that have a `.txt` description next to them
+(`photo1.png.txt` or `photo1.txt` for `photo1.png`); see
 [Ingestion architecture](ingestion-architecture.md#file-types) for how each
 file type is read.
 

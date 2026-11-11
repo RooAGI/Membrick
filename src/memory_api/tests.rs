@@ -5936,8 +5936,15 @@ fn memory_service_indexes_and_searches_html_text_and_image_files() {
     std::fs::write(root.join("field-log.txt"), "Collected a volcanic basalt sample.").unwrap();
     std::fs::write(root.join("harbor.png"), [0x89, 0x50]).unwrap();
     std::fs::write(root.join("harbor.txt"), "A lighthouse beside the harbor at sunset.").unwrap();
+    // The full-name description form, `<image name>.txt`.
+    std::fs::write(root.join("map.jpg"), [0xFF, 0xD8]).unwrap();
+    std::fs::write(root.join("map.jpg.txt"), "A hand drawn treasure map of the island.").unwrap();
 
     let service = open_scanned_workspace(&root);
+    assert!(service
+        .source_document_by_id("map.jpg")
+        .is_some_and(|map| map.content.contains("A hand drawn treasure map")));
+    assert!(service.source_document_by_id("map.jpg.txt").is_none());
 
     // Each format is stored as one source document keyed by its own path,
     // and the image description is stored only under its image.
@@ -5957,6 +5964,7 @@ fn memory_service_indexes_and_searches_html_text_and_image_files() {
         ("when does the zebra migration finish", "roadmap.html"),
         ("volcanic basalt sample", "field-log.txt"),
         ("lighthouse beside the harbor", "harbor.png"),
+        ("hand drawn treasure map", "map.jpg"),
     ] {
         let payload = service
             .search_agent_cached(query, "claude-code", None, 3, &BTreeMap::new())
@@ -5969,6 +5977,7 @@ fn memory_service_indexes_and_searches_html_text_and_image_files() {
             .collect();
         assert_eq!(doc_ids.first().copied(), Some(expected), "{query}: {payload}");
         assert!(!doc_ids.contains(&"harbor.txt"), "{query}: {payload}");
+        assert!(!doc_ids.contains(&"map.jpg.txt"), "{query}: {payload}");
     }
 
     drop(service);

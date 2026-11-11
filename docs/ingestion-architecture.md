@@ -20,13 +20,19 @@ resolution work the same way for all of them. Code files are not scanned.
 | `.md` | Markdown | The file as written, with wiki and Markdown links, headings, and frontmatter metadata such as `supersedes` and `author`. |
 | `.html`, `.htm` | HTML | Readable content only. Headings become heading lines, lists, tables, code blocks and image alt text are kept, and scripts, styles and `<head>` are dropped. `<title>` is the top heading when the page has no `<h1>`, and `<meta name="author">` sets the author. |
 | `.txt` | Plain text | The file name as the top heading. Long files are split at blank lines into parts of about 2,000 characters under `<name> (part N)` headings. Lines starting with `#` are escaped so they are not read as headings. |
-| `.jpg`, `.jpeg`, `.png` (any case) | Image | The description in the same-named `.txt` file next to the image, for example `photo1.txt` for `photo1.jpg`. The image file itself is never read. |
+| `.jpg`, `.jpeg`, `.png` (any case) | Image | The description in a `.txt` file next to the image: the full image name plus `.txt` if it exists (`photo1.jpg.txt`, `photo1.png.txt`), otherwise the same stem (`photo1.txt`). The image file itself is never read. |
 
 Image documents use the image path as their id and source, so search results
 point at the image. They carry a `media_type` filter (`image/jpeg` or
-`image/png`) and record the description path in Tier0 metadata. A description
-file is indexed only under its image, never again as plain text. Images
-without a description are skipped. Byte limits apply to the description, not
+`image/png`) and record the description path in Tier0 metadata.
+
+The full-name form wins because it names exactly one image, so `photo1.jpg`
+and `photo1.png` can each have their own description. When only `photo1.txt`
+exists, every image named `photo1` shares it. A text file is skipped by the
+plain text adapter only when it is the description an image picked, so if
+both `photo1.jpg.txt` and `photo1.txt` exist, the second one is indexed as
+ordinary text. A `ghost.jpg.txt` with no `ghost.jpg` is also ordinary text.
+Images without a description are skipped. Byte limits apply to the description, not
 the image, and the modified time is the later of the two files.
 
 The scan limits (`max_files`, `max_total_bytes`) are shared across file types.
@@ -35,7 +41,7 @@ budget the earlier scans left unused.
 
 Adding, editing, or removing any of these files invalidates the workspace
 index. That includes images, because adding or removing `photo1.jpg` decides
-whether `photo1.txt` is a description or plain text. The watcher, the
+whether `photo1.txt` or `photo1.jpg.txt` is a description or plain text. The watcher, the
 workspace fingerprint, and the query cache fingerprint all use one shared
 check, `is_indexed_source_path` in `src/adapters.rs`.
 
