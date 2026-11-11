@@ -50,6 +50,9 @@ server_token = "replace-with-a-secret"
 tenant_id = "team-a"
 adaptive_segment_max_n = 32
 jwt_secret = "replace-with-a-secret"
+# Paths the project scan skips, matched as part of the path relative to the
+# project root. Unset means these defaults; setting it replaces them.
+ignore_paths = ["node_modules", "target", "dist", "build", "vendor", "coverage", ".git", "venv", ".tox", "site-packages"]
 # Allow `bind` or `resident_http_bind` to use a non-loopback address such as
 # 0.0.0.0. Requires server_token, server_token_file, or jwt_secret.
 # allow_non_loopback = true

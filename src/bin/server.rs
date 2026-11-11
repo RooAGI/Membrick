@@ -138,6 +138,11 @@ struct ServerSettings {
     server_token_file: Option<PathBuf>,
     tenant_id: Option<String>,
     jwt_secret: Option<String>,
+    /// Paths the project scan skips, matched as fragments of the path relative
+    /// to the project root. Read through `adapters::project_ignore_paths`;
+    /// declared here so a wrongly typed value fails the settings parse.
+    #[allow(dead_code)]
+    ignore_paths: Option<Vec<String>>,
     /// Allow `bind` and `resident_http_bind` to use a non-loopback address.
     /// The same rule as `--allow-non-loopback` applies: a server token or JWT
     /// secret must be configured. This is the only way to opt in for a
@@ -460,7 +465,7 @@ fn open_workspace_runtime(
 fn start_runtime_workspace_watcher(runtime: Arc<WorkspaceRuntime>) {
     let watcher = match crate::pipeline::WorkspaceWatcher::new(
         &runtime.project_root,
-        &provider_memory_ignore_paths(),
+        &provider_memory_ignore_paths(&runtime.project_root),
     ) {
         Ok(watcher) => Arc::new(watcher),
         Err(error) => {
@@ -490,7 +495,7 @@ fn start_runtime_watcher_with_handle(
     let root = runtime.project_root.clone();
     let index_root = runtime.workspace_index_root.clone();
     let writer = runtime.staged_writer.for_workspace();
-    let ignore_paths = provider_memory_ignore_paths();
+    let ignore_paths = provider_memory_ignore_paths(&root);
     tokio::spawn(async move {
         let mut poll = tokio::time::interval(Duration::from_millis(500));
         let mut refresh_pending = false;
@@ -705,19 +710,9 @@ struct DashboardSession {
     last_event: String,
 }
 
-fn provider_memory_ignore_paths() -> Vec<String> {
-    [
-        "node_modules",
-        "target",
-        "dist",
-        "build",
-        "vendor",
-        "coverage",
-        ".git",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+/// The project's `ignore_paths` from `.membrick/server.toml`, or the defaults.
+fn provider_memory_ignore_paths(root: &std::path::Path) -> Vec<String> {
+    crate::adapters::project_ignore_paths(root)
 }
 
 #[cfg(test)]
@@ -737,7 +732,7 @@ fn open_workspace_owner_at(
     workspace_root: &std::path::Path,
     options: PipelineOptions,
 ) -> anyhow::Result<MemoryService> {
-    let ignore_paths = provider_memory_ignore_paths();
+    let ignore_paths = provider_memory_ignore_paths(root);
     let mut owner = MemoryService::open_workspace_owner_with_options_at(
         root,
         workspace_root,
@@ -934,7 +929,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let workspace_index_root =
         selected_index.unwrap_or_else(|| project_root.join(".membrick").join("workspace-memory"));
     let owner = open_workspace_owner_at(&project_root, &workspace_index_root, options.clone())?;
-    let ignore_paths = provider_memory_ignore_paths();
+    let ignore_paths = provider_memory_ignore_paths(&project_root);
     let watcher = crate::pipeline::WorkspaceWatcher::new(&project_root, &ignore_paths)?;
     {
         let documents = owner
@@ -1022,7 +1017,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     ) {
         let project_root = state.project_root.clone();
         let workspace_index_root = state.workspace_index_root.clone();
-        let ignore_paths = provider_memory_ignore_paths();
+        let ignore_paths = provider_memory_ignore_paths(&project_root);
         tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_millis(500));
             let mut refresh_pending = false;

@@ -272,6 +272,17 @@ impl Graph {
             corpus.pages.extend(more.pages);
             corpus.tier0_records.extend(more.tier0_records);
         }
+        // Membrick's own state is never project content, whatever
+        // `ignore_paths` says; the watcher and fingerprints skip it too.
+        let is_membrick_state = |rel_path: &str| {
+            Path::new(rel_path)
+                .components()
+                .any(|component| component.as_os_str() == ".membrick")
+        };
+        corpus.pages.retain(|page| !is_membrick_state(&page.rel_path));
+        corpus
+            .tier0_records
+            .retain(|record| !is_membrick_state(&record.source));
         let pages: Vec<Page> = corpus
             .pages
             .into_iter()

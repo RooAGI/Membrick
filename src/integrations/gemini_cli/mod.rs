@@ -1066,10 +1066,10 @@ mod tests {
         // (session pointers, follow-up resolution) to the adapter's own
         // provider, never hardcoded "gemini".
         let root = temp_root("hermes-scope");
-        let memory_root = mcp_index::shared_memory_root(&root);
-        fs::create_dir_all(&memory_root).unwrap();
+        // A project file; the scan never indexes files inside `.membrick`.
+        fs::create_dir_all(&root).unwrap();
         fs::write(
-            memory_root.join("tea.md"),
+            root.join("tea.md"),
             "# Tea\nLuyi prefers oolong tea from Alishan, Taiwan.",
         )
         .unwrap();

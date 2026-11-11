@@ -100,16 +100,8 @@ fn query_cache_core_file(s: &CacheSettings<'_>) -> PathBuf {
 }
 
 fn fingerprint_base_path(root_path: &str) -> PathBuf {
-    let root = Path::new(root_path);
-    if root.is_file() {
-        return root.parent().unwrap_or(root).to_path_buf();
-    }
-    let docs = root.join("docs");
-    if docs.is_dir() {
-        docs
-    } else {
-        root.to_path_buf()
-    }
+    // Fingerprint the same folder the project scan walks.
+    crate::adapters::scan_base(Path::new(root_path))
 }
 
 pub(crate) fn compute_corpus_fingerprint(

@@ -265,15 +265,7 @@ pub fn build_markdown_corpus(
 }
 
 fn docs_dir(root: &Path) -> PathBuf {
-    if root.is_file() {
-        return root.parent().unwrap_or(root).to_path_buf();
-    }
-    let docs = root.join("docs");
-    if docs.is_dir() {
-        docs
-    } else {
-        root.to_path_buf()
-    }
+    crate::adapters::scan_base(root)
 }
 
 pub(crate) fn parse_frontmatter_kv(content: &str) -> HashMap<String, String> {

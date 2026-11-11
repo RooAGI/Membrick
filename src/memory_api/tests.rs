@@ -5890,12 +5890,14 @@ fn workspace_source_documents_cover_every_scanned_format() {
 }
 
 /// Open a project through `MemoryService` the way the MCP tools do: the
-/// service runs the project scan through its source-document callback.
+/// service runs the project scan through its source-document callback, with
+/// the project's `ignore_paths` applied.
 fn open_scanned_workspace(root: &Path) -> MemoryService {
+    let ignore_paths = crate::adapters::project_ignore_paths(root);
     MemoryService::open_workspace(
         root,
         crate::integrations::mcp_index::SHARED_MEMORY_DIR,
-        &[],
+        &ignore_paths,
         || {
             let input = crate::adapters::AdapterInput {
                 root,
@@ -5905,10 +5907,63 @@ fn open_scanned_workspace(root: &Path) -> MemoryService {
                 max_total_bytes: 100_000_000,
             };
             let graph = crate::adapters::build_project_graph(&input)?;
+            let graph = crate::adapters::apply_ignore_paths(graph, &ignore_paths);
             Ok(crate::adapters::graph_to_source_documents(&graph))
         },
     )
     .expect("workspace opens through MemoryService")
+}
+
+#[test]
+fn memory_service_indexes_the_whole_project_except_configured_ignore_paths() {
+    let temp_base = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let root = temp_base.join(format!(
+        "membrick-service-ignore-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for folder in ["docs", "drafts", "node_modules/pkg", ".venv/lib/site-packages/pkg"] {
+        std::fs::create_dir_all(root.join(folder)).unwrap();
+    }
+    std::fs::write(root.join(".venv/lib/site-packages/pkg/LICENSE.txt"), "MIT License").unwrap();
+    std::fs::write(root.join("README.md"), "# Readme\nThe project overview.").unwrap();
+    std::fs::write(root.join("docs/guide.md"), "# Guide\nHow to use it.").unwrap();
+    std::fs::write(root.join("drafts/idea.md"), "# Idea\nNot ready.").unwrap();
+    std::fs::write(root.join("node_modules/pkg/readme.md"), "# Pkg").unwrap();
+    std::fs::create_dir_all(root.join(".membrick")).unwrap();
+    // A configured list replaces the defaults, so node_modules is indexed
+    // here and only drafts is skipped.
+    std::fs::write(
+        root.join(".membrick/server.toml"),
+        "ignore_paths = [\"drafts\"]\n",
+    )
+    .unwrap();
+
+    let service = open_scanned_workspace(&root);
+    // Outside docs/ is indexed now that the docs-only rule is gone.
+    assert!(service.source_document_by_id("README.md").is_some());
+    assert!(service.source_document_by_id("docs/guide.md").is_some());
+    assert!(service.source_document_by_id("drafts/idea.md").is_none());
+    assert!(service.source_document_by_id("node_modules/pkg/readme.md").is_some());
+    drop(service);
+
+    // Without the key, the defaults apply and node_modules is skipped.
+    std::fs::write(root.join(".membrick/server.toml"), "").unwrap();
+    std::fs::remove_dir_all(root.join(".membrick/memory")).ok();
+    let service = open_scanned_workspace(&root);
+    assert!(service.source_document_by_id("drafts/idea.md").is_some());
+    assert!(service.source_document_by_id("node_modules/pkg/readme.md").is_none());
+    assert!(service
+        .source_document_by_id(".venv/lib/site-packages/pkg/LICENSE.txt")
+        .is_none());
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

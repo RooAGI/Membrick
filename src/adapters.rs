@@ -25,19 +25,47 @@ pub mod image;
 pub mod markdown;
 pub mod txt;
 
-/// Directory a file adapter walks for `root`, matching the Markdown scan: a
-/// single file scans its parent, and a project with a `docs` directory scans
-/// that directory.
+/// Directory every file adapter walks for `root`: the whole project root, or
+/// for a single-file root, that file's folder (the walk then keeps only that
+/// file). Paths to leave out are set with `ignore_paths`, see
+/// [`project_ignore_paths`].
 pub(crate) fn scan_base(root: &Path) -> std::path::PathBuf {
     if root.is_file() {
         return root.parent().unwrap_or(root).to_path_buf();
     }
-    let docs = root.join("docs");
-    if docs.is_dir() {
-        docs
-    } else {
-        root.to_path_buf()
-    }
+    root.to_path_buf()
+}
+
+/// Paths the project scan skips when `.membrick/server.toml` does not set
+/// `ignore_paths`. Each entry is matched as a fragment of the lowercase path
+/// relative to the project root.
+pub(crate) const DEFAULT_IGNORE_PATHS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "vendor",
+    "coverage",
+    ".git",
+    // Python virtual environments (`.venv`, `venv`) and installed packages,
+    // which hold many package README.md and LICENSE.txt files.
+    "venv",
+    ".tox",
+    "site-packages",
+];
+
+/// The project's `ignore_paths` from `.membrick/server.toml`, or
+/// [`DEFAULT_IGNORE_PATHS`] when the file or the key is absent. Setting the
+/// key replaces the defaults, so `ignore_paths = []` skips nothing. A file the
+/// resident cannot parse also falls back to the defaults here; the resident
+/// itself refuses to start on it and reports the error.
+pub(crate) fn project_ignore_paths(root: &Path) -> Vec<String> {
+    let configured = std::fs::read_to_string(root.join(".membrick").join("server.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok())
+        .and_then(|settings| settings.get("ignore_paths").cloned())
+        .and_then(|value| value.try_into::<Vec<String>>().ok());
+    configured.unwrap_or_else(|| DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect())
 }
 
 /// One readable file found by [`scan_text_files`].
@@ -410,6 +438,49 @@ mod tests {
         let mut paths: Vec<_> = graph.pages.iter().map(|p| p.rel_path.clone()).collect();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn the_scan_covers_the_whole_project_even_when_it_has_a_docs_folder() {
+        let root = temp_dir("whole-project");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("README.md"), "# Readme").unwrap();
+        fs::write(root.join("docs").join("guide.md"), "# Guide").unwrap();
+        fs::write(root.join("src").join("notes.txt"), "Notes").unwrap();
+        // Membrick's own state is skipped even with an empty ignore list.
+        fs::create_dir_all(root.join(".membrick").join("runtime")).unwrap();
+        fs::write(root.join(".membrick").join("server.toml"), "ignore_paths = []\n").unwrap();
+        fs::write(root.join(".membrick").join("runtime").join("notes.md"), "# State").unwrap();
+
+        let graph = build_project_graph(&input_for(&root, 50_000, 100_000_000)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            sorted_page_paths(&graph),
+            vec!["README.md", "docs/guide.md", "src/notes.txt"]
+        );
+    }
+
+    #[test]
+    fn ignore_paths_come_from_server_toml_with_defaults_when_unset() {
+        let defaults: Vec<String> = DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect();
+        let root = temp_dir("ignore-settings");
+        // No settings file, then a file without the key.
+        assert_eq!(project_ignore_paths(&root), defaults);
+        fs::create_dir_all(root.join(".membrick")).unwrap();
+        let settings = root.join(".membrick").join("server.toml");
+        fs::write(&settings, "bind = \"127.0.0.1:8080\"\n").unwrap();
+        assert_eq!(project_ignore_paths(&root), defaults);
+        // A configured list replaces the defaults, including an empty one.
+        fs::write(&settings, "ignore_paths = [\"drafts\", \"vendor\"]\n").unwrap();
+        assert_eq!(project_ignore_paths(&root), vec!["drafts", "vendor"]);
+        fs::write(&settings, "ignore_paths = []\n").unwrap();
+        assert!(project_ignore_paths(&root).is_empty());
+        // A wrongly typed value falls back to the defaults.
+        fs::write(&settings, "ignore_paths = \"drafts\"\n").unwrap();
+        assert_eq!(project_ignore_paths(&root), defaults);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

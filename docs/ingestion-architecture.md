@@ -32,8 +32,30 @@ exists, every image named `photo1` shares it. A text file is skipped by the
 plain text adapter only when it is the description an image picked, so if
 both `photo1.jpg.txt` and `photo1.txt` exist, the second one is indexed as
 ordinary text. A `ghost.jpg.txt` with no `ghost.jpg` is also ordinary text.
-Images without a description are skipped. Byte limits apply to the description, not
-the image, and the modified time is the later of the two files.
+Images without a description are skipped. Byte limits apply to the
+description, not the image, and the modified time is the later of the two
+files.
+
+## What the scan covers
+
+The scan walks the whole project root, or only the given file for a
+single-file root. It skips the paths listed in `ignore_paths` in
+`.membrick/server.toml`. Each entry is matched as part of the lowercase path
+relative to the project root. When the key is absent, the defaults apply:
+
+```toml
+ignore_paths = ["node_modules", "target", "dist", "build", "vendor", "coverage", ".git", "venv", ".tox", "site-packages"]
+```
+
+`venv` covers both `.venv` and `venv`. Because entries match any part of the
+path, a default can also skip a file whose name contains it, such as
+`docs/build-guide.md` or `docs/venv-setup.md`; remove the entry from your list
+if that matters.
+
+Setting the key replaces the defaults; `ignore_paths = []` skips nothing. New
+installs write the defaults into `server.toml`. The resident, the MCP tools,
+and the watcher all read the list through `project_ignore_paths` in
+`src/adapters.rs`. The `.membrick` folder itself is never indexed.
 
 The scan limits (`max_files`, `max_total_bytes`) are shared across file types.
 Markdown is scanned first, then HTML, plain text, and images; each gets the

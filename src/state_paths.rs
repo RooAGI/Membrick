@@ -65,12 +65,22 @@ fn initialize_default_settings(workspace: &Path) -> anyhow::Result<PathBuf> {
     }
 
     let port = available_resident_http_port(workspace)?;
+    let ignore_paths = crate::adapters::DEFAULT_IGNORE_PATHS
+        .iter()
+        .map(|path| format!("\"{path}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let defaults = format!(
         "# Membrick local server settings. Existing files are preserved by install.\n\
 bind = \"127.0.0.1:8080\"\n\
 resident_http_bind = \"127.0.0.1:{port}\"\n\
 resident_http_auto_port = true\n\
-dashboard_url = \"http://127.0.0.1:{port}/dashboard\"\n"
+dashboard_url = \"http://127.0.0.1:{port}/dashboard\"\n\
+\n\
+# The project scan indexes the whole project root except these paths. Each\n\
+# entry is matched as part of the path relative to the project root. Add a\n\
+# folder to skip it, or remove an entry to index it.\n\
+ignore_paths = [{ignore_paths}]\n"
     );
     let temporary = settings_temporary_path(&state)?;
     let mut file = fs::OpenOptions::new()
@@ -418,6 +428,16 @@ mod tests {
             .unwrap();
         assert!(parsed["resident_http_bind"].as_str().is_some());
         assert!(parsed["dashboard_url"].as_str().is_some());
+        // The default ignore list is written out so users can see and edit
+        // it, and reading it back gives the same list the scan uses.
+        assert!(parsed["ignore_paths"].as_array().is_some());
+        assert_eq!(
+            crate::adapters::project_ignore_paths(&workspace),
+            crate::adapters::DEFAULT_IGNORE_PATHS
+                .iter()
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>()
+        );
         fs::remove_dir_all(workspace).unwrap();
     }
 
