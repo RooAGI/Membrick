@@ -14,11 +14,16 @@ pub(super) fn router() -> Router<AppState> {
             get(dashboard_search_evaluation),
         )
         .route("/dashboard/board-ui.mjs", get(dashboard_board_ui))
+        .route(
+            "/dashboard/provider-turns.mjs",
+            get(dashboard_provider_turns),
+        )
         .route("/dashboard/styles.css", get(dashboard_styles))
         .route("/dashboard/rooagi-logo.png", get(dashboard_logo))
         .route("/api/status", get(api_status))
         .route("/api/timeseries", get(api_timeseries))
         .route("/api/search-reviews", get(api_search_reviews))
+        .route("/api/mcp-search-response", get(api_mcp_search_response))
         .route("/api/integrations", get(api_integrations))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/:session_key/events", get(api_session_events))
@@ -82,6 +87,19 @@ pub(super) async fn dashboard_board_ui() -> (
     )
 }
 
+pub(super) async fn dashboard_provider_turns() -> (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../../dashboard/provider-turns.mjs"),
+    )
+}
+
 pub(super) async fn dashboard_capture_progress() -> (
     [(axum::http::header::HeaderName, &'static str); 1],
     &'static str,
@@ -116,8 +134,11 @@ pub(super) async fn dashboard_logo() -> (
 }
 
 pub(super) async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
-    let inspection = match state.service.read() {
-        Ok(service) => service.memory_store(MemoryStore::Workspace).inspection(),
+    let (inspection, captured_inspection) = match state.service.read() {
+        Ok(service) => (
+            service.memory_store(MemoryStore::Workspace).inspection(),
+            service.memory_store(MemoryStore::Captured).inspection(),
+        ),
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -142,6 +163,7 @@ pub(super) async fn api_status(State(state): State<AppState>) -> impl IntoRespon
             .checked_div(1_000)
             .unwrap_or_default(),
         index: dashboard_index_status(inspection),
+        captured_index: dashboard_index_status(captured_inspection),
         telemetry,
         integrations: dashboard_integrations(&state.project_root),
         transcript_captures: {
@@ -154,6 +176,41 @@ pub(super) async fn api_status(State(state): State<AppState>) -> impl IntoRespon
         },
     })
     .into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct McpSearchResponseQuery {
+    search_id: String,
+}
+
+pub(super) async fn api_mcp_search_response(
+    State(state): State<AppState>,
+    Query(query): Query<McpSearchResponseQuery>,
+) -> impl IntoResponse {
+    if query.search_id.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"detail":"invalid search id"})),
+        )
+            .into_response();
+    }
+    match crate::telemetry::mcp_search_record_by_trace_id(&state.project_root, &query.search_id) {
+        Ok(Some(record)) => Json(json!({
+            "search_id": query.search_id,
+            "response": record.response.get("result").cloned().unwrap_or(record.response),
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"detail":"search response not found"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"detail":"search response unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 pub(super) async fn api_timeseries(State(state): State<AppState>) -> impl IntoResponse {

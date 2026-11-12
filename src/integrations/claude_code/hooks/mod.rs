@@ -261,6 +261,27 @@ fn handle_hook_with_backend(
             tracing::warn!("Claude transcript usage capture failed open: {error:#}");
         }
     }
+    // A subagent's usage lives in its own transcript. Never fall back to the
+    // parent transcript, which would count the parent's tokens again.
+    if matches!(kind, ClaudeHookKind::SubagentStop) && !input.stop_hook_active {
+        let agent_transcript = input
+            .extra
+            .get("agent_transcript_path")
+            .and_then(serde_json::Value::as_str)
+            .map(Path::new);
+        if let Err(error) = record_transcript_usage_if_available(
+            RecordingProvider::Claude,
+            &root,
+            &session_id,
+            agent_transcript,
+            input.turn_id.as_deref(),
+            input.agent_id.as_deref(),
+            input.agent_type.as_deref(),
+            "claude-subagent-transcript",
+        ) {
+            tracing::warn!("Claude subagent usage capture failed open: {error:#}");
+        }
+    }
     if !membrick_enabled(RecordingProvider::Claude, &root)? {
         return Ok(ClaudeHookOutput::default());
     }
@@ -453,6 +474,7 @@ fn retrieve(
         }
         context.push_str(&entry);
         retrieved_memories.push(serde_json::json!({
+            "doc_id": result.get("doc_id"),
             "source": source,
             "type": result.get("document_type").and_then(Value::as_str).unwrap_or("memory"),
             "score": result.get("score"),
@@ -1462,6 +1484,84 @@ mod tests {
             doc_types,
             HashSet::from(["outcome".to_string(), "session-context".to_string(),])
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn subagent_stop_input(
+        root: &Path,
+        parent: &Path,
+        agent_transcript: Option<&Path>,
+    ) -> ClaudeHookInput {
+        let mut value = serde_json::json!({
+            "session_id": "session-1",
+            "transcript_path": parent,
+            "cwd": root,
+            "hook_event_name": "SubagentStop",
+            "agent_id": "agent-7",
+            "agent_type": "Explore"
+        });
+        if let Some(path) = agent_transcript {
+            value["agent_transcript_path"] = serde_json::json!(path);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn usage_events(root: &Path) -> Vec<crate::telemetry::ProviderLifecycleEvent> {
+        crate::telemetry::provider_lifecycle_status(root, "claude")
+            .unwrap()
+            .map(|status| {
+                status
+                    .events
+                    .into_iter()
+                    .filter(|event| event.event == "TurnUsage")
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn subagent_stop_records_usage_from_the_subagent_transcript() {
+        let root = temp_dir("subagent-usage");
+        let parent = root.join("parent.jsonl");
+        fs::write(
+            &parent,
+            r#"{"type":"assistant","message":{"role":"assistant","content":"parent","usage":{"input_tokens":1000,"output_tokens":100}}}"#,
+        )
+        .unwrap();
+        let agent = root.join("agent-7.jsonl");
+        fs::write(
+            &agent,
+            r#"{"type":"assistant","message":{"role":"assistant","content":"done","usage":{"input_tokens":18,"output_tokens":5,"cache_read_input_tokens":40}}}"#,
+        )
+        .unwrap();
+
+        let input = subagent_stop_input(&root, &parent, Some(&agent));
+        handle_hook_test(ClaudeHookKind::SubagentStop, input, &root).unwrap();
+
+        let usage = usage_events(&root);
+        assert_eq!(usage.len(), 1, "one usage event for the subagent turn");
+        assert_eq!(usage[0].agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(usage[0].agent_type.as_deref(), Some("Explore"));
+        assert_eq!(usage[0].input_tokens, Some(18));
+        assert_eq!(usage[0].output_tokens, Some(5));
+        assert_eq!(usage[0].cache_read_input_tokens, Some(40));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subagent_stop_without_agent_transcript_never_reads_the_parent_usage() {
+        let root = temp_dir("subagent-usage-missing");
+        let parent = root.join("parent.jsonl");
+        fs::write(
+            &parent,
+            r#"{"type":"assistant","message":{"role":"assistant","content":"parent","usage":{"input_tokens":1000,"output_tokens":100}}}"#,
+        )
+        .unwrap();
+
+        let input = subagent_stop_input(&root, &parent, None);
+        handle_hook_test(ClaudeHookKind::SubagentStop, input, &root).unwrap();
+
+        assert!(usage_events(&root).is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

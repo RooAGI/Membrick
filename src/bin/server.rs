@@ -564,6 +564,7 @@ struct DashboardStatus {
     version: &'static str,
     uptime_seconds: u64,
     index: DashboardIndexStatus,
+    captured_index: DashboardIndexStatus,
     telemetry: TelemetrySnapshot,
     integrations: Vec<DashboardIntegrationStatus>,
     transcript_captures: Value,
@@ -620,8 +621,10 @@ struct DashboardIntegrationStatus {
     event_window_limit: usize,
     /// Cumulative counters, or `None` when the ledger predates them.
     counters: Option<DashboardProviderCounters>,
-    /// The newest prompt, stop, usage and subagent events.
+    /// The newest main-agent prompt, stop, usage and session events.
     milestone_events: Vec<ProviderLifecycleEvent>,
+    /// The newest subagent starts, stops and subagent usage events.
+    subagent_events: Vec<ProviderLifecycleEvent>,
 }
 
 /// Cumulative per-provider counters as served by `/api/status`. The ledger's
@@ -1815,6 +1818,7 @@ fn dashboard_integration(
         event_window_limit: crate::telemetry::MAX_PROVIDER_TELEMETRY_EVENTS,
         counters,
         milestone_events: status.milestone_events,
+        subagent_events: status.subagent_events,
         provider,
         recording_provider,
         compiled,

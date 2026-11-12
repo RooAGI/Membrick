@@ -251,6 +251,7 @@ fn handle_hook_with_backend(
         if !excerpt.trim().is_empty() {
             context.push_str(&format!("\n- Source: {}\n  {}\n", source, excerpt));
             retrieved_memories.push(serde_json::json!({
+                "doc_id": result.get("doc_id"),
                 "source": source,
                 "type": result.get("document_type").and_then(Value::as_str).unwrap_or("memory"),
                 "score": result.get("score"),

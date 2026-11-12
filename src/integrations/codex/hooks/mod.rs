@@ -456,6 +456,7 @@ fn retrieve(
         }
         context.push_str(&entry);
         retrieved_memories.push(serde_json::json!({
+            "doc_id": result.get("doc_id"),
             "source": source,
             "type": result.get("document_type").and_then(Value::as_str).unwrap_or("memory"),
             "score": result.get("score"),

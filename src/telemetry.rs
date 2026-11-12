@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::{mpsc, Mutex};
 use std::thread;
@@ -303,13 +303,18 @@ pub struct ProviderLifecycleStatus {
     /// load with zeroed counters and `since_ms == 0`.
     #[serde(default)]
     pub counters: ProviderLifecycleCounters,
-    /// The newest prompt, stop, usage and subagent events, kept apart from
-    /// `events` so retrieval and tool bursts cannot evict them.
+    /// The newest main-agent prompt, stop, usage and session events, kept
+    /// apart from `events` so retrieval and tool bursts cannot evict them.
     #[serde(default)]
     pub milestone_events: Vec<ProviderLifecycleEvent>,
+    /// The newest subagent starts, stops and subagent usage events. They have
+    /// their own buffer so a long run of main-agent turns cannot evict them.
+    #[serde(default)]
+    pub subagent_events: Vec<ProviderLifecycleEvent>,
 }
 
 const MAX_PROVIDER_MILESTONE_EVENTS: usize = 50;
+pub const MAX_PROVIDER_SUBAGENT_EVENTS: usize = 100;
 const MAX_OPEN_PROMPT_SESSIONS: usize = 256;
 const MAX_OPEN_SUBAGENTS: usize = 256;
 /// Upper bounds of the prompt-to-stop duration histogram buckets. The last
@@ -560,6 +565,20 @@ impl ProviderLifecycleCounters {
     }
 }
 
+/// Subagent lifecycle events, and usage reported for a subagent's own turn.
+fn is_subagent_event(event: &ProviderLifecycleEvent) -> bool {
+    matches!(event.event.as_str(), "SubagentStart" | "SubagentStop")
+        || (event.event == "TurnUsage" && event.agent_id.is_some())
+}
+
+fn push_bounded(list: &mut Vec<ProviderLifecycleEvent>, event: ProviderLifecycleEvent, cap: usize) {
+    list.push(event);
+    if list.len() > cap {
+        let keep_from = list.len() - cap;
+        list.drain(..keep_from);
+    }
+}
+
 fn is_milestone_event(event_name: &str) -> bool {
     matches!(
         event_name,
@@ -568,8 +587,6 @@ fn is_milestone_event(event_name: &str) -> bool {
             | "Stop"
             | "AfterAgent"
             | "TurnUsage"
-            | "SubagentStart"
-            | "SubagentStop"
             | "SessionStart"
             | "SessionEnd"
     )
@@ -597,6 +614,9 @@ pub struct ProviderLifecycleEvent {
     pub prompt_preview: Option<String>,
     #[serde(default)]
     pub tool_response_preview: Option<String>,
+    /// Search trace for a Membrick MCP search tool response, when present.
+    #[serde(default)]
+    pub mcp_search_id: Option<String>,
     #[serde(default)]
     pub stop_response_preview: Option<String>,
     #[serde(default)]
@@ -682,6 +702,15 @@ pub fn record_provider_lifecycle_event(
         retrieved_memory_count,
         retrieved_memory_details,
     ) = event_details(provider, event_name, payload);
+    let mcp_search_id = if matches!(event_name, "PostToolUse" | "PostToolUseFailure" | "AfterTool")
+        && tool_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("mcp__membrick__search"))
+    {
+        mcp_tool_response(payload).and_then(mcp_search_trace_id)
+    } else {
+        None
+    };
     status.provider = provider.to_string();
     status.last_event = Some(event_name.to_string());
     status.last_seen_ms = now_ms();
@@ -713,6 +742,7 @@ pub fn record_provider_lifecycle_event(
         tool_arguments,
         prompt_preview,
         tool_response_preview,
+        mcp_search_id,
         stop_response_preview,
         input_tokens,
         output_tokens,
@@ -725,12 +755,18 @@ pub fn record_provider_lifecycle_event(
         retrieved_memory_details,
     };
     status.counters.record(&event);
-    if is_milestone_event(event_name) {
-        status.milestone_events.push(event.clone());
-        if status.milestone_events.len() > MAX_PROVIDER_MILESTONE_EVENTS {
-            let keep_from = status.milestone_events.len() - MAX_PROVIDER_MILESTONE_EVENTS;
-            status.milestone_events.drain(..keep_from);
-        }
+    if is_subagent_event(&event) {
+        push_bounded(
+            &mut status.subagent_events,
+            event.clone(),
+            MAX_PROVIDER_SUBAGENT_EVENTS,
+        );
+    } else if is_milestone_event(event_name) {
+        push_bounded(
+            &mut status.milestone_events,
+            event.clone(),
+            MAX_PROVIDER_MILESTONE_EVENTS,
+        );
     }
     status.events.push(event);
     if status.events.len() > MAX_PROVIDER_TELEMETRY_EVENTS {
@@ -864,10 +900,25 @@ fn event_details(
     Option<String>,
 ) {
     let object = payload.as_object();
-    let value_for =
-        |keys: &[&str]| object.and_then(|object| keys.iter().find_map(|key| object.get(*key)));
+    // Hook adapters put fields they do not model under `extra`, so look there
+    // after the top level. A key that is present but null does not count.
+    let extra = object
+        .and_then(|object| object.get("extra"))
+        .and_then(serde_json::Value::as_object);
+    let value_for = |keys: &[&str]| {
+        keys.iter().find_map(|key| {
+            [object, extra]
+                .into_iter()
+                .flatten()
+                .find_map(|scope| scope.get(*key).filter(|value| !value.is_null()))
+        })
+    };
     let string_for = |keys: &[&str]| value_for(keys).and_then(|value| value.as_str());
-    let identity_for = |keys: &[&str]| string_for(keys).map(|value| truncate_text(value, 160));
+    let identity_for = |keys: &[&str]| {
+        string_for(keys)
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| truncate_text(value, 160))
+    };
     let tool_event = matches!(
         event_name,
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "BeforeTool"
@@ -899,9 +950,17 @@ fn event_details(
     let tool_response_preview = response_event
         .then(|| value_for(&["tool_response", "toolResponse", "tool_output", "response"]))
         .flatten()
-        .and_then(preview_value);
+        .and_then(|value| preview_tool_response(value, tool_name.as_deref()));
     let stop_response_preview = stop_event
-        .then(|| value_for(&["final_response", "response", "output", "reason"]))
+        .then(|| {
+            value_for(&[
+                "last_assistant_message",
+                "final_response",
+                "response",
+                "output",
+                "reason",
+            ])
+        })
         .flatten()
         .and_then(preview_value);
     let retrieval_query_preview = (event_name == "MemoryRetrieved")
@@ -917,7 +976,7 @@ fn event_details(
     let retrieved_memory_details = (event_name == "MemoryRetrieved")
         .then(|| value_for(&["retrieved_memory_details"]))
         .flatten()
-        .and_then(preview_value);
+        .and_then(preview_memory_details);
     let usage = normalize_usage(provider, payload);
     let usage = usage.as_ref().and_then(serde_json::Value::as_object);
     let usage_number = |keys: &[&str]| {
@@ -955,18 +1014,78 @@ fn event_details(
 }
 
 fn preview_value(value: &serde_json::Value) -> Option<String> {
-    let sanitized = sanitize_tool_value(value, None, 0);
+    preview_value_with_limits(value, 2_048, 512)
+}
+
+fn mcp_tool_response(payload: &serde_json::Value) -> Option<&serde_json::Value> {
+    let object = payload.as_object()?;
+    let extra = object.get("extra").and_then(serde_json::Value::as_object);
+    [Some(object), extra]
+        .into_iter()
+        .flatten()
+        .find_map(|scope| {
+            ["tool_response", "toolResponse", "tool_output", "response"]
+                .iter()
+                .find_map(|key| scope.get(*key).filter(|value| !value.is_null()))
+        })
+}
+
+fn mcp_search_trace_id(value: &serde_json::Value) -> Option<String> {
+    if let Some(id) = value.get("search_id").and_then(serde_json::Value::as_str) {
+        return Some(id.to_string());
+    }
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|nested| mcp_search_trace_id(&nested));
+    }
+    if let Some(result) = value.get("result") {
+        if let Some(id) = mcp_search_trace_id(result) {
+            return Some(id);
+        }
+    }
+    value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|item| item.get("text").and_then(mcp_search_trace_id))
+}
+
+fn preview_tool_response(value: &serde_json::Value, tool_name: Option<&str>) -> Option<String> {
+    let is_membrick_search = tool_name
+        .is_some_and(|name| name.eq_ignore_ascii_case("mcp__membrick__search"));
+    if is_membrick_search {
+        preview_value_with_limits(value, 64 * 1024, 64 * 1024)
+    } else {
+        preview_value(value)
+    }
+}
+
+fn preview_memory_details(value: &serde_json::Value) -> Option<String> {
+    // Keep the full structured array so the dashboard can render every
+    // injected memory. Five excerpts can exceed the generic 2 KiB preview.
+    preview_value_with_limits(value, 64 * 1024, 4 * 1024)
+}
+
+fn preview_value_with_limits(
+    value: &serde_json::Value,
+    preview_limit: usize,
+    string_limit: usize,
+) -> Option<String> {
+    let sanitized = sanitize_tool_value(value, None, 0, string_limit);
     let rendered = match sanitized {
         serde_json::Value::String(value) => value,
         value => serde_json::to_string(&value).ok()?,
     };
-    Some(truncate_text(&rendered, 2_048))
+    Some(truncate_text(&rendered, preview_limit))
 }
 
 fn sanitize_tool_value(
     value: &serde_json::Value,
     key: Option<&str>,
     depth: usize,
+    string_limit: usize,
 ) -> serde_json::Value {
     if depth > 6 {
         return serde_json::Value::String("[MAX_DEPTH]".to_string());
@@ -982,7 +1101,7 @@ fn sanitize_tool_value(
                 .map(|(key, value)| {
                     (
                         key.clone(),
-                        sanitize_tool_value(value, Some(key), depth + 1),
+                        sanitize_tool_value(value, Some(key), depth + 1, string_limit),
                     )
                 })
                 .collect(),
@@ -991,16 +1110,13 @@ fn sanitize_tool_value(
             values
                 .iter()
                 .take(20)
-                .map(|value| sanitize_tool_value(value, None, depth + 1))
+                .map(|value| sanitize_tool_value(value, None, depth + 1, string_limit))
                 .collect(),
         ),
-        serde_json::Value::String(value) => {
-            if looks_like_credential(value) {
-                serde_json::Value::String("[REDACTED]".to_string())
-            } else {
-                serde_json::Value::String(truncate_text(value, 512))
-            }
-        }
+        serde_json::Value::String(value) => serde_json::Value::String(truncate_text(
+            &redact_credential_substrings(value),
+            string_limit,
+        )),
         other => other.clone(),
     }
 }
@@ -1023,10 +1139,34 @@ fn is_sensitive_key(key: &str) -> bool {
     .any(|needle| key.contains(needle))
 }
 
-fn looks_like_credential(value: &str) -> bool {
-    ["sk-", "sk_live_", "ghp_", "gho_", "xoxb-", "Bearer "]
-        .iter()
-        .any(|prefix| value.contains(prefix))
+fn redact_credential_substrings(value: &str) -> String {
+    const PREFIXES: &[&str] = &["sk_live_", "sk-", "ghp_", "gho_", "xoxb-", "Bearer "];
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let remaining = &value[cursor..];
+        let next = PREFIXES
+            .iter()
+            .filter_map(|prefix| remaining.find(prefix).map(|at| (at, *prefix)))
+            .min_by_key(|(at, _)| *at);
+        let Some((offset, prefix)) = next else {
+            output.push_str(remaining);
+            break;
+        };
+        let start = cursor + offset;
+        output.push_str(&value[cursor..start]);
+        let token_start = start + prefix.len();
+        let token_end = value[token_start..]
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | '<' | '>' | ',' | ';' | ')' | ']' | '}')
+            })
+            .map(|offset| token_start + offset)
+            .unwrap_or(value.len());
+        output.push_str("[REDACTED]");
+        cursor = token_end.max(token_start);
+    }
+    output
 }
 
 fn truncate_text(value: &str, max_bytes: usize) -> String {
@@ -1038,6 +1178,27 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
         end = end.saturating_sub(1);
     }
     format!("{}...", &value[..end])
+}
+
+/// Load one full MCP search record by its trace ID for the local dashboard.
+pub fn mcp_search_record_by_trace_id(
+    project_root: &Path,
+    search_id: &str,
+) -> Result<Option<McpCallRecord>> {
+    let path = project_root.join(".membrick").join(MCP_CALL_HISTORY_FILE);
+    let Ok(file) = fs::File::open(path) else {
+        return Ok(None);
+    };
+    for line in io::BufReader::new(file).lines() {
+        let line = line?;
+        let Ok(record) = serde_json::from_str::<McpCallRecord>(&line) else {
+            continue;
+        };
+        if record.tool == "search" && record.trace_id.as_deref() == Some(search_id) {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 pub fn provider_lifecycle_status(
@@ -1768,13 +1929,112 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             milestones,
+            ["UserPromptSubmit", "TurnUsage", "Stop", "Stop"]
+        );
+        let subagent = status
+            .subagent_events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(subagent, ["SubagentStart", "SubagentStop"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stop_preview_reads_the_last_assistant_message_and_ignores_null_keys() {
+        let root = test_directory().join(format!("provider-stop-preview-{}", now_ms()));
+        let record = |provider: &str, event: &str, payload: serde_json::Value| {
+            record_provider_lifecycle_event(&root, provider, "session-a", event, &payload).unwrap();
+        };
+        // Claude: unmodelled hook fields are nested under `extra`.
+        record(
+            "claude",
+            "Stop",
+            serde_json::json!({"hook_event_name": "Stop", "extra": {"last_assistant_message": "All tests pass."}}),
+        );
+        record(
+            "claude",
+            "SubagentStop",
+            serde_json::json!({"agent_id": "a1", "extra": {"last_assistant_message": "Found 3 files."}}),
+        );
+        // Codex: `reason` is always present and usually null.
+        record(
+            "codex",
+            "Stop",
+            serde_json::json!({"reason": null, "extra": {"last_assistant_message": "Done."}}),
+        );
+        record("codex", "Stop", serde_json::json!({"reason": null}));
+
+        let preview = |provider: &str| {
+            let status = provider_lifecycle_status(&root, provider).unwrap().unwrap();
+            status
+                .events
+                .iter()
+                .map(|event| event.stop_response_preview.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            preview("claude"),
             [
-                "UserPromptSubmit",
-                "SubagentStart",
-                "SubagentStop",
+                Some("All tests pass.".to_string()),
+                Some("Found 3 files.".to_string())
+            ]
+        );
+        assert_eq!(preview("codex"), [Some("Done.".to_string()), None]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subagent_events_survive_a_long_run_of_main_agent_turns() {
+        let root = test_directory().join(format!("provider-subagent-retention-{}", now_ms()));
+        let record = |event: &str, payload: serde_json::Value| {
+            record_provider_lifecycle_event(&root, "claude", "session-a", event, &payload).unwrap();
+        };
+        record(
+            "SubagentStart",
+            serde_json::json!({"agent_id": "a1", "agent_type": "Explore"}),
+        );
+        record(
+            "TurnUsage",
+            serde_json::json!({"agent_id": "a1", "agent_type": "Explore", "usage": {"input_tokens": 9, "output_tokens": 2}}),
+        );
+        record(
+            "SubagentStop",
+            serde_json::json!({"agent_id": "a1", "agent_type": ""}),
+        );
+        for _ in 0..MAX_PROVIDER_MILESTONE_EVENTS {
+            record("UserPromptSubmit", serde_json::json!({"prompt": "next"}));
+            record(
                 "TurnUsage",
-                "Stop",
-                "Stop"
+                serde_json::json!({"usage": {"input_tokens": 1}}),
+            );
+            record("Stop", serde_json::json!({}));
+        }
+
+        let status = provider_lifecycle_status(&root, "claude").unwrap().unwrap();
+        assert_eq!(status.milestone_events.len(), MAX_PROVIDER_MILESTONE_EVENTS);
+        assert!(status
+            .milestone_events
+            .iter()
+            .all(|event| event.agent_id.is_none()));
+        let subagent = status
+            .subagent_events
+            .iter()
+            .map(|event| {
+                (
+                    event.event.as_str(),
+                    event.agent_id.as_deref(),
+                    event.agent_type.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subagent,
+            [
+                ("SubagentStart", Some("a1"), Some("Explore")),
+                ("TurnUsage", Some("a1"), Some("Explore")),
+                // An empty agent_type is treated as missing.
+                ("SubagentStop", Some("a1"), None),
             ]
         );
         fs::remove_dir_all(root).unwrap();
@@ -1872,6 +2132,7 @@ mod tests {
         assert_eq!(status.counters.since_ms, 0);
         assert_eq!(status.counters.prompts, 0);
         assert!(status.milestone_events.is_empty());
+        assert!(status.subagent_events.is_empty());
         assert_eq!(status.counters.cycle_duration_quantile_ms(0.5), None);
     }
 }
