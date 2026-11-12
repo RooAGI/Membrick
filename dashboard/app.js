@@ -1,5 +1,6 @@
-import { renderEventDetail, renderToolCall, toolDetail, toolGroup } from './event-detail.js';
+import { highlightMatchedText, injectedMemoriesFromEvent, memoryMatchDetailsForToolCall, memoryMatchesForSources, renderEventDetail, renderMcpSearchResponse, renderToolCall, searchResultMemories, toolDetail, toolGroup } from './event-detail.js';
 import { renderCaptureProgressHtml } from './capture-progress.mjs';
+import { buildProviderTurns, mergeProviderEvents } from './provider-turns.mjs';
 import { renderSearchEvaluationHtml } from './search-evaluation.mjs';
 import { flowEventSummary, flowPostLabel, flowStageSteps, flowTrackedWork, mergeBoardPosts as mergeFlowBoardPosts, parseBoardLinkTarget as parseFlowLinkTarget, rollupTasks as rollupFlowBoardTasks } from './board-ui.mjs';
 import { attributeSubagentUsage, escapeHtml as esc, inferSubagentEnds, mergeBoardPosts, pairSubagentRuns, parseBoardLinkTarget, SUBAGENT_IDLE_MS, rollupTasks, tasksByRecentActivity } from './board-ui.mjs';
@@ -40,6 +41,65 @@ const pct = value => `${(Number(value || 0) * 100).toFixed(1)}%`;
 const seconds = ms => ms ? `${(ms / 1000).toFixed(1)}s` : '—';
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const stillness = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+async function copyPreformattedText(pre, button) {
+  const content = pre.cloneNode(true);
+  content.querySelector('.copy-box-button')?.remove();
+  const text = content.textContent || '';
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const temporary = document.createElement('textarea');
+      temporary.value = text;
+      temporary.setAttribute('readonly', '');
+      temporary.style.position = 'fixed';
+      temporary.style.opacity = '0';
+      document.body.append(temporary);
+      temporary.select();
+      const copied = document.execCommand('copy');
+      temporary.remove();
+      if (!copied) throw new Error('Copy unavailable');
+    }
+    button.textContent = 'Copied';
+    button.classList.add('is-copied');
+  } catch {
+    button.textContent = 'Copy failed';
+    button.classList.add('is-copy-failed');
+  }
+  clearTimeout(button.copyResetTimer);
+  button.copyResetTimer = setTimeout(() => {
+    button.textContent = 'Copy';
+    button.classList.remove('is-copied', 'is-copy-failed');
+  }, 1600);
+}
+
+function addCopyButtons(root) {
+  if (root.matches?.('pre')) addCopyButton(root);
+  root.querySelectorAll?.('pre').forEach(addCopyButton);
+}
+
+function addCopyButton(pre) {
+  if (pre.querySelector('.copy-box-button')) return;
+  pre.dataset.copyReady = 'true';
+  const button = document.createElement('button');
+  button.className = 'copy-box-button';
+  button.type = 'button';
+  button.textContent = 'Copy';
+  button.setAttribute('aria-label', 'Copy this text');
+  button.addEventListener('click', event => {
+    event.stopPropagation();
+    copyPreformattedText(pre, button);
+  });
+  pre.append(button);
+}
+
+addCopyButtons(document);
+new MutationObserver(records => {
+  records.forEach(record => record.addedNodes.forEach(node => {
+    if (node.nodeType === Node.ELEMENT_NODE) addCopyButtons(node);
+  }));
+}).observe(document.body, { childList: true, subtree: true });
 
 // The Boards and Flows list panels collapse to a narrow rail. The choice is a
 // class on the static layout element, so detail re-renders never reset it.
@@ -265,7 +325,7 @@ async function refresh() {
     document.body.classList.remove('booting');
 
     const integrations = status.integrations || [];
-    const projectIndex = projectIndexView(status.index, integrations);
+    const projectIndex = projectIndexView(status.index, integrations, status.captured_index);
     renderIndexBrief(projectIndex);
     renderIndexTopology(projectIndex);
     renderProviders(integrations, projectIndex);
@@ -2430,12 +2490,17 @@ sparks.addEventListener('mouseleave', () => { state.hover = null; drawSparks(); 
 // The project view spans the shared workspace corpus and every discovered
 // provider store. Keep segments qualified by their store name so identical
 // local segment ids from separate indexes never look like one segment.
-function projectIndexView(primary, integrations) {
+function projectIndexView(primary, integrations, captured) {
   const stores = [];
   if (primary?.snapshot) stores.push({
     name: 'workspace-memory',
     snapshot: primary.snapshot,
     snapshot_revision: primary.snapshot_revision,
+  });
+  if (captured?.snapshot) stores.push({
+    name: 'captured-memory',
+    snapshot: captured.snapshot,
+    snapshot_revision: captured.snapshot_revision,
   });
   integrations.flatMap(provider => provider.indexes || []).forEach(index => {
     if (index.snapshot) stores.push({
@@ -2664,7 +2729,7 @@ function wireTopology(target, segments, total) {
 
 /* ── providers ─────────────────────────────────────────────────── */
 
-function renderProviders(items, projectIndex = projectIndexView(state.status?.index, items)) {
+function renderProviders(items, projectIndex = projectIndexView(state.status?.index, items, state.status?.captured_index)) {
   const visible = items
     .filter(item => item.events_total > 0 || (item.indexes || []).length > 0)
     .sort((left, right) => Number(right.last_seen_ms || 0) - Number(left.last_seen_ms || 0) || left.provider.localeCompare(right.provider));
@@ -2686,7 +2751,7 @@ function renderProviders(items, projectIndex = projectIndexView(state.status?.in
   rail.querySelectorAll('.railprovider').forEach(button => button.addEventListener('click', () => {
     state.provider = button.dataset.provider;
     state.tool = null;
-    renderProviders(items, projectIndexView(state.status?.index, items));
+    renderProviders(items, projectIndexView(state.status?.index, items, state.status?.captured_index));
     showView('providers');
   }));
 
@@ -2934,13 +2999,13 @@ function renderTokenPanel(stats) {
     </section>`;
 }
 
-// `events` should include the milestone events so subagent runs are not
-// evicted by tool bursts. With `counters`, the headline counts are cumulative
-// and the rows show the most recent runs. Active never comes from starts minus
-// stops, which would count an interrupted run as active forever. Servers that
-// track open subagents give cumulative Active and Did not finish figures;
+// Headline subagent figures for the Subagents section. `events` should include
+// the milestone and subagent events so runs are not evicted by tool bursts.
+// With `counters`, the counts are cumulative. Active never comes from starts
+// minus stops, which would count an interrupted run as active forever. Servers
+// that track open subagents give cumulative Active and Did not finish figures;
 // otherwise both come from the paired runs in the retained events.
-function renderDelegationPanel(events, counters = null) {
+function delegationFiguresHtml(events, counters = null) {
   const stats = delegationAnalytics(events);
   if (counters) {
     stats.starts = Number(counters.subagent_starts || 0);
@@ -2956,34 +3021,10 @@ function renderDelegationPanel(events, counters = null) {
     stats.unfinished = Number(counters.subagent_interrupted || 0) + Number(counters.subagent_ended_without_stop || 0);
   }
   if (!stats.starts && !stats.completed && !stats.hasUsage) return '';
-  const rowState = run => run.stop ? ['completed', 'completed', seconds(run.duration)]
-    : run.interrupted ? ['interrupted', 'interrupted', 'did not finish']
-    : run.ended === 'session_ended' ? ['ended', 'ended', 'ended without stop']
-    : run.ended === 'idle' ? ['quiet', 'quiet', 'no recent activity']
-    : run.usageOnly ? ['usage', 'usage only', 'no lifecycle events']
-    : ['running', 'running', 'in progress'];
-  const rows = stats.runs.map(run => {
-    const label = run.start.agent_type || run.start.agent_id || 'Subagent';
-    const id = run.start.agent_type ? run.start.agent_id || '' : '';
-    const [tone, status, note] = rowState(run);
-    const usage = run.usage;
-    const usageTotal = usage ? usage.fresh + usage.cacheWrite + usage.cacheRead + usage.output : 0;
-    return `
-      <div class="delegation-row">
-        <div><strong>${esc(label)}</strong><small>${esc(id || 'delegated task')} · ${clock(run.start.timestamp_ms)}${usage ? ` · ${fmt(usageTotal)} tokens` : ''}</small></div>
-        <span class="delegation-duration ${tone}">${note}</span>
-        <span class="badge ${run.stop ? 'active' : 'idle'}">${status}</span>
-      </div>`;
-  }).join('');
   const scope = !counters ? 'Counts from the retained event window only.'
-    : tracked ? `Counts since counting began; rows are the most recent runs. Did not finish counts runs that were resumed or whose session ended without a stop.${quiet ? ` ${fmt(quiet)} open ${quiet === 1 ? 'run has' : 'runs have'} had no activity for 30 minutes and ${quiet === 1 ? 'is' : 'are'} in neither Active nor Did not finish.` : ''}`
+    : tracked ? `Counts since counting began; the list below shows the most recent subagents. Did not finish counts runs that were resumed or whose session ended without a stop.${quiet ? ` ${fmt(quiet)} open ${quiet === 1 ? 'run has' : 'runs have'} had no activity for 30 minutes and ${quiet === 1 ? 'is' : 'are'} in neither Active nor Did not finish.` : ''}`
     : 'Started and Completed count since counting began; Active and Did not finish come from recent events, so they need not add up.';
   return `
-    <section class="panel">
-      <div class="panel__head">
-        <div><p class="eyebrow">Delegation</p><h2>Subagent activity</h2></div>
-        <span class="panel__note">Lifecycle hooks</span>
-      </div>
       <div class="figure-row" style="margin-top:0;padding-top:0;border-top:0">
         <div><span>Started</span><strong>${fmt(stats.starts)}</strong></div>
         <div><span>Completed</span><strong>${fmt(stats.completed)}</strong></div>
@@ -2991,9 +3032,7 @@ function renderDelegationPanel(events, counters = null) {
         <div><span>Did not finish</span><strong>${fmt(stats.unfinished)}</strong></div>
         <div><span>Avg. duration</span><strong>${seconds(stats.averageDuration)}</strong><small>recent runs</small></div>
       </div>
-      <p class="metric-scope ${tracked ? '' : 'metric-scope--window'}">${scope}</p>
-      <div>${rows}</div>
-    </section>`;
+      <p class="metric-scope ${tracked ? '' : 'metric-scope--window'}">${scope}</p>`;
 }
 
 function renderStores(indexes) {
@@ -3031,8 +3070,6 @@ function renderProvider(provider) {
   const toolEvents = events.filter(event => event.tool_name);
   const sessions = sessionsFor(events);
   const indexes = provider.indexes || [];
-  const current = sessions[0];
-  const live = current && Date.now() - current.last_seen_ms < 60_000;
 
   const counts = toolEvents.reduce((result, event) => {
     const group = toolGroup(event.tool_name);
@@ -3058,8 +3095,12 @@ function renderProvider(provider) {
   const windowLabel = stats.window.label;
   // Milestone events (prompts, stops, usage, subagents) are kept apart from
   // the window on newer servers so delegation rows survive tool bursts.
-  const seen = new Set(events.map(event => event.event_id));
-  const withMilestones = events.concat((provider.milestone_events || []).filter(event => !seen.has(event.event_id)));
+  // Subagent events have their own retained list on newer servers.
+  const withMilestones = mergeProviderEvents(events, provider.milestone_events, provider.subagent_events);
+  const windowTimes = events.map(event => Number(event.timestamp_ms)).filter(value => value > 0);
+  const turnModel = buildProviderTurns(withMilestones, { windowStartMs: windowTimes.length ? Math.min(...windowTimes) : 0 });
+  const turnContextFor = turnContext(turnModel);
+  turnBodies = new Map();
   const toolCallTotal = counters ? Number(counters.tool_calls || 0) : toolEvents.filter(event => /^(PreToolUse|BeforeTool)$/i.test(event.event)).length;
 
   document.querySelector('#provider-view').innerHTML = `
@@ -3075,7 +3116,6 @@ function renderProvider(provider) {
     </div>
 
     <div class="row row--halves">${renderCyclePanel(stats)}${renderTokenPanel(stats)}</div>
-    ${renderDelegationPanel(withMilestones, counters)}
 
     <div class="stat-row">
       <article class="stat"><span>Documents</span><strong>${fmt(indexes.reduce((sum, index) => sum + Number(index.source_document_count || 0), 0))}</strong><small>${fmt(indexes.length)} private memory stores</small></article>
@@ -3084,22 +3124,8 @@ function renderProvider(provider) {
       <article class="stat"><span>Tool calls</span><strong>${fmt(toolCallTotal)}</strong><small>${counters ? 'in total' : `in ${esc(windowLabel)}`} · ${fmt(tools.length)} categories recently</small></article>
     </div>
 
-    <div class="row row--narrow-first">
-      <section class="panel">
-        <div class="sub-head">
-          <div><p class="eyebrow">Session history</p><h2>Sessions</h2></div>
-          <span class="panel__note">${sessions.length ? `${sessions.length} in ${esc(windowLabel)}` : 'None in the retained window'}</span>
-        </div>
-        <div class="scroll-list">${renderSessions(sessions)}</div>
-      </section>
-      <section class="panel">
-        <div class="sub-head">
-          <div><p class="eyebrow">Live session</p><h2>${live ? 'Current activity' : 'Latest activity'}</h2></div>
-          <span class="live-indicator ${live ? 'on' : ''}"><i></i>${live ? 'LIVE' : 'IDLE'}</span>
-        </div>
-        ${renderLive(current)}
-      </section>
-    </div>
+    ${renderMainAgentSection(turnModel, turnContextFor, provider.provider)}
+    ${renderSubagentSection(turnModel, turnContextFor, withMilestones, counters)}
 
     <div class="row row--halves">
       <section class="panel">
@@ -3138,7 +3164,15 @@ function renderProvider(provider) {
     state.tool = state.tool === button.dataset.tool ? null : button.dataset.tool;
     renderProvider(provider);
   }));
-  document.querySelectorAll('[data-flip-card]').forEach(card => {
+  const view = document.querySelector('#provider-view');
+  bindFlipCards(view);
+  bindTurnToggles(view);
+  bindMcpSearchResponses(view);
+}
+
+function bindFlipCards(root) {
+  root.querySelectorAll('[data-flip-card]:not([data-flip-bound])').forEach(card => {
+    card.dataset.flipBound = '1';
     const flip = () => card.classList.toggle('flipped');
     card.addEventListener('click', flip);
     card.addEventListener('keydown', event => {
@@ -3147,24 +3181,404 @@ function renderProvider(provider) {
   });
 }
 
-function renderSessions(sessions) {
-  if (!sessions.length) return '<div class="empty-state">No provider sessions observed yet.</div>';
-  return sessions.slice(0, 12).map((session, index) => `
-    <div class="session-item ${index === 0 ? 'latest' : ''}">
-      <div><span class="session-key">${esc(session.session_key)}</span><small>${fmt(session.events.length)} events · ${esc(session.last_event)}</small></div>
-      <strong>${clock(session.last_seen_ms)}</strong>
-    </div>`).join('');
+/* ── provider turns: main agent and subagents ─────────────────── */
+
+// Open or closed state of each session, turn and subagent, by its open key,
+// so the 5-second refresh keeps what the viewer opened. Keys not in the map
+// fall back to the default: the newest session and its newest turn open.
+const turnOpenState = new Map();
+const mcpSearchResponseCache = new Map();
+const mcpSearchFollowups = new Map();
+const mcpSearchSince = new Map();
+// Builds the body of a turn when its details first open, so closed turns
+// cost nothing. Rebuilt on every render.
+let turnBodies = new Map();
+const MAX_TURN_SESSIONS = 8;
+const MAX_TURNS_PER_LIST = 25;
+const MAX_SUBAGENTS = 12;
+
+const isTurnOpen = (key, fallback) => turnOpenState.has(key) ? turnOpenState.get(key) : fallback;
+
+function bindTurnToggles(root) {
+  root.querySelectorAll('details[data-open-key]:not([data-toggle-bound])').forEach(item => {
+    item.dataset.toggleBound = '1';
+    item.addEventListener('toggle', () => {
+      turnOpenState.set(item.dataset.openKey, item.open);
+      if (!item.open) return;
+      const body = item.querySelector(':scope > [data-turn-body]');
+      if (!body || body.dataset.filled) return;
+      const build = turnBodies.get(item.dataset.openKey);
+      if (!build) return;
+      body.innerHTML = build();
+      body.dataset.filled = '1';
+      bindFlipCards(body);
+      bindTurnToggles(body);
+      bindMcpSearchResponses(body);
+    });
+  });
 }
 
-function renderLive(session) {
-  if (!session) return '<div class="empty-state tall">Start a provider session to see live activity here.</div>';
-  const events = session.events.slice().reverse().slice(0, 8);
-  return `
-    <div class="live-summary">
-      <div><span class="session-key">${esc(session.session_key)}</span><small>${fmt(session.events.length)} events in this session</small></div>
-      <strong>${clock(session.last_seen_ms)}</strong>
+function bindMcpSearchResponses(root) {
+  root.querySelectorAll('.mcp-search-response[data-mcp-search-id]:not([data-full-loaded]):not([data-search-loading])').forEach(container => {
+    const searchId = container.dataset.mcpSearchId;
+    if (!searchId) return;
+    container.dataset.searchLoading = '1';
+    const showFullResponse = raw => {
+      if (!container.isConnected) return;
+      highlightMemoryMatchedCalls(searchResultMemories(raw), mcpSearchFollowups.get(searchId) || []);
+      container.outerHTML = renderMcpSearchResponse(
+        raw,
+        mcpSearchFollowups.get(searchId) || [],
+        searchId,
+        true,
+        mcpSearchSince.get(searchId) || 0
+      );
+    };
+    const cached = mcpSearchResponseCache.get(searchId);
+    if (cached) {
+      showFullResponse(cached);
+      return;
+    }
+    fetch(`/api/mcp-search-response?search_id=${encodeURIComponent(searchId)}`)
+      .then(response => response.ok ? response.json() : null)
+      .then(payload => {
+        const raw = payload?.response ? JSON.stringify(payload.response, null, 2) : null;
+        if (!raw) return;
+        mcpSearchResponseCache.set(searchId, raw);
+        showFullResponse(raw);
+      })
+      .catch(() => {});
+  });
+}
+
+function highlightMemoryMatchedCalls(memories, calls) {
+  for (const call of calls) {
+    if (/^mcp__membrick__search$/i.test(call.tool_name || '')) continue;
+    const { reasons, keywords } = memoryMatchDetailsForToolCall(memories, call);
+    if (!reasons.length) continue;
+    const callId = call.pre?.event_id || call.post?.event_id;
+    if (!callId) continue;
+    document.querySelectorAll('.tool-call-item[data-tool-call-id]').forEach(card => {
+      if (card.dataset.toolCallId !== callId) return;
+      card.classList.add('tool-call-item--memory-match');
+      const heading = card.querySelector('.tool-heading, .call-main > div');
+      if (!heading) return;
+      let badge = heading.querySelector('.tool-memory-match');
+      if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'tool-memory-match';
+        badge.textContent = 'Memory match';
+        heading.append(badge);
+      }
+      badge.title = `Matched retrieved memory by ${reasons.join(', ')}${keywords.length ? `: ${keywords.join(', ')}` : ''}`;
+      if (keywords.length && !card.querySelector('.tool-memory-match-detail')) {
+        const detail = document.createElement('small');
+        detail.className = 'tool-memory-match-detail';
+        detail.textContent = `Matched: ${keywords.join(' · ')}`;
+        (card.querySelector('.call-main') || card.querySelector('.event-detail'))?.append(detail);
+      }
+      if (keywords.length) {
+        const pre = card.querySelector('.tool-face-parsed pre');
+        if (pre) {
+          const copyButton = pre.querySelector('.copy-box-button');
+          const originalText = [...pre.childNodes].filter(node => node !== copyButton).map(node => node.textContent || '').join('');
+          pre.innerHTML = highlightMatchedText(originalText, keywords);
+          if (copyButton) pre.append(copyButton);
+        }
+      }
+    });
+  }
+}
+
+function compactTokens(value) {
+  const amount = Number(value || 0);
+  if (amount >= 1e6) return `${(amount / 1e6).toFixed(1)}M`;
+  if (amount >= 1e4) return `${Math.round(amount / 1e3)}k`;
+  if (amount >= 1e3) return `${(amount / 1e3).toFixed(1)}k`;
+  return fmt(amount);
+}
+
+function turnSpan(ms) {
+  if (ms == null) return null;
+  const s = Math.max(0, ms) / 1000;
+  if (s < 90) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
+  if (s < 5400) return `${Math.round(s / 60)} min`;
+  return `${(s / 3600).toFixed(1)} h`;
+}
+
+const firstLine = (text, limit = 140) => {
+  const line = String(text || '').replace(/\s+/g, ' ').trim();
+  return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
+};
+
+// [badge tone, label] for a turn state. A main turn with no stop was followed
+// by another prompt (Claude delivers a subagent hand-back that way), so it
+// continued; a subagent turn with no stop was followed by another start.
+function turnStateBadge(turn) {
+  switch (turn.state) {
+    case 'completed': return ['active', 'completed'];
+    case 'running': return ['running', 'running'];
+    case 'quiet': return ['idle', 'no recent activity'];
+    case 'ended': return ['idle', 'session ended'];
+    case 'no_stop': return ['idle', turn.agent_id ? 'resumed later' : 'continued in next turn'];
+    default: return ['idle', turn.state || 'unknown'];
+  }
+}
+
+function mainTurnTitle(turn) {
+  const prompt = firstLine(turn.opener?.prompt_preview);
+  if (prompt) return prompt;
+  return turn.partial ? 'Turn started before the retained events' : 'Prompt text not captured';
+}
+
+function subagentTurnTitle(turn, agent) {
+  const prompt = firstLine(turn.opener?.prompt_preview);
+  if (prompt) return prompt;
+  const name = agent?.agent_type || turn.agent_type || 'Subagent';
+  return turn.partial ? `${name} · started before the retained events` : `${name} turn`;
+}
+
+function turnSummaryHtml(turn, title) {
+  const [tone, label] = turnStateBadge(turn);
+  const meta = [
+    clock(turn.startMs),
+    turnSpan(turn.duration),
+    `${fmt(turn.tools.length)} ${turn.tools.length === 1 ? 'tool' : 'tools'}`,
+    turn.subagents.length ? `${fmt(turn.subagents.length)} ${turn.subagents.length === 1 ? 'subagent' : 'subagents'}` : null,
+    turn.usage ? `${compactTokens(turn.usage.total)} tokens` : null
+  ].filter(Boolean).join(' · ');
+  return `<span class="turn__title">${esc(title)}</span><span class="turn__meta">${esc(meta)}</span><span class="badge ${tone}">${esc(label)}</span>`;
+}
+
+function turnUsageHtml(usage) {
+  if (!usage) return '';
+  const parts = [
+    ['Uncached input', usage.fresh],
+    ['Cache write', usage.cacheWrite],
+    ['Cache read', usage.cacheRead],
+    ['Output', usage.output]
+  ];
+  return `<div class="turn__usage">
+    <div class="turn-usage__total"><strong>${fmt(usage.total)}</strong><span>tokens this turn</span></div>
+    <div class="turn-usage__metrics">${parts.map(([label, amount]) => `<div class="turn-usage__metric"><span>${label}</span><strong>${fmt(amount)}</strong></div>`).join('')}</div>
+  </div>`;
+}
+
+function turnStepHtml(label, text, timestamp, extra = '') {
+  return `<div class="activity-item turn-step"><i class="activity-dot"></i><div class="event-detail">
+    <div class="tool-heading"><strong>${esc(label)}</strong>${extra}</div><small>${clock(timestamp)}</small>
+    ${text ? `<div class="event-field"><pre>${esc(text)}</pre></div>` : ''}
+  </div></div>`;
+}
+
+// One merged tool call: the Pre event's arguments with the Post event's
+// response, and the outcome where the hook event name used to be.
+function turnToolHtml(call, followingCalls = [], memoryMatch = { reasons: [], keywords: [] }) {
+  const base = call.pre || call.post;
+  const searchId = call.post?.mcp_search_id || null;
+  if (searchId) {
+    mcpSearchFollowups.set(searchId, followingCalls);
+    mcpSearchSince.set(searchId, call.endMs ?? call.startMs);
+  }
+  const outcome = call.failed ? 'failed'
+    : !call.post ? 'no result yet'
+    : !call.pre ? 'result only'
+    : turnSpan(call.duration);
+  return renderToolCall({
+    ...base,
+    tool_response_preview: call.post?.tool_response_preview || null,
+    mcp_search_id: searchId,
+    following_calls: followingCalls,
+    memory_match: memoryMatch.reasons?.length ? memoryMatch : null,
+    memory_match_call_id: call.pre?.event_id || call.post?.event_id || null,
+    since_ms: call.endMs ?? call.startMs,
+    event: outcome
+  }, 'live');
+}
+
+function turnTimelineHtml(turn, context) {
+  const descendantCalls = (root, fromMs, untilMs, seen = new Set()) => {
+    if (!root || seen.has(root.id)) return [];
+    seen.add(root.id);
+    const calls = root.tools.filter(call => call.startMs >= fromMs && call.startMs < untilMs);
+    for (const child of root.subagents || []) {
+      calls.push(...descendantCalls(context.subagentTurns.get(child.turnId), fromMs, untilMs, seen));
+    }
+    return calls;
+  };
+  const boundedCallsAfter = (at, boundary) => descendantCalls(turn, at, boundary).sort((a, b) => a.startMs - b.startMs);
+  const followingCallsFor = call => {
+    if (!/^mcp__membrick__search$/i.test(call.tool_name || '')) return [];
+    const endMs = call.endMs ?? call.startMs;
+    const nextRelevantMs = turn.timeline
+      .filter(item => item.at > call.startMs && ((item.kind === 'tool' && /^mcp__membrick__search$/i.test(item.call.tool_name || '')) || item.kind === 'retrieval'))
+      .map(item => item.at)
+      .sort((a, b) => a - b)[0] ?? Infinity;
+    return boundedCallsAfter(endMs + 1, nextRelevantMs).filter(next => next !== call);
+  };
+  const memorySources = [];
+  for (const event of context.preambleRetrievalsByTurn.get(turn.id) || []) {
+    memorySources.push({ at: Number(event.timestamp_ms) || turn.startMs, memories: injectedMemoriesFromEvent(event) });
+  }
+  for (const item of turn.timeline) {
+    if (item.kind === 'retrieval') {
+      memorySources.push({ at: item.at, memories: injectedMemoriesFromEvent(item.event) });
+      continue;
+    }
+    if (item.kind !== 'tool' || !/^mcp__membrick__search$/i.test(item.call.tool_name || '')) continue;
+    const call = item.call;
+    const searchId = call.post?.mcp_search_id;
+    const previewMemories = searchResultMemories(call.post?.tool_response_preview);
+    const memories = previewMemories.length
+      ? previewMemories
+      : searchResultMemories(mcpSearchResponseCache.get(searchId));
+    memorySources.push({ at: call.endMs ?? call.startMs, memories, call });
+  }
+  memorySources.sort((a, b) => a.at - b.at);
+  memorySources.forEach(source => {
+    if (source.call) {
+      const searchId = source.call.post?.mcp_search_id;
+      if (searchId) {
+        mcpSearchFollowups.set(searchId, followingCallsFor(source.call));
+        mcpSearchSince.set(searchId, source.at);
+      }
+    }
+  });
+  const memoryMatches = memoryMatchesForSources(turn.tools, memorySources);
+  const items = turn.timeline.map(item => {
+    if (item.kind === 'prompt') return turnStepHtml('Prompt', item.event.prompt_preview, item.at);
+    if (item.kind === 'start') return turnStepHtml('Subagent start', item.event.prompt_preview, item.at);
+    if (item.kind === 'stop') return turnStepHtml(item.event.event === 'SubagentStop' ? 'Subagent stop' : 'Final response', item.event.stop_response_preview, item.at);
+    if (item.kind === 'tool') return turnToolHtml(item.call, followingCallsFor(item.call), memoryMatches.get(item.call) || { reasons: [], keywords: [] });
+    if (item.kind === 'subagent') {
+      const agent = context.agents.get(item.agentKey);
+      const sub = context.subagentTurns.get(item.turnId);
+      if (!sub) return '';
+      const key = `nested:${sub.id}`;
+      return turnDetailsHtml(sub, `${agent?.agent_type || 'Subagent'} · ${subagentTurnTitle(sub, agent)}`, key, false, context, 'turn--nested');
+    }
+    if (item.kind === 'retrieval') {
+      const boundary = turn.timeline
+        .filter(next => next.at > item.at && next.kind === 'retrieval')
+        .map(next => next.at)
+        .sort((a, b) => a - b)[0] ?? Infinity;
+      return renderEventDetail(item.event, 'live', {
+        sinceMs: item.at,
+        followingCalls: boundedCallsAfter(item.at, boundary)
+      });
+    }
+    return renderEventDetail(item.event, 'live');
+  }).join('');
+  return items || '<div class="empty-state">No events retained for this turn.</div>';
+}
+
+function turnBodyHtml(turn, context) {
+  const notes = [
+    turn.partial ? (turn.agent_id ? 'This turn began before the retained events, so its start is missing.' : 'This turn began before the retained events, so its prompt is missing.') : null,
+    turn.toolsTruncated ? 'Tool calls older than the retained tool window are not shown for this turn.' : null,
+    turn.turn_id ? `Turn id ${turn.turn_id}` : null
+  ].filter(Boolean);
+  return `${notes.length ? `<p class="turn__note">${notes.map(esc).join(' ')}</p>` : ''}
+    ${turnUsageHtml(turn.usage)}
+    <div class="turn__timeline">${turnTimelineHtml(turn, context)}</div>`;
+}
+
+function turnDetailsHtml(turn, title, key, fallbackOpen, context, modifier = '') {
+  const open = isTurnOpen(key, fallbackOpen);
+  turnBodies.set(key, () => turnBodyHtml(turn, context));
+  return `<details class="turn ${modifier}" data-open-key="${esc(key)}"${open ? ' open' : ''}>
+    <summary class="turn__head">${turnSummaryHtml(turn, title)}</summary>
+    <div class="turn__body" data-turn-body${open ? ' data-filled="1"' : ''}>${open ? turnBodyHtml(turn, context) : ''}</div>
+  </details>`;
+}
+
+function turnContext(model) {
+  const preambleRetrievalsByTurn = new Map();
+  for (const session of model.sessions) {
+    const firstTurn = session.turns.at(-1);
+    const retrievals = session.preamble.filter(event => event.event === 'MemoryRetrieved' || event.retrieved_memory_details);
+    if (firstTurn && retrievals.length) preambleRetrievalsByTurn.set(firstTurn.id, retrievals);
+  }
+  return {
+    agents: new Map(model.agents.map(agent => [agent.key, agent])),
+    subagentTurns: new Map(model.agents.flatMap(agent => agent.turns.map(turn => [turn.id, turn]))),
+    mainTurns: new Map(model.sessions.flatMap(session => session.turns.map(turn => [turn.id, turn]))),
+    preambleRetrievalsByTurn
+  };
+}
+
+function renderMainAgentSection(model, context, providerName) {
+  const sessions = model.sessions.filter(session => session.turns.length || session.preamble.length);
+  const latest = sessions[0];
+  const live = latest && !latest.ended && Date.now() - latest.lastSeenMs < 60_000;
+  const turnCount = sessions.reduce((sum, session) => sum + session.turns.length, 0);
+  const body = sessions.slice(0, MAX_TURN_SESSIONS).map((session, index) => {
+    const key = `session:${providerName}:${session.session_key}`;
+    const open = isTurnOpen(key, index === 0);
+    const turns = session.turns.slice(0, MAX_TURNS_PER_LIST)
+      .map((turn, turnIndex) => turnDetailsHtml(turn, mainTurnTitle(turn), `turn:${turn.id}`, index === 0 && turnIndex === 0, context))
+      .join('');
+    const older = session.turns.length - MAX_TURNS_PER_LIST;
+    const preamble = session.preamble.length
+      ? `<p class="turn__note">Session start · ${fmt(session.preamble.length)} ${session.preamble.length === 1 ? 'event' : 'events'} before the first prompt</p>` : '';
+    const sessionLive = !session.ended && Date.now() - session.lastSeenMs < 60_000;
+    return `<details class="turn-session" data-open-key="${esc(key)}"${open ? ' open' : ''}>
+      <summary class="turn-session__head">
+        <span class="dot ${sessionLive ? 'active' : ''}"></span>
+        <span class="session-key">${esc(session.session_key)}</span>
+        <span class="turn__meta">${fmt(session.turns.length)} ${session.turns.length === 1 ? 'turn' : 'turns'} · last ${clock(session.lastSeenMs)}</span>
+        ${session.ended ? '<span class="badge idle">ended</span>' : ''}
+      </summary>
+      <div class="turn-session__body">${preamble}${turns || '<div class="empty-state">No turns retained for this session.</div>'}${older > 0 ? `<p class="turn__note">${fmt(older)} older ${older === 1 ? 'turn is' : 'turns are'} not shown.</p>` : ''}</div>
+    </details>`;
+  }).join('');
+  return `<section class="panel turns-panel">
+    <div class="sub-head">
+      <div><p class="eyebrow">Main agent</p><h2>Turns by session</h2></div>
+      <span class="live-indicator ${live ? 'on' : ''}"><i></i>${live ? 'LIVE' : 'IDLE'}</span>
     </div>
-    <div class="live-list">${events.map(event => renderEventDetail(event, 'live')).join('')}</div>`;
+    <p class="metric-scope metric-scope--window">${fmt(sessions.length)} ${sessions.length === 1 ? 'session' : 'sessions'} · ${fmt(turnCount)} ${turnCount === 1 ? 'turn' : 'turns'} in the retained events, newest first. Subagent work is listed under Subagents and linked from the turn that started it.</p>
+    ${body || '<div class="empty-state tall">Start a provider session to see its turns here.</div>'}
+  </section>`;
+}
+
+function renderSubagentSection(model, context, events, counters) {
+  const figures = delegationFiguresHtml(events, counters);
+  if (!model.agents.length && !figures) return '';
+  const agents = model.agents.slice(0, MAX_SUBAGENTS).map(agent => {
+    const key = `agent:${agent.key}`;
+    const open = isTurnOpen(key, false);
+    const [tone, label] = agent.turns[0] ? turnStateBadge(agent.turns[0]) : ['idle', 'unknown'];
+    const parent = context.mainTurns.get(agent.parentTurnIds.at(-1));
+    const meta = [
+      `${fmt(agent.turns.length)} ${agent.turns.length === 1 ? 'turn' : 'turns'}`,
+      agent.usage ? `${compactTokens(agent.usage.total)} tokens` : null,
+      `last ${clock(agent.lastSeenMs)}`
+    ].filter(Boolean).join(' · ');
+    const from = parent ? `Started from “${firstLine(parent.opener?.prompt_preview, 80) || 'a turn'}” at ${clock(parent.startMs)} in session ${agent.session_key || ''}.` : 'The turn that started this subagent is not in the retained events.';
+    const turns = () => `<p class="turn__note">${esc(from)}</p>${agent.turns.slice(0, MAX_TURNS_PER_LIST)
+      .map(turn => turnDetailsHtml(turn, subagentTurnTitle(turn, agent), `turn:${turn.id}`, false, context)).join('')}`;
+    turnBodies.set(key, turns);
+    return `<details class="turn-agent" data-open-key="${esc(key)}"${open ? ' open' : ''}>
+      <summary class="turn-agent__head">
+        <span class="dot ${tone === 'running' ? 'active' : tone === 'active' ? '' : 'idle'}"></span>
+        <span class="turn__title">${esc(agent.agent_type || 'Subagent')}<small>${esc(agent.agent_id || 'no agent id')}</small></span>
+        <span class="turn__meta">${esc(meta)}</span>
+        <span class="badge ${tone}">${esc(label)}</span>
+      </summary>
+      <div class="turn-agent__body" data-turn-body${open ? ' data-filled="1"' : ''}>${open ? turns() : ''}</div>
+    </details>`;
+  }).join('');
+  const hidden = model.agents.length - MAX_SUBAGENTS;
+  return `<section class="panel turns-panel">
+    <div class="sub-head">
+      <div><p class="eyebrow">Subagents</p><h2>Subagent turns</h2></div>
+      <span class="panel__note">Lifecycle hooks · newest first</span>
+    </div>
+    ${figures}
+    ${agents || '<div class="empty-state">No subagent events in the retained events.</div>'}
+    ${hidden > 0 ? `<p class="turn__note">${fmt(hidden)} older ${hidden === 1 ? 'subagent is' : 'subagents are'} not shown.</p>` : ''}
+  </section>`;
 }
 
 /* ── command palette ───────────────────────────────────────────── */

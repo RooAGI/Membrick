@@ -215,6 +215,19 @@ pub(super) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
     body.push_str("# HELP membrick_index_segments Number of segments in the published search snapshot.\n# TYPE membrick_index_segments gauge\n");
     if let Ok(service) = state.service.read() {
         let inspection = service.memory_store(MemoryStore::Workspace).inspection();
+        let captured_inspection = service.memory_store(MemoryStore::Captured).inspection();
+        let segment_count = inspection
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.segment_count)
+            .unwrap_or_default()
+            .saturating_add(
+                captured_inspection
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.segment_count)
+                    .unwrap_or_default(),
+            );
         body.push_str(&format!(
             "membrick_index_source_documents {}\nmembrick_index_records {}\nmembrick_index_dirty {}\nmembrick_index_store_revision {}\nmembrick_index_snapshot_revision {}\nmembrick_index_revision_lag {}\nmembrick_index_segments {}\n",
             inspection.source_document_count,
@@ -223,7 +236,7 @@ pub(super) async fn metrics(State(state): State<AppState>) -> impl IntoResponse 
             inspection.store_revision,
             inspection.snapshot_revision,
             inspection.store_revision.saturating_sub(inspection.snapshot_revision),
-            inspection.snapshot.map(|snapshot| snapshot.segment_count).unwrap_or_default()
+            segment_count
         ));
     }
     (
