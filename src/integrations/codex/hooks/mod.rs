@@ -321,11 +321,14 @@ fn handle_hook_with_backend(
         // open and durable index refresh can exceed that; Stop already captures
         // the completed turn, so avoid starting a write that Codex may kill.
         CodexHookKind::SessionEnd => Ok(CodexHookOutput::default()),
-        CodexHookKind::SubagentStart => retrieve(
+        CodexHookKind::SubagentStart => retrieve_with_identity(
             &root,
             kind.event_name(),
             &input.session_id,
             input.prompt.as_deref().unwrap_or_default(),
+            input.agent_id.as_deref(),
+            input.agent_type.as_deref(),
+            input.turn_id.as_deref(),
             backend,
         ),
         CodexHookKind::SubagentStop => capture(&root, input, CodexDocumentType::Outcome, backend),
@@ -355,6 +358,21 @@ fn retrieve(
     event_name: &str,
     session_id: &str,
     query: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<CodexHookOutput> {
+    retrieve_with_identity(
+        root, event_name, session_id, query, None, None, None, backend,
+    )
+}
+
+fn retrieve_with_identity(
+    root: &Path,
+    event_name: &str,
+    session_id: &str,
+    query: &str,
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
+    turn_id: Option<&str>,
     backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<CodexHookOutput> {
     if query.trim().is_empty() {
@@ -463,13 +481,16 @@ fn retrieve(
             "excerpt": normalized,
         }));
     }
-    let _ = crate::telemetry::record_memory_retrieval(
+    let _ = crate::telemetry::record_memory_retrieval_with_identity(
         root,
         "codex",
         session_id,
         query,
         started.elapsed().as_millis() as u64,
         &retrieved_memories,
+        agent_id,
+        agent_type,
+        turn_id,
     );
     if seen.is_empty() {
         return Ok(CodexHookOutput::default());
@@ -1437,6 +1458,30 @@ mod tests {
             .unwrap()
             .additional_context
             .contains("Implemented docker segment routing"));
+
+        let mut subagent = input(&root, None, "SubagentStart");
+        subagent.prompt = Some("docker routing".to_string());
+        subagent.agent_id = Some("agent-docker".to_string());
+        subagent.agent_type = Some("Explore".to_string());
+        subagent.turn_id = Some("turn-docker".to_string());
+        let output = handle_hook_test(CodexHookKind::SubagentStart, subagent, &root).unwrap();
+        assert!(output
+            .hook_specific_output
+            .unwrap()
+            .additional_context
+            .contains("Implemented docker segment routing"));
+        let status = crate::telemetry::provider_lifecycle_status(&root, "codex")
+            .unwrap()
+            .unwrap();
+        let retrieval = status
+            .subagent_events
+            .iter()
+            .find(|event| event.event == "MemoryRetrieved")
+            .expect("subagent retrieval should be retained with its child events");
+        assert_eq!(retrieval.agent_id.as_deref(), Some("agent-docker"));
+        assert_eq!(retrieval.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(retrieval.turn_id.as_deref(), Some("turn-docker"));
+        assert_eq!(retrieval.retrieved_memory_count, Some(1));
 
         fs::remove_dir_all(root).unwrap();
     }

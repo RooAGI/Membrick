@@ -142,6 +142,11 @@ test('buildProviderTurns separates subagent work from the main turn and links it
     tool('PreToolUse', 110, 'Bash', { command: 'cat' }),
     tool('PostToolUse', 111, 'Bash', { command: 'cat' }),
     ev('SubagentStart', 120, agent),
+    ev('MemoryRetrieved', 120.5, {
+      ...agent,
+      retrieved_memory_count: 1,
+      retrieved_memory_details: JSON.stringify([{ doc_id: 'doc-auth', excerpt: 'shared auth policy' }])
+    }),
     tool('PreToolUse', 121, 'Bash', { command: 'ls' }, agent),
     tool('PostToolUse', 122, 'Bash', { command: 'ls' }, agent),
     ev('SubagentStop', 130, agent),
@@ -163,6 +168,11 @@ test('buildProviderTurns separates subagent work from the main turn and links it
   assert.equal(sub.agent_type, 'Explore');
   assert.equal(sub.state, 'completed');
   assert.equal(sub.usage.total, 12);
+  assert.equal(sub.turns[0].retrievals.length, 1);
+  assert.deepEqual(sub.turns[0].timeline.map(item => item.kind), [
+    'start', 'retrieval', 'tool', 'tool', 'stop'
+  ]);
+  assert.equal(sub.turns[0].timeline[1].event.agent_id, 'a1');
   assert.equal(sub.turns[0].parentTurnId, main.id);
   assert.deepEqual(sub.parentTurnIds, [main.id]);
   assert.equal(main.subagents[0].turnId, sub.turns[0].id);

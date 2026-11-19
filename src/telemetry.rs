@@ -565,10 +565,9 @@ impl ProviderLifecycleCounters {
     }
 }
 
-/// Subagent lifecycle events, and usage reported for a subagent's own turn.
+/// Events attributed to a subagent, including its retrieval and usage events.
 fn is_subagent_event(event: &ProviderLifecycleEvent) -> bool {
-    matches!(event.event.as_str(), "SubagentStart" | "SubagentStop")
-        || (event.event == "TurnUsage" && event.agent_id.is_some())
+    matches!(event.event.as_str(), "SubagentStart" | "SubagentStop") || event.agent_id.is_some()
 }
 
 fn push_bounded(list: &mut Vec<ProviderLifecycleEvent>, event: ProviderLifecycleEvent, cap: usize) {
@@ -647,6 +646,30 @@ pub fn record_memory_retrieval(
     latency_ms: u64,
     memories: &[serde_json::Value],
 ) -> Result<()> {
+    record_memory_retrieval_with_identity(
+        project_root,
+        provider,
+        session_id,
+        query,
+        latency_ms,
+        memories,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn record_memory_retrieval_with_identity(
+    project_root: &Path,
+    provider: &str,
+    session_id: &str,
+    query: &str,
+    latency_ms: u64,
+    memories: &[serde_json::Value],
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<()> {
     record_provider_lifecycle_event(
         project_root,
         provider,
@@ -657,6 +680,9 @@ pub fn record_memory_retrieval(
             "retrieval_latency_ms": latency_ms,
             "retrieved_memory_count": memories.len() as u64,
             "retrieved_memory_details": memories,
+            "agent_id": agent_id,
+            "agent_type": agent_type,
+            "turn_id": turn_id,
         }),
     )
 }
@@ -1994,6 +2020,24 @@ mod tests {
             "SubagentStart",
             serde_json::json!({"agent_id": "a1", "agent_type": "Explore"}),
         );
+        record_memory_retrieval_with_identity(
+            &root,
+            "claude",
+            "session-a",
+            "auth policy",
+            12,
+            &[serde_json::json!({
+                "doc_id": "doc-auth",
+                "source": "memory://auth",
+                "type": "memory",
+                "score": 0.9,
+                "excerpt": "Use the shared auth policy"
+            })],
+            Some("a1"),
+            Some("Explore"),
+            Some("turn-a1"),
+        )
+        .unwrap();
         record(
             "TurnUsage",
             serde_json::json!({"agent_id": "a1", "agent_type": "Explore", "usage": {"input_tokens": 9, "output_tokens": 2}}),
@@ -2025,18 +2069,31 @@ mod tests {
                     event.event.as_str(),
                     event.agent_id.as_deref(),
                     event.agent_type.as_deref(),
+                    event.turn_id.as_deref(),
                 )
             })
             .collect::<Vec<_>>();
         assert_eq!(
             subagent,
             [
-                ("SubagentStart", Some("a1"), Some("Explore")),
-                ("TurnUsage", Some("a1"), Some("Explore")),
+                ("SubagentStart", Some("a1"), Some("Explore"), None),
+                (
+                    "MemoryRetrieved",
+                    Some("a1"),
+                    Some("Explore"),
+                    Some("turn-a1")
+                ),
+                ("TurnUsage", Some("a1"), Some("Explore"), None),
                 // An empty agent_type is treated as missing.
-                ("SubagentStop", Some("a1"), None),
+                ("SubagentStop", Some("a1"), None, None),
             ]
         );
+        let retrieval = status
+            .subagent_events
+            .iter()
+            .find(|event| event.event == "MemoryRetrieved")
+            .unwrap();
+        assert_eq!(retrieval.retrieved_memory_count, Some(1));
         fs::remove_dir_all(root).unwrap();
     }
 
