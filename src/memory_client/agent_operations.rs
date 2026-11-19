@@ -1,4 +1,5 @@
 use super::{decode, ensure_success, Connection, Memory, MemoryError};
+use crate::memory_api::{ReviewSearchResult, SearchReviewResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -92,7 +93,71 @@ pub struct WorkspaceSearchResponse {
     pub metadata: serde_json::Map<String, Value>,
 }
 
+/// Select one recorded workspace search or page through unreviewed searches.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReviewSearchRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<usize>,
+}
+
+/// Select which Membrick search history to review.
+#[derive(Debug, Clone)]
+pub enum ReviewSearchTarget {
+    /// Recorded search made against indexed workspace content.
+    Workspace(AgentOperationContext),
+    /// Search made through the user-scoped `Memory::search` API.
+    User { user_id: String },
+}
+
+impl ReviewSearchRequest {
+    /// Retrieve the recorded query, results, and available source documents.
+    pub fn by_id(search_id: impl Into<String>) -> Self {
+        Self {
+            search_id: Some(search_id.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Page through searches that have not yet been reviewed.
+    pub fn unreviewed(cursor: Option<String>, page_size: Option<usize>) -> Self {
+        Self {
+            cursor,
+            page_size,
+            ..Self::default()
+        }
+    }
+}
+
 impl Memory {
+    /// Retrieve the recorded details and source documents for a user-scoped
+    /// memory search. The response is the same DTO exposed by the Python and
+    /// Node.js clients.
+    pub fn review_memory_search(
+        &self,
+        search_id: &str,
+        user_id: &str,
+    ) -> Result<SearchReviewResponse, MemoryError> {
+        if search_id.trim().is_empty() {
+            return Err(MemoryError::Configuration {
+                message: "review search_id must not be empty".into(),
+            });
+        }
+        if user_id.trim().is_empty() {
+            return Err(MemoryError::Configuration {
+                message: "review user_id must not be empty".into(),
+            });
+        }
+        let payload = json!({"search_id": search_id, "user_id": user_id});
+        let (status, body) =
+            self.request("POST", "/v1/memories/search/review", Some(&payload), false)?;
+        ensure_success(status, &body)?;
+        decode(body)
+    }
+
     /// Queue a provider transcript for durable background capture. A receipt
     /// means accepted by the queue, not yet persisted/searchable.
     pub fn submit_capture(
@@ -166,6 +231,50 @@ impl Memory {
         });
         let body = self.workspace_tool(context, "search", arguments, false)?;
         decode(body)
+    }
+
+    /// Review a recorded workspace or user-scoped search.
+    ///
+    /// Exact review returns the recorded query and results together with
+    /// available indexed source documents. Workspace searches can also page
+    /// through unreviewed searches. User-scoped memory searches must be
+    /// reviewed by exact `search_id` and matching `user_id`.
+    pub fn review_search(
+        &self,
+        target: ReviewSearchTarget,
+        request: ReviewSearchRequest,
+    ) -> Result<ReviewSearchResult, MemoryError> {
+        if request
+            .search_id
+            .as_deref()
+            .is_some_and(|search_id| search_id.trim().is_empty())
+        {
+            return Err(MemoryError::Configuration {
+                message: "review search_id must not be empty".into(),
+            });
+        }
+        match target {
+            ReviewSearchTarget::Workspace(context) => {
+                let arguments =
+                    serde_json::to_value(request).map_err(|error| MemoryError::Configuration {
+                        message: format!("invalid review search request: {error}"),
+                    })?;
+                decode(self.workspace_tool(&context, "review_search", arguments, false)?)
+            }
+            ReviewSearchTarget::User { user_id } => {
+                if request.search_id.is_none()
+                    || request.cursor.is_some()
+                    || request.page_size.is_some()
+                {
+                    return Err(MemoryError::Configuration {
+                        message: "user search review requires only an exact search_id".into(),
+                    });
+                }
+                let search_id = request.search_id.expect("validated above");
+                let response = self.review_memory_search(&search_id, &user_id)?;
+                Ok(ReviewSearchResult::Exact(response))
+            }
+        }
     }
 
     /// Durably publish adapter-parsed capture documents through the resident

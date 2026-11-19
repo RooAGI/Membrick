@@ -47,6 +47,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/add/batch", post(add_batch))
         .route("/flush", post(refresh_memories))
         .route("/search", post(search))
+        .route("/search/review", post(review_memory_search))
         .route("/delete", post(delete))
         .route("/supersede", post(supersede))
         .route("/expire", post(expire))
@@ -56,6 +57,7 @@ pub(super) fn router() -> Router<AppState> {
             get(get_memory).patch(update_memory).delete(delete_memory),
         )
         .route("/v1/memories/search", post(search))
+        .route("/v1/memories/search/review", post(review_memory_search))
         .route("/v1/memories/refresh", post(refresh_memories))
 }
 
@@ -183,6 +185,11 @@ pub(super) async fn search(
         // user's follow-up state.
         request.request.scope = Some(auth.0.user_id.clone());
     }
+    let history_request = match serde_json::to_value(&request) {
+        Ok(value) => value,
+        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    let history_user_id = request.request.user_id.clone();
     // Search uses the already-published immutable index snapshot. Its small
     // mutable side state is internally synchronized, so requests can share
     // the service read lock and run retrieval concurrently.
@@ -253,7 +260,16 @@ pub(super) async fn search(
             result.as_ref().map(|r| r.data.is_empty()).unwrap_or(false),
         );
         return match result {
-            Ok(response) => Json(response).into_response(),
+            Ok(response) => {
+                match record_memory_search(&state, history_user_id, history_request, response) {
+                    Ok(response) => Json(response).into_response(),
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"detail":"search review record failed"})),
+                    )
+                        .into_response(),
+                }
+            }
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
@@ -277,7 +293,14 @@ pub(super) async fn search(
                 false,
                 result.data.is_empty(),
             );
-            Json(serde_json::to_value(result).unwrap()).into_response()
+            match record_memory_search(&state, history_user_id, history_request, result) {
+                Ok(response) => Json(response).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"detail":"search review record failed"})),
+                )
+                    .into_response(),
+            }
         }
         Err(_) => {
             state
@@ -289,6 +312,73 @@ pub(super) async fn search(
             )
                 .into_response()
         }
+    }
+}
+
+fn record_memory_search(
+    state: &AppState,
+    user_id: String,
+    request: Value,
+    response: crate::memory_api::SearchResponse,
+) -> anyhow::Result<crate::memory_client::MemorySearchResponse> {
+    let search_id = crate::memory_search_history::new_search_id();
+    let created_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    crate::memory_search_history::record_search(
+        &state.project_root,
+        &crate::memory_search_history::MemorySearchHistoryRecord {
+            search_id: search_id.clone(),
+            user_id,
+            request,
+            response: response.clone(),
+            created_at_ms,
+        },
+    )?;
+    Ok(crate::memory_client::MemorySearchResponse {
+        search_id,
+        data: response.data,
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewMemorySearchRequest {
+    search_id: String,
+    user_id: String,
+}
+
+async fn review_memory_search(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthContext>>,
+    Json(request): Json<ReviewMemorySearchRequest>,
+) -> impl IntoResponse {
+    if request.search_id.trim().is_empty() || request.user_id.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"detail":"search_id and user_id are required"})),
+        )
+            .into_response();
+    }
+    let value = json!({"user_id": request.user_id});
+    if let Err(error) = tenant_check(&state, &value, auth.as_ref().map(|a| &a.0)) {
+        return error.into_response();
+    }
+    let reviewed = match state.service.read() {
+        Ok(service) => service.review_memory_search_record(
+            &state.project_root,
+            &request.search_id,
+            &request.user_id,
+        ),
+        Err(_) => Err(anyhow::anyhow!("memory service lock poisoned")),
+    };
+    match reviewed {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"detail":"search record not found"})),
+        )
+            .into_response(),
     }
 }
 

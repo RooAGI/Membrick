@@ -1,0 +1,165 @@
+{
+  "run_date": "2026-11-16",
+  "purpose": "Additional topic triage pilot using Membrick candidate search, source review, and a stratified audit",
+  "topic": {
+    "slug": "system-updates",
+    "definition": "DGX Spark DGX OS, OTA, BIOS, firmware, NVIDIA driver, or kernel updates and resulting regressions. A thread is relevant if it supports a reusable, evidence-backed fact, diagnostic procedure, outcome, limitation, or carefully caveated report. Unresolved reports can qualify when their scope and uncertainty are preserved.",
+    "exclusions": "General hardware/workload problems without an update trigger; recovery-tool requests or recovery design proposals without a concrete update event or regression; unrelated OS changes made for another product or research environment."
+  },
+  "searches": [
+    {
+      "query": "DGX Spark DGX OS update firmware BIOS driver kernel upgrade regression recovery",
+      "search_id": "mcp:fa3f1bf612e6dff2935e81c60080ff41edc794341f1d2475004f98b11107cbf0",
+      "top_k": 12,
+      "results": [
+        {"rank": 1, "doc_id": "raw/365280/365280.md", "membrick_source_hash": "f46f7546c296532ebe6a9be358d39017eafa307c80376e9d612d16a8156b6263"},
+        {"rank": 2, "doc_id": "raw/369711/369711.md", "membrick_source_hash": "0658901d6dc5ac12fb8d083bcc2e4bbbb46ce170baf35ab99bfee97ae369c040"},
+        {"rank": 3, "doc_id": "raw/366026/366026.md", "membrick_source_hash": "3065e2201cb66ecac7f674ed671f593916c15ded10d2eac25c56948ae6e8cf63"},
+        {"rank": 4, "doc_id": "raw/378200/378200.md", "membrick_source_hash": "40fc4e5e1ff5b8adfda1bbc1ac27bed88f911d813fff33e53dcf830a545b2593"},
+        {"rank": 5, "doc_id": "raw/368678/368678.md", "membrick_source_hash": "a09587911a9fb7680c866fbed355b79e63abc9c05f3d5f42ac3bbe3c3988c77e"},
+        {"rank": 6, "doc_id": "raw/387898/387898.md", "membrick_source_hash": "8d1bcc50d86a563b71fc3d0e9547befd0ba2b5eb8ea06915dabda858a82c7b4a"},
+        {"rank": 7, "doc_id": "raw/348453/348453.md", "membrick_source_hash": "58aab57fb816303895f5691457ee039d10c3bcfbeb54b1d3fbff196f1a2288c0"},
+        {"rank": 8, "doc_id": "raw/351923/351923.md", "membrick_source_hash": "8a7ad0d052a0f5451c8fc7d680a3ac184dd9a83ad4ff344c15c90f0cfc777755"},
+        {"rank": 9, "doc_id": "raw/381820/381820.md", "membrick_source_hash": "1cc4e114a01c4072efd5cd88c472bc36e4a79b69d82498da76fcc217b13068db"},
+        {"rank": 10, "doc_id": "raw/371102/371102.md", "membrick_source_hash": "e29c4bd06617650950e2b4e59c41135845db845d07a3944bd14f7caddc251b14"},
+        {"rank": 11, "doc_id": "raw/367655/367655.md", "membrick_source_hash": "507a02be66302d371278dd375dbf595eb771ea4d58b092cba8498d6e0f164cee"},
+        {"rank": 12, "doc_id": "raw/361630/361630.md", "membrick_source_hash": "a2987ebf7336ab44851259681522f8988444be1ccf36b2bfa60037c972427437"}
+      ]
+    },
+    {
+      "query": "DGX Spark apt upgrade NVIDIA driver firmware OTA version mismatch GPU no devices rollback",
+      "search_id": "mcp:c2d18dabc49291dd781b9fd40f06cb567052958aeb0097ed51a7306a96614481",
+      "top_k": 12,
+      "results": [
+        {"rank": 1, "doc_id": "raw/378200/378200.md", "membrick_source_hash": "40fc4e5e1ff5b8adfda1bbc1ac27bed88f911d813fff33e53dcf830a545b2593"},
+        {"rank": 2, "doc_id": "raw/369711/369711.md", "membrick_source_hash": "0658901d6dc5ac12fb8d083bcc2e4bbbb46ce170baf35ab99bfee97ae369c040"},
+        {"rank": 3, "doc_id": "raw/356426/356426.md", "membrick_source_hash": "1b9096444509a8e92efbca5b1866dc8154928040b83905fc91f6192f58e88d62"},
+        {"rank": 4, "doc_id": "raw/382452/382452.md", "membrick_source_hash": "a51774f3e0c2b2d5de43f5fe28e816bdf72c2ef95ee422f149682453696998ec"},
+        {"rank": 5, "doc_id": "raw/351828/351828.md", "membrick_source_hash": "80769e116054bef2de3f80cebfb1c860694f3560ab94766813466e44d19d3519"},
+        {"rank": 6, "doc_id": "raw/348453/348453.md", "membrick_source_hash": "58aab57fb816303895f5691457ee039d10c3bcfbeb54b1d3fbff196f1a2288c0"},
+        {"rank": 7, "doc_id": "raw/375537/375537.md", "membrick_source_hash": "8f61e0f98b85621e40cd1e57d5189cc22729c52301f7b4bf3f82f2414e21d606"},
+        {"rank": 8, "doc_id": "raw/363299/363299.md", "membrick_source_hash": "f919521f322f5ca1c0ab36737df9566beecdef665a4d809d75025b70364cd52c"},
+        {"rank": 9, "doc_id": "raw/388605/388605.md", "membrick_source_hash": "12d22ddabb95358a493a41dddc0794d63583fd97378afe3da1dc3708572ecb3c"},
+        {"rank": 10, "doc_id": "raw/383295/383295.md", "membrick_source_hash": "b32749286bd8666ec98034bbe6f9925b534ac58c4f89b51a429850071d44b997"},
+        {"rank": 11, "doc_id": "raw/360398/360398.md", "membrick_source_hash": "4b8e81c3bf12344536b0c7cdf3dfca4ab10dccd004763e36fda171be081a316a"},
+        {"rank": 12, "doc_id": "raw/387898/387898.md", "membrick_source_hash": "8d1bcc50d86a563b71fc3d0e9547befd0ba2b5eb8ea06915dabda858a82c7b4a"}
+      ]
+    }
+  ],
+  "deduplication": {
+    "candidate_universe_size": 20,
+    "duplicate_doc_ids_across_queries": ["raw/378200/378200.md", "raw/369711/369711.md", "raw/387898/387898.md", "raw/348453/348453.md"],
+    "rule": "Deduplicate by exact Membrick doc_id before forming candidate pools. Duplicate appearances retain both query ranks in the search result records above."
+  },
+  "candidate_pools": {
+    "sampling": {
+      "method": "Three candidates sampled without replacement from each manually triaged pool; IDs sorted lexically before sampling.",
+      "implementation": "Python random.Random(seed).sample",
+      "seed": 20261116,
+      "rng": "CPython random.Random",
+      "reproducibility_note": "The exact algorithm and sorted input pools are recorded here. The sample IDs are retained explicitly below as the audit record."
+    },
+    "system-updates": {
+      "selected": ["348453", "351828", "351923", "361630", "363299", "365280", "366026", "367655", "368678", "369711", "375537", "378200", "382452", "383295", "387898"],
+      "excluded": ["356426", "360398", "371102", "381820", "388605"]
+    }
+  },
+  "audit": [
+    {
+      "topic": "system-updates",
+      "thread_id": "361630",
+      "triage": "selected",
+      "label": "relevant",
+      "reason": "Posts #5 and #6 report display signal loss after updates; useful as a scoped regression report even though no fix is established in the thread.",
+      "query_ranks": [{"search_id": "mcp:fa3f1bf612e6dff2935e81c60080ff41edc794341f1d2475004f98b11107cbf0", "rank": 12}],
+      "source": "raw/361630/361630.md",
+      "membrick_source_hash": "a2987ebf7336ab44851259681522f8988444be1ccf36b2bfa60037c972427437",
+      "local_file_sha256": "77e548c8ca4e230e4a859698c7919c28eba12707b9c86d8af6111c94ba073e96",
+      "membrick_content_truncated": false
+    },
+    {
+      "topic": "system-updates",
+      "thread_id": "387898",
+      "triage": "selected",
+      "label": "relevant",
+      "reason": "Detailed unresolved USB-C PD firmware update report with version checks, capsule results, and repeated diagnostic attempts; retain as unresolved, not as a confirmed fix.",
+      "query_ranks": [{"search_id": "mcp:fa3f1bf612e6dff2935e81c60080ff41edc794341f1d2475004f98b11107cbf0", "rank": 6}, {"search_id": "mcp:c2d18dabc49291dd781b9fd40f06cb567052958aeb0097ed51a7306a96614481", "rank": 12}],
+      "source": "raw/387898/387898.md",
+      "membrick_source_hash": "8d1bcc50d86a563b71fc3d0e9547befd0ba2b5eb8ea06915dabda858a82c7b4a",
+      "local_file_sha256": "7d13cadb9bf5dd666afa97cfff07cc71d668e6e6bce86c5689edab2129eff11f",
+      "membrick_content_truncated": true,
+      "source_review_note": "Membrick returned truncated content; the available local forum export was reviewed."
+    },
+    {
+      "topic": "system-updates",
+      "thread_id": "375537",
+      "triage": "selected",
+      "label": "relevant",
+      "reason": "Reports a fwupd/libfwupd version mismatch after OTA, isolates the daemon failure, and records a resolution.",
+      "query_ranks": [{"search_id": "mcp:c2d18dabc49291dd781b9fd40f06cb567052958aeb0097ed51a7306a96614481", "rank": 7}],
+      "source": "raw/375537/375537.md",
+      "membrick_source_hash": "8f61e0f98b85621e40cd1e57d5189cc22729c52301f7b4bf3f82f2414e21d606",
+      "local_file_sha256": "e04a62acf78d0b3ed3c7188991cb16f1adb9c4564e8bebb6d139df16ab1f9f57",
+      "membrick_content_truncated": true,
+      "source_review_note": "Membrick returned truncated content; the available local forum export was reviewed."
+    },
+    {
+      "topic": "system-updates",
+      "thread_id": "381820",
+      "triage": "excluded",
+      "label": "not_relevant",
+      "reason": "Asks for recovery tools and clarifies access to the recovery process; no specific update event or regression is documented.",
+      "query_ranks": [{"search_id": "mcp:fa3f1bf612e6dff2935e81c60080ff41edc794341f1d2475004f98b11107cbf0", "rank": 9}],
+      "source": "raw/381820/381820.md",
+      "membrick_source_hash": "1cc4e114a01c4072efd5cd88c472bc36e4a79b69d82498da76fcc217b13068db",
+      "local_file_sha256": "75aba05246719fcd9c03a94be8d6959c94616fba8781e3e4dc20619ac9834ef6",
+      "membrick_content_truncated": false
+    },
+    {
+      "topic": "system-updates",
+      "thread_id": "371102",
+      "triage": "excluded",
+      "label": "not_relevant",
+      "reason": "Proposes a community recovery architecture; it is a design discussion rather than a concrete update or regression case.",
+      "query_ranks": [{"search_id": "mcp:fa3f1bf612e6dff2935e81c60080ff41edc794341f1d2475004f98b11107cbf0", "rank": 10}],
+      "source": "raw/371102/371102.md",
+      "membrick_source_hash": "e29c4bd06617650950e2b4e59c41135845db845d07a3944bd14f7caddc251b14",
+      "local_file_sha256": "5709b49da5a7277566791b632ba6f6f49ebf96cacb6e4e061811f111adfb9fcb",
+      "membrick_content_truncated": true,
+      "source_review_note": "Membrick returned truncated content; the available local forum export was reviewed."
+    },
+    {
+      "topic": "system-updates",
+      "thread_id": "388605",
+      "triage": "excluded",
+      "label": "not_relevant",
+      "reason": "Reports a GPU rendering correlation on a matching driver/OS stack, without an update trigger; outside this topic's update-regression boundary.",
+      "query_ranks": [{"search_id": "mcp:c2d18dabc49291dd781b9fd40f06cb567052958aeb0097ed51a7306a96614481", "rank": 9}],
+      "source": "raw/388605/388605.md",
+      "membrick_source_hash": "12d22ddabb95358a493a41dddc0794d63583fd97378afe3da1dc3708572ecb3c",
+      "local_file_sha256": "c10e938420d3c41d13c7f938f524ebc46bdead6022f7d808e91ce431b736efe8",
+      "membrick_content_truncated": false
+    }
+  ],
+  "metrics": {
+    "definition": "Selected is the positive prediction; excluded is the negative prediction. Source review provides the audit label.",
+    "per_topic": {
+      "system-updates": {"tp": 3, "fp": 0, "fn": 0, "tn": 3, "f1": 1.0}
+    },
+    "macro_f1": 1.0,
+    "pooled": {"tp": 3, "fp": 0, "fn": 0, "tn": 3, "precision": 1.0, "recall": 1.0, "micro_f1": 1.0}
+  },
+  "calculation": {
+    "script": "triage-pilot.py",
+    "command": "python3 triage-pilot.py triage-pilot-2026-11-16-system-updates.json",
+    "hash_validation_command_at_run_time": "python3 triage-pilot.py triage-pilot-2026-11-16-system-updates.json --source-root .",
+    "hash_validation_result": "All six local source SHA-256 hashes matched the forum exports in the original local corpus."
+  },
+  "limitations": [
+    "The six-document audit is illustrative and does not estimate production performance.",
+    "F1 measures classification only inside these retrieved candidate pools; it cannot identify relevant sources missed by both searches.",
+    "No false negative appeared in this small sample; this is not evidence that retrieval recall is complete.",
+    "The initial candidate pool labels were formed from ranked result content and topic scope; only the sampled six received full source audit.",
+    "Membrick source hashes differ from SHA-256 hashes of local raw exports; both values are preserved separately rather than treating them as interchangeable."
+  ]
+}

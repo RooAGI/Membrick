@@ -332,11 +332,14 @@ fn handle_hook_with_backend(
             ClaudeCodeDocumentType::SessionSummary,
             backend,
         ),
-        ClaudeHookKind::SubagentStart => retrieve(
+        ClaudeHookKind::SubagentStart => retrieve_with_identity(
             &root,
             kind.event_name(),
             &input.session_id,
             input.prompt.as_deref().unwrap_or_default(),
+            input.agent_id.as_deref(),
+            input.agent_type.as_deref(),
+            input.turn_id.as_deref(),
             backend,
         ),
         ClaudeHookKind::SubagentStop => {
@@ -368,6 +371,21 @@ fn retrieve(
     event_name: &str,
     session_id: &str,
     query: &str,
+    backend: crate::integrations::mcp_tools::MemoryBackend,
+) -> Result<ClaudeHookOutput> {
+    retrieve_with_identity(
+        root, event_name, session_id, query, None, None, None, backend,
+    )
+}
+
+fn retrieve_with_identity(
+    root: &Path,
+    event_name: &str,
+    session_id: &str,
+    query: &str,
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
+    turn_id: Option<&str>,
     backend: crate::integrations::mcp_tools::MemoryBackend,
 ) -> Result<ClaudeHookOutput> {
     if query.trim().is_empty() {
@@ -481,13 +499,16 @@ fn retrieve(
             "excerpt": normalized,
         }));
     }
-    let _ = crate::telemetry::record_memory_retrieval(
+    let _ = crate::telemetry::record_memory_retrieval_with_identity(
         root,
         "claude",
         session_id,
         query,
         started.elapsed().as_millis() as u64,
         &retrieved_memories,
+        agent_id,
+        agent_type,
+        turn_id,
     );
     if seen.is_empty() {
         return Ok(ClaudeHookOutput::default());
@@ -1441,12 +1462,27 @@ mod tests {
 
         let mut subagent = input(&root, None, "SubagentStart");
         subagent.prompt = Some("auth module JWT signing".to_string());
+        subagent.agent_id = Some("agent-auth".to_string());
+        subagent.agent_type = Some("Explore".to_string());
+        subagent.turn_id = Some("turn-auth".to_string());
         let output = handle_hook_test(ClaudeHookKind::SubagentStart, subagent, &root).unwrap();
         let context = output
             .hook_specific_output
             .expect("relevant memory should be retrieved")
             .additional_context;
         assert!(context.contains("JWT"));
+        let status = crate::telemetry::provider_lifecycle_status(&root, "claude")
+            .unwrap()
+            .unwrap();
+        let retrieval = status
+            .subagent_events
+            .iter()
+            .find(|event| event.event == "MemoryRetrieved")
+            .expect("subagent retrieval should be retained with its child events");
+        assert_eq!(retrieval.agent_id.as_deref(), Some("agent-auth"));
+        assert_eq!(retrieval.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(retrieval.turn_id.as_deref(), Some("turn-auth"));
+        assert_eq!(retrieval.retrieved_memory_count, Some(1));
         fs::remove_dir_all(root).unwrap();
     }
 

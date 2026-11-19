@@ -212,7 +212,8 @@ or the HTTP API.
         [{"role": "user", "content": "I prefer concise answers with a short summary first."}],
         user_id="local-user",
     )
-    hits = memory.search("How do I prefer answers?", user_id="local-user")
+    search = memory.search("How do I prefer answers?", user_id="local-user")
+    review = memory.review_search(search["search_id"], "local-user")
     ```
 
 === "Node.js"
@@ -229,7 +230,8 @@ or the HTTP API.
       [{ role: 'user', content: 'I prefer concise answers with a short summary first.' }],
       'local-user',
     )
-    const hits = await memory.search('How do I prefer answers?', 'local-user')
+    const search = await memory.search('How do I prefer answers?', 'local-user')
+    const review = await memory.reviewSearch(search.search_id, 'local-user')
     ```
 
 === "Rust"
@@ -321,12 +323,13 @@ you are using:
     Continue with the `memory` client from the previous step:
 
     ```python
-    hits = memory.search(
+    search = memory.search(
         "How do I prefer answers?",
         user_id="local-user",
         top_k=5,
     )
-    for hit in hits:
+    review = memory.review_search(search["search_id"], "local-user")
+    for hit in search["data"]:
         print(hit["content"])
     ```
 
@@ -335,12 +338,13 @@ you are using:
     Continue with the `memory` client from the previous step:
 
     ```js
-    const hits = await memory.search(
+    const search = await memory.search(
       'How do I prefer answers?',
       'local-user',
       { topK: 5 },
     )
-    for (const hit of hits) {
+    const review = await memory.reviewSearch(search.search_id, 'local-user')
+    for (const hit of search.data) {
       console.log(hit.content)
     }
     ```
@@ -360,7 +364,7 @@ you are using:
             ..Default::default()
         },
     )?;
-    for hit in hits {
+    for hit in hits.data {
         println!("{}", hit.content);
     }
     ```
@@ -424,7 +428,7 @@ Choose the interface you are using:
     Continue with the `memory` client and `hits` from the search step:
 
     ```python
-    memory_id = hits[0]["id"]
+    memory_id = search["data"][0]["id"]
 
     updated = memory.update(
         memory_id,
@@ -443,7 +447,7 @@ Choose the interface you are using:
     Continue with the `memory` client and `hits` from the search step:
 
     ```js
-    const memoryId = hits[0].id
+    const memoryId = search.data[0].id
 
     const updated = await memory.update(
       memoryId,
@@ -464,7 +468,7 @@ Choose the interface you are using:
     ```rust
     use membrick::UpdateOptions;
 
-    let memory_id = &hits[0].id;
+    let memory_id = &hits.data[0].id;
     let updated = memory.update(
         memory_id,
         "local-user",

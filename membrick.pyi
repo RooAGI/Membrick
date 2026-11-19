@@ -1,6 +1,6 @@
 """Typed public API for the Membrick Python extension."""
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union, overload
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict, Union, overload
 
 
 class MembrickError(Exception):
@@ -22,6 +22,71 @@ class UnavailableError(ConnectionError, MembrickError):
 
 class UncertainError(RuntimeError, MembrickError):
     """The operation may have reached the service; do not blindly replay it."""
+
+
+class MemorySearchResponse(TypedDict):
+    search_id: str
+    data: List[Dict[str, Any]]
+
+
+class SearchReviewResponse(TypedDict):
+    search_id: str
+    reviewed: bool
+    search: Dict[str, Any]
+    result: Dict[str, Any]
+    documents: List[Dict[str, Any]]
+    prior_feedback: Optional[Any]
+
+
+class SearchReviewPageEntry(TypedDict):
+    search_id: str
+    search: Dict[str, Any]
+    result: Dict[str, Any]
+    documents: List[Dict[str, Any]]
+
+
+class SearchReviewPage(TypedDict):
+    searches: List[SearchReviewPageEntry]
+    next_cursor: Optional[str]
+    has_more: bool
+    oversized_records_skipped: int
+    malformed_records_skipped: int
+    first_malformed_offset: Optional[int]
+    ambiguous_searches_skipped: int
+
+
+class SearchReviewExactIndexing(TypedDict):
+    status: Literal["indexing"]
+    search_id: str
+    indexed_bytes: int
+    history_bytes: int
+    message: str
+
+
+class SearchReviewPageIndexing(TypedDict):
+    status: Literal["indexing"]
+    searches: List[Any]
+    indexed_bytes: int
+    history_bytes: int
+    message: str
+
+
+class SearchReviewHistoryIncomplete(TypedDict):
+    status: Literal["history_incomplete"]
+    search_id: str
+    malformed_records_skipped: int
+    oversized_records_skipped: int
+    first_malformed_offset: Optional[int]
+    message: str
+
+
+ReviewSearchResult = Union[
+    SearchReviewResponse,
+    SearchReviewPage,
+    SearchReviewExactIndexing,
+    SearchReviewPageIndexing,
+    SearchReviewHistoryIncomplete,
+]
 
 
 class Memory:
@@ -67,7 +132,40 @@ class Memory:
         scope: Optional[str] = ...,
         reference_date: Optional[str] = ...,
         options: Optional[Sequence[str]] = ...,
-    ) -> List[Dict[str, Any]]: ...
+    ) -> MemorySearchResponse: ...
+
+    def workspace_search(
+        self,
+        query: str,
+        provider: str,
+        top_k: int = ...,
+        workspace: Optional[str] = ...,
+        session_id: Optional[str] = ...,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    def review_search(
+        self,
+        search_id: str,
+        user_id: str,
+        provider: None = ...,
+        workspace: None = ...,
+        session_id: None = ...,
+        cursor: None = ...,
+        page_size: None = ...,
+    ) -> SearchReviewResponse: ...
+
+    @overload
+    def review_search(
+        self,
+        search_id: Optional[str] = ...,
+        user_id: None = ...,
+        provider: Optional[str] = ...,
+        workspace: Optional[str] = ...,
+        session_id: Optional[str] = ...,
+        cursor: Optional[str] = ...,
+        page_size: Optional[int] = ...,
+    ) -> ReviewSearchResult: ...
 
     def get(
         self, memory_id: str, user_id: str, include_inactive: bool = ...
@@ -125,7 +223,9 @@ class MemorySession:
         scope: Optional[str] = ...,
         reference_date: Optional[str] = ...,
         options: Optional[Sequence[str]] = ...,
-    ) -> List[Dict[str, Any]]: ...
+    ) -> MemorySearchResponse: ...
+
+    def review_search(self, search_id: str) -> SearchReviewResponse: ...
 
 
 class Mem0Adapter:

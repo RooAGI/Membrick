@@ -53,6 +53,7 @@ nav:
       - Rust: memory-client-rust.md
   - Integration:
       - Overview: connect-agent.md
+      - Agent integrations: agents.md
       - Connect your AI agents:
           - Codex: codex.md
           - Claude Code: claude-code.md
@@ -135,8 +136,10 @@ nav:
               - HTTP server benchmarks: http-server-benchmarks.md
               - LongMemEval strategies: longmemeval-strategies.md
               - Cross-system comparison: comparison.md
+  - Case study: case-studies/know-how-distillation-membrick/membrick-know-how-case-study.md
   - Releases:
       - Unreleased: releases/unreleased.md
+      - 0.10.0: releases/0.10.0.md
       - 0.9.1: releases/0.9.1.md
       - 0.9.0: releases/0.9.0.md
       - 0.8.3: releases/0.8.3.md

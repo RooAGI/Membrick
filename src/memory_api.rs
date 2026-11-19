@@ -263,6 +263,101 @@ pub struct SearchResponse {
     pub data: Vec<SearchMemory>,
 }
 
+/// Exact recorded search details and source documents returned by review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReviewResponse {
+    pub search_id: String,
+    pub reviewed: bool,
+    pub search: serde_json::Value,
+    pub result: serde_json::Value,
+    pub documents: Vec<serde_json::Value>,
+    pub prior_feedback: Option<serde_json::Value>,
+}
+
+/// One reviewed search from a page of unreviewed workspace searches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReviewPageEntry {
+    pub search_id: String,
+    pub search: serde_json::Value,
+    pub result: serde_json::Value,
+    pub documents: Vec<serde_json::Value>,
+}
+
+/// A page of unreviewed workspace searches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReviewPage {
+    pub searches: Vec<SearchReviewPageEntry>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub oversized_records_skipped: usize,
+    pub malformed_records_skipped: usize,
+    pub first_malformed_offset: Option<u64>,
+    pub ambiguous_searches_skipped: usize,
+}
+
+/// Progress while the resident indexes an exact workspace search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReviewExactIndexing {
+    pub status: SearchReviewIndexingStatus,
+    pub search_id: String,
+    pub indexed_bytes: u64,
+    pub history_bytes: u64,
+    pub message: String,
+}
+
+/// Progress while the resident indexes a page of workspace searches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReviewPageIndexing {
+    pub status: SearchReviewIndexingStatus,
+    pub searches: Vec<serde_json::Value>,
+    pub indexed_bytes: u64,
+    pub history_bytes: u64,
+    pub message: String,
+}
+
+/// Search history could not be fully checked because some records were invalid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchReviewHistoryIncomplete {
+    pub status: SearchReviewHistoryStatus,
+    pub search_id: String,
+    pub malformed_records_skipped: usize,
+    pub oversized_records_skipped: usize,
+    pub first_malformed_offset: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchReviewIndexingStatus {
+    Indexing,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchReviewHistoryStatus {
+    HistoryIncomplete,
+}
+
+/// Typed variants returned by exact and paginated workspace review operations.
+///
+/// This is an untagged union to preserve the established JSON shapes while
+/// sharing one response contract across Rust, Python, and Node.js clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReviewSearchResult {
+    Exact(SearchReviewResponse),
+    Page(SearchReviewPage),
+    ExactIndexing(SearchReviewExactIndexing),
+    PageIndexing(SearchReviewPageIndexing),
+    HistoryIncomplete(SearchReviewHistoryIncomplete),
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteRequest {
     pub user_id: String,

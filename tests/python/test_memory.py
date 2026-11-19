@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,51 @@ def _status_server(status):
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_port}"
+
+
+def _workspace_tool_server():
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            calls.append(body)
+            arguments = body.get("arguments", {})
+            if body.get("tool") == "search":
+                result = {"search_id": "workspace:search-1", "results": [{"id": "doc-1"}]}
+            elif body.get("tool") == "review_search" and "search_id" in arguments:
+                result = {
+                    "search_id": arguments["search_id"],
+                    "reviewed": False,
+                    "search": {},
+                    "result": {},
+                    "documents": [],
+                    "prior_feedback": None,
+                }
+            else:
+                result = {
+                    "searches": [],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "oversized_records_skipped": 0,
+                    "malformed_records_skipped": 0,
+                    "first_malformed_offset": None,
+                    "ambiguous_searches_skipped": 0,
+                }
+            encoded = json.dumps(result).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_port}", calls
 
 
 class MemoryBindingTests(unittest.TestCase):
@@ -82,6 +128,51 @@ class MemoryBindingTests(unittest.TestCase):
         self.assertTrue(issubclass(membrick.ConfigurationError, ValueError))
         self.assertTrue(issubclass(membrick.UnavailableError, ConnectionError))
         self.assertTrue(issubclass(membrick.UncertainError, RuntimeError))
+
+    def test_workspace_search_and_unified_review_search(self):
+        server, base_url, calls = _workspace_tool_server()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        memory = membrick.Memory(base_url=base_url)
+
+        result = memory.workspace_search(
+            "where is the deployment guide",
+            provider="codex",
+            top_k=7,
+            workspace="/remote/project",
+            session_id="codex:session-1",
+        )
+        self.assertEqual(result["search_id"], "workspace:search-1")
+        self.assertEqual(result["results"][0]["id"], "doc-1")
+
+        exact = memory.review_search(
+            result["search_id"],
+            provider="codex",
+            workspace="/remote/project",
+            session_id="codex:session-1",
+        )
+        self.assertEqual(exact["search_id"], result["search_id"])
+
+        page = memory.review_search(
+            provider="codex",
+            workspace="/remote/project",
+            cursor="next-page",
+            page_size=3,
+        )
+        self.assertEqual(page["next_cursor"], None)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0]["workspace"], "/remote/project")
+        self.assertEqual(calls[0]["provider"], "codex")
+        self.assertEqual(calls[0]["session_id"], "codex:session-1")
+        self.assertEqual(calls[0]["tool"], "search")
+        self.assertEqual(calls[0]["arguments"]["top_k"], 7)
+        self.assertEqual(calls[1]["tool"], "review_search")
+        self.assertEqual(calls[1]["arguments"]["search_id"], result["search_id"])
+        self.assertEqual(calls[2]["arguments"]["cursor"], "next-page")
+        self.assertEqual(calls[2]["arguments"]["page_size"], 3)
+
+        with self.assertRaises(ValueError):
+            memory.review_search(result["search_id"], provider="codex", page_size=1)
 
 
 class TestRemoteLifecycle(unittest.TestCase):
@@ -186,8 +277,11 @@ class TestRemoteLifecycle(unittest.TestCase):
         # next immutable search snapshot. Flush explicitly for read-after-write.
         memory.refresh()
         found = memory.search("submarines", "remote-user", 5)
-        self.assertGreaterEqual(len(found), 1)
-        record = found[0]
+        self.assertTrue(found["search_id"])
+        self.assertGreaterEqual(len(found["data"]), 1)
+        review = memory.review_search(found["search_id"], "remote-user")
+        self.assertEqual(review["search_id"], found["search_id"])
+        record = found["data"][0]
         self.assertEqual(record["user_id"], "remote-user")
 
         fetched = memory.get(record["id"], "remote-user")

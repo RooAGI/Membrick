@@ -24,20 +24,22 @@ from another's.
 === "Python"
 
     ```python
-    hits = memory.search("How should answers be written?", user_id="alice", top_k=5)
-    for hit in hits:
-        print(hit.content, hit.score)
+    search = memory.search("How should answers be written?", user_id="alice", top_k=5)
+    review = memory.review_search(search["search_id"], "alice")
+    for hit in search["data"]:
+        print(hit["content"], hit["score"])
     ```
 
 === "Node.js"
 
     ```js
-    const hits = await memory.search(
+    const search = await memory.search(
       'How should answers be written?',
       'alice',
       { topK: 5 },
     )
-    for (const hit of hits) console.log(hit.content, hit.score)
+    const review = await memory.reviewSearch(search.search_id, 'alice')
+    for (const hit of search.data) console.log(hit.content, hit.score)
     ```
 
 === "Rust"
@@ -48,7 +50,7 @@ from another's.
         "alice",
         SearchOptions { top_k: 5, ..Default::default() },
     )?;
-    for hit in hits {
+    for hit in hits.data {
         println!("{} ({:.2})", hit.content, hit.score);
     }
     ```

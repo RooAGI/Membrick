@@ -576,6 +576,7 @@ pub(super) async fn provider_mcp_tool_call(
                     .staged_writer
                     .read_view()?
                     .review_search_mcp(&root, &arguments)
+                    .and_then(|response| serde_json::to_value(response).map_err(Into::into))
             }
             "search_feedback" => {
                 let root = runtime.project_root.clone();

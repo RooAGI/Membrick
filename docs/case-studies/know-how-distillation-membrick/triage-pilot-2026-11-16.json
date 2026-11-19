@@ -1,0 +1,123 @@
+{
+  "run_date": "2026-11-16",
+  "purpose": "Small random-topic triage demonstration for Membrick-assisted know-how discovery",
+  "topic_universe": {
+    "source": "spark-atlas-builder-claude-project-thread-8cxvrj/distill/config.py",
+    "slugs": [
+      "setup",
+      "system-updates",
+      "networking-clustering",
+      "storage-and-hardware",
+      "thermals-cooling",
+      "containers-dev-env",
+      "inference-vllm",
+      "inference-sglang",
+      "inference-trtllm",
+      "inference-llamacpp-ollama",
+      "models",
+      "performance",
+      "training-finetuning",
+      "other-workloads",
+      "other"
+    ],
+    "selection": {
+      "method": "seeded Fisher-Yates shuffle",
+      "seed": 20261116,
+      "selected": ["thermals-cooling", "training-finetuning", "other-workloads"],
+      "reproducibility_note": "The original PRNG implementation and selection script were not retained. The selected draw is recorded, but cannot be regenerated from the seed alone."
+    }
+  },
+  "searches": [
+    {
+      "topic": "thermals-cooling",
+      "query": "DGX Spark thermal temperature fan cooling throttling",
+      "searches": [
+        {"search_id": "mcp:c41c38eb9ff198760b4888f8435cf9fd8cf2da75edc0f2581beff4c0a96db676", "top_k": 8},
+        {"search_id": "mcp:be6786f6222280ec4073a9a2b5479eda071a669d63652a2a25fbb3caf9cb2004", "top_k": 15}
+      ]
+    },
+    {
+      "topic": "training-finetuning",
+      "query": "DGX Spark training fine tuning LoRA",
+      "searches": [
+        {"search_id": "mcp:6dd9f7adb504233784ceccb35401161359c2169fe51b9c52c5bfa64d8cb0f785", "top_k": 8},
+        {"search_id": "mcp:231001276da61c7d3c920a2d81ed2c2a38960116e40340e08f5379291c767ed7", "top_k": 15}
+      ]
+    },
+    {
+      "topic": "other-workloads",
+      "query": "DGX Spark audio vision robotics scientific workload",
+      "searches": [
+        {"search_id": "mcp:7ab4d5b1f91623cef0687480eea20223d6237996210e4b40e07b09f672115e18", "top_k": 8},
+        {"search_id": "mcp:8ce9b4e89052669f42e9ecc685843fb828ec560376e14cf38c68c6c8dc3d8d8c", "top_k": 15}
+      ]
+    },
+    {
+      "topic": "other-workloads",
+      "query": "DGX Spark speech recognition ASR transcription audio model Parakeet",
+      "searches": [{"search_id": "mcp:7db322600864f4b028db142ff2b069af75406d0523977f563eb8807deaccc37f"}]
+    },
+    {
+      "topic": "other-workloads",
+      "query": "DGX Spark computer vision image classification detection pipeline",
+      "searches": [{"search_id": "mcp:100c76f2e9ad7731d6a1b647e62ffadde9aed394a3dfe8349f72d58071916e09"}]
+    },
+    {
+      "topic": "other-workloads",
+      "query": "DGX Spark robotics Isaac ROS simulation",
+      "searches": [{"search_id": "mcp:d21e8dad4ee68dc170e94eedf7497f7fe827fd96348815f0c9c11ab0df1be72"}]
+    }
+  ],
+  "candidate_pools": {
+    "sampling": {
+      "method": "Two candidates sampled from each decision class per topic",
+      "prng": "xorshift32",
+      "seed": 123456789,
+      "reproducibility_note": "The selected candidates are retained explicitly below. The original sampling script was not saved, so the exact random draw procedure is not independently regenerable. Pools are manually assembled neighborhoods from the search results and follow-up probes, not exhaustive corpus inventories."
+    },
+    "thermals-cooling": {
+      "selected": ["377069", "367883", "383193", "377044", "373996", "383988", "381029", "361960", "382065", "373836"],
+      "excluded": ["361703", "387379", "380975", "373819"]
+    },
+    "training-finetuning": {
+      "selected": ["371355", "376822", "361703", "363268", "381381", "346967", "387379", "378311", "366223", "351329"],
+      "excluded": ["383193", "380975", "373819"]
+    },
+    "other-workloads": {
+      "selected": ["364191", "356353", "385294", "347965", "365780", "352698"],
+      "excluded": ["383193", "373819", "361703", "387379"]
+    }
+  },
+  "audit": [
+    {"topic": "thermals-cooling", "thread_id": "377069", "triage": "selected", "label": "relevant", "source": "raw/377069/377069.md", "membrick_source_hash": "7a83431dc69701b519978d70450755b0efa43b454ca2271f257b485ad688f78e"},
+    {"topic": "thermals-cooling", "thread_id": "367883", "triage": "selected", "label": "relevant", "source": "raw/367883/367883.md", "membrick_source_hash": "97c8b91b4c21bbacafcd37cc6b9cf5954da37abd486606331a552310845f076a"},
+    {"topic": "thermals-cooling", "thread_id": "387379", "triage": "excluded", "label": "not_relevant", "reason": "Training thread", "source": "raw/387379/387379.md", "membrick_source_hash": "43b89482e4e54e8f48e0aeed933ab20c39aa3a8ae94de7aa8a5dcb9f6d0eb8ad"},
+    {"topic": "thermals-cooling", "thread_id": "380975", "triage": "excluded", "label": "not_relevant", "reason": "Multimodal llama.cpp thread", "source": "raw/380975/380975.md", "membrick_source_hash": "94cccf3fe66d38438688020edc5310267300c89f79b420292a5f89d054ba9743"},
+    {"topic": "training-finetuning", "thread_id": "378311", "triage": "selected", "label": "relevant", "source": "raw/378311/378311.md", "membrick_source_hash": "7aa2a4612d6f15c2d24f70a0c8b61f84bd10e4c466b0dff6f8408207a2c5e42f", "source_review_note": "Membrick content was truncated; available local source content was checked."},
+    {"topic": "training-finetuning", "thread_id": "346967", "triage": "selected", "label": "not_relevant", "reason": "Generic advice; respondent says they do not own a Spark", "source": "raw/346967/346967.md", "membrick_source_hash": "a40246bb42ef471e57aed1c4bb16a960e500b8fbf28b0798720f900fb92db393"},
+    {"topic": "training-finetuning", "thread_id": "380975", "triage": "excluded", "label": "not_relevant", "reason": "Multimodal llama.cpp thread", "source": "raw/380975/380975.md", "membrick_source_hash": "94cccf3fe66d38438688020edc5310267300c89f79b420292a5f89d054ba9743"},
+    {"topic": "training-finetuning", "thread_id": "383193", "triage": "excluded", "label": "not_relevant", "reason": "Cooling thread", "source": "raw/383193/383193.md", "membrick_source_hash": "d784f251a4df48acb5adce412ab9c028e04686d851a5fb9e6e4299c6a064e6ad"},
+    {"topic": "other-workloads", "thread_id": "364191", "triage": "selected", "label": "relevant", "reason": "ASR", "source": "raw/364191/364191.md", "membrick_source_hash": "2c607d26acc1ef742e0d4f387581c7278fd18f2f43fd16603ee69ec76008b0cc", "source_review_note": "Membrick content was truncated; available local source content was checked."},
+    {"topic": "other-workloads", "thread_id": "385294", "triage": "selected", "label": "relevant", "reason": "VibeVoice ASR", "source": "raw/385294/385294.md", "membrick_source_hash": "6d2e6bd413b0e795b2e8e900b8a0784ef1e4a4cbf31638c65aa7a8377dd7e886"},
+    {"topic": "other-workloads", "thread_id": "383193", "triage": "excluded", "label": "not_relevant", "reason": "Cooling thread", "source": "raw/383193/383193.md", "membrick_source_hash": "d784f251a4df48acb5adce412ab9c028e04686d851a5fb9e6e4299c6a064e6ad"},
+    {"topic": "other-workloads", "thread_id": "373819", "triage": "excluded", "label": "not_relevant", "reason": "Cross-node LLM serving", "source": "raw/373819/373819.md", "membrick_source_hash": "197748eab41785fc31eff2ce70ec81f12aec1a786541736ae7d82e54ab17cffc", "source_review_note": "Membrick content was truncated; available local source content was checked."}
+  ],
+  "metrics": {
+    "definition": "Selected means positive prediction; excluded means negative prediction. Relevant is the source-review gold label.",
+    "per_topic": {
+      "thermals-cooling": {"tp": 2, "fp": 0, "fn": 0, "tn": 2, "f1": 1.0},
+      "training-finetuning": {"tp": 1, "fp": 1, "fn": 0, "tn": 2, "f1": 0.6667},
+      "other-workloads": {"tp": 2, "fp": 0, "fn": 0, "tn": 2, "f1": 1.0}
+    },
+    "macro_f1": 0.8889,
+    "pooled": {"tp": 5, "fp": 1, "fn": 0, "tn": 6, "precision": 0.8333, "recall": 1.0, "micro_f1": 0.9091}
+  },
+  "limitations": [
+    "This 12-candidate demonstration is not a performance estimate.",
+    "F1 describes triage only within these retrieved candidate neighborhoods; it does not measure relevant documents missing from retrieval.",
+    "The excluded sample includes clear cross-topic negatives, and no false negative appeared in this small sample.",
+    "Topic-level relevance depends on the stated topic definitions.",
+    "The complete Membrick result exports and original selection scripts were not retained."
+  ],
+  "related_document": "membrick-know-how-case-study.md"
+}

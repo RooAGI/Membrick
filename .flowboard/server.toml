@@ -1,0 +1,3 @@
+# Flowboard server settings for this project.
+workspace_root = "."
+dashboard_bind = "127.0.0.1:8466"

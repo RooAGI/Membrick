@@ -44,8 +44,31 @@ const receipt = await memory.add(
   [{ role: 'user', content: 'I prefer oat milk.' }],
   'alice',
 )
-const hits = await memory.search('What are Alice’s preferences?', 'alice')
+const search = await memory.search('What are Alice’s preferences?', 'alice')
+console.log(search.search_id, search.data)
+const review = await memory.reviewSearch(search.search_id, 'alice')
 ```
+
+`search` searches user-scoped memories. To search captured memories and
+workspace memory, call `workspaceSearch` with the provider identity. A project
+connection uses its connected root as the workspace; a remote connection must
+pass `workspace` explicitly:
+
+```js
+const matches = await memory.workspaceSearch(
+  'What did we decide about the API?',
+  'codex',
+  { topK: 5 },
+)
+const review = await memory.reviewSearch(matches.search_id, undefined, {
+  provider: 'codex',
+})
+```
+
+`reviewSearch` also handles workspace searches. Pass workspace options with a
+`provider` instead of passing a `userId`; include `workspace` and `sessionId`
+when needed. To page through unreviewed workspace searches, call
+`reviewSearch(undefined, undefined, { provider, cursor, pageSize })`.
 
 Pass `requestId` when the application needs to reuse an idempotency key after
 an uncertain response. `memory.session(userId, sessionId)` creates a view that
@@ -86,7 +109,9 @@ const memory = new Memory({
   baseUrl: 'http://127.0.0.1:8080',
   apiKey: process.env.MEMBRICK_API_KEY,
 })
-const results = await memory.search('When is the launch?', 'alice')
+const search = await memory.search('When is the launch?', 'alice')
+const review = await memory.reviewSearch(search.search_id, 'alice')
+const results = search.data
 ```
 
 The remote backend uses the versioned `/v1/memories` HTTP API. `Memory` is the

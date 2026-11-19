@@ -226,7 +226,9 @@ test('Memory remote CRUD returns consistent operation shapes', async (t) => {
     if (request.method === 'POST' && url.pathname === '/v1/memories') {
       send(201, { success: true, request_id: body.request_id, user_id: body.user_id, session_id: resolveServerSession(body) })
     } else if (request.method === 'POST' && url.pathname === '/v1/memories/search') {
-      send(200, { data: [{ ...record, score: 0.9 }] })
+      send(200, { search_id: 'memory:remote-search-1', data: [{ ...record, score: 0.9 }] })
+    } else if (request.method === 'POST' && url.pathname === '/v1/memories/search/review') {
+      send(200, { search_id: body.search_id, reviewed: false, search: {}, result: {}, documents: [], prior_feedback: null })
     } else if (request.method === 'GET' && url.pathname === '/v1/memories/client-memory-1') {
       send(200, record)
     } else if (request.method === 'GET' && url.pathname === '/v1/memories') {
@@ -248,12 +250,87 @@ test('Memory remote CRUD returns consistent operation shapes', async (t) => {
   const client = new Memory({ baseUrl: `http://127.0.0.1:${address.port}` })
   const added = await client.add([{ role: 'user', content: 'Alice prefers tea' }], 'alice', { requestId: 'crud-request' })
   assert.equal(added.request_id, 'crud-request')
-  assert.equal((await client.search('Alice preferences', 'alice', { topK: 10 }))[0].id, record.id)
+  const search = await client.search('Alice preferences', 'alice', { topK: 10 })
+  assert.equal(search.data[0].id, record.id)
+  assert.equal(search.search_id, 'memory:remote-search-1')
+  assert.equal((await client.reviewSearch(search.search_id, 'alice')).search_id, search.search_id)
   assert.equal((await client.get(record.id, 'alice')).user_id, 'alice')
   assert.equal((await client.list('alice', { limit: 100 })).data[0].id, record.id)
   assert.match((await client.update(record.id, 'alice', 'Alice prefers green tea', {})).content, /green tea/)
   assert.equal(await client.delete(record.id, 'alice'), true)
   await client.refresh()
+})
+
+test('Memory workspace search and unified reviewSearch preserve workspace context', async (t) => {
+  const calls = []
+  const server = createServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    calls.push(body)
+    let result
+    if (body.tool === 'search') {
+      result = { search_id: 'workspace:search-1', results: [{ id: 'doc-1' }] }
+    } else if (body.tool === 'review_search' && body.arguments.search_id) {
+      result = {
+        search_id: body.arguments.search_id,
+        reviewed: false,
+        search: {},
+        result: {},
+        documents: [],
+        prior_feedback: null,
+      }
+    } else {
+      result = {
+        searches: [],
+        next_cursor: null,
+        has_more: false,
+        oversized_records_skipped: 0,
+        malformed_records_skipped: 0,
+        first_malformed_offset: null,
+        ambiguous_searches_skipped: 0,
+      }
+    }
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(result))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())))
+
+  const address = server.address()
+  const client = new Memory({ baseUrl: `http://127.0.0.1:${address.port}` })
+  const found = await client.workspaceSearch(
+    'where is the deployment guide',
+    'codex',
+    { topK: 7, workspace: '/remote/project', sessionId: 'codex:session-1' },
+  )
+  assert.equal(found.search_id, 'workspace:search-1')
+  assert.equal(found.results[0].id, 'doc-1')
+
+  const exact = await client.reviewSearch(found.search_id, undefined, {
+    provider: 'codex',
+    workspace: '/remote/project',
+    sessionId: 'codex:session-1',
+  })
+  assert.equal(exact.search_id, found.search_id)
+
+  const page = await client.reviewSearch(undefined, undefined, {
+    provider: 'codex',
+    workspace: '/remote/project',
+    cursor: 'next-page',
+    pageSize: 3,
+  })
+  assert.equal(page.next_cursor, null)
+  assert.equal(calls.length, 3)
+  assert.equal(calls[0].workspace, '/remote/project')
+  assert.equal(calls[0].provider, 'codex')
+  assert.equal(calls[0].session_id, 'codex:session-1')
+  assert.equal(calls[0].tool, 'search')
+  assert.equal(calls[0].arguments.top_k, 7)
+  assert.equal(calls[1].tool, 'review_search')
+  assert.equal(calls[1].arguments.search_id, found.search_id)
+  assert.equal(calls[2].arguments.cursor, 'next-page')
+  assert.equal(calls[2].arguments.page_size, 3)
 })
 
 

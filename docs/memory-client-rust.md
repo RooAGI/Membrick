@@ -41,7 +41,7 @@ let memories = client.search(
 )?;
 
 println!("saved session: {}", receipt.session_id);
-println!("matches: {}", memories.len());
+println!("matches: {}", memories.data.len());
 ```
 
 For an existing project, replace `Memory::init` with
@@ -154,9 +154,25 @@ timeout and starts again when a later request arrives.
 ## Agent integrations
 
 The optional `membrick::agent` API provides typed capture and workspace search
-operations for adapters. `AgentOperationContext` carries the provider,
-workspace, and host session identity. Capture acknowledgements let adapters
+operations for adapters, plus `review_search` for reading recorded workspace
+or user-scoped searches and their available source documents. `AgentOperationContext` carries
+the provider, workspace, and host session identity. Use
+`ReviewSearchRequest::by_id(search_id)` to review an exact search, or
+`ReviewSearchRequest::unreviewed(cursor, page_size)` to page through unreviewed
+searches. `Memory::review_search` deserializes the response as the
+`ReviewSearchResult` enum; its
+`SearchReviewResponse`, `SearchReviewPage`, `SearchReviewExactIndexing`,
+`SearchReviewPageIndexing`, and `SearchReviewHistoryIncomplete` variants
+preserve the existing JSON contract.
+
+Workspace review applies to searches recorded by the resident workspace
+`search` tool, across provider adapters. User-scoped `Memory::search` returns
+its own `search_id` in `MemorySearchResponse`; use
+`Memory::review_memory_search(search_id, user_id)` to retrieve that query,
+result snapshot, and matching source documents as `SearchReviewResponse`. This
+is the same DTO exposed by the Python and Node.js clients. The resident checks
+ownership against the user who ran the search. Capture acknowledgements let adapters
 advance transcript cursors only after durable acceptance. Host event parsing
-and response formatting remain in the adapters. The read-only routes for boards
-and flows are documented in the [Boards](api/boards/index.md) and
+and response formatting remain in the adapters. The read-only routes for
+boards and flows are documented in the [Boards](api/boards/index.md) and
 [Flows](api/flows/index.md) API references.
