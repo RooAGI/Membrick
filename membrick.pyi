@@ -1,6 +1,6 @@
 """Typed public API for the Membrick Python extension."""
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union, overload
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TypedDict, Union, overload
 
 
 class MembrickError(Exception):
@@ -22,6 +22,20 @@ class UnavailableError(ConnectionError, MembrickError):
 
 class UncertainError(RuntimeError, MembrickError):
     """The operation may have reached the service; do not blindly replay it."""
+
+
+class MemorySearchResponse(TypedDict):
+    search_id: str
+    data: List[Dict[str, Any]]
+
+
+class SearchReviewResponse(TypedDict):
+    search_id: str
+    reviewed: bool
+    search: Dict[str, Any]
+    result: Dict[str, Any]
+    documents: List[Dict[str, Any]]
+    prior_feedback: Optional[Any]
 
 
 class Memory:
@@ -67,7 +81,27 @@ class Memory:
         scope: Optional[str] = ...,
         reference_date: Optional[str] = ...,
         options: Optional[Sequence[str]] = ...,
-    ) -> List[Dict[str, Any]]: ...
+    ) -> MemorySearchResponse: ...
+
+    def workspace_search(
+        self,
+        query: str,
+        provider: str,
+        top_k: int = ...,
+        workspace: Optional[str] = ...,
+        session_id: Optional[str] = ...,
+    ) -> Dict[str, Any]: ...
+
+    def review_search(
+        self,
+        search_id: Optional[str] = ...,
+        user_id: Optional[str] = ...,
+        provider: Optional[str] = ...,
+        workspace: Optional[str] = ...,
+        session_id: Optional[str] = ...,
+        cursor: Optional[str] = ...,
+        page_size: Optional[int] = ...,
+    ) -> Union[SearchReviewResponse, Dict[str, Any]]: ...
 
     def get(
         self, memory_id: str, user_id: str, include_inactive: bool = ...
@@ -125,7 +159,9 @@ class MemorySession:
         scope: Optional[str] = ...,
         reference_date: Optional[str] = ...,
         options: Optional[Sequence[str]] = ...,
-    ) -> List[Dict[str, Any]]: ...
+    ) -> MemorySearchResponse: ...
+
+    def review_search(self, search_id: str) -> SearchReviewResponse: ...
 
 
 class Mem0Adapter:

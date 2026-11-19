@@ -15,6 +15,9 @@ void client.add([{ role: "user", content: "Remember this." }], "alice", {
   requestId: "request-1",
 })
 void session.search("What did Alice say?", { topK: 5 })
+void remoteClient.workspaceSearch("where is the guide?", "codex", { topK: 5 })
+void remoteClient.reviewSearch("workspace:search-1", undefined, { provider: "codex" })
+void remoteClient.reviewSearch(undefined, undefined, { provider: "codex", pageSize: 10 })
 void remoteClient.refresh()
 
 function getMemoryErrorCode(error: unknown): MemoryError["code"] | undefined {

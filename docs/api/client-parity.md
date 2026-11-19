@@ -21,6 +21,10 @@ APIs. They are not aliases for the application's `Memory` operations.
 | Delete | `DELETE /v1/memories/{id}?user_id=...` | `delete(id, user_id)` | `delete(memory_id, user_id)` | `delete(memoryId, userId)` |
 | Refresh | `POST /v1/memories/refresh` | `refresh()` | `refresh()` | `refresh()` |
 
+Rust, Python, and Node.js `Memory.search` return the search ID and result data.
+Use `review_search` (Python/Rust) or `reviewSearch` (Node.js) to retrieve the
+recorded query, ranked result snapshot, and matching source documents.
+
 Field names in JSON are snake_case. Node method parameters and option objects
 use camelCase; the Node binding translates them at the boundary. Python uses
 snake_case. Rust uses typed option structs. In all interfaces `user_id` is

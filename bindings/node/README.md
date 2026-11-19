@@ -42,7 +42,9 @@ const receipt = await memory.add(
   [{ role: 'user', content: 'I prefer oat milk.' }],
   'alice',
 )
-const hits = await memory.search('What are Alice’s preferences?', 'alice')
+const search = await memory.search('What are Alice’s preferences?', 'alice')
+console.log(search.search_id, search.data)
+const review = await memory.reviewSearch(search.search_id, 'alice')
 ```
 
 Set `path` to select a project's resident, or `baseUrl` and optional
@@ -58,7 +60,9 @@ const memory = new Memory({
   baseUrl: 'http://127.0.0.1:8080',
   apiKey: process.env.MEMBRICK_API_KEY,
 })
-const hits = await memory.search('When is the launch?', 'alice')
+const search = await memory.search('When is the launch?', 'alice')
+console.log(search.search_id, search.data)
+const review = await memory.reviewSearch(search.search_id, 'alice')
 ```
 
 

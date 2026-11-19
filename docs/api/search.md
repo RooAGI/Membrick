@@ -1,7 +1,8 @@
 # Search memories
 
 Rank a user's memories against a query. Hits carry the memory ID, content,
-score, and available evidence metadata.
+score, and available evidence metadata. The response includes a `search_id` for
+reviewing the exact query and ranked result snapshot later.
 
 ## Endpoint
 
@@ -49,6 +50,7 @@ follow-up phrasing and time anchors. To list only one session's memories, use
 
 ```json
 {
+  "search_id": "memory:mem-123-456-0",
   "data": [
     {
       "id": "<opaque-memory-id>",
@@ -65,6 +67,13 @@ follow-up phrasing and time anchors. To list only one session's memories, use
 
 | Field | Description |
 | --- | --- |
+| `search_id` | ID for reviewing this exact search and its result snapshot |
+| `data` | Ranked result array |
+
+Each item in `data` has these fields:
+
+| Field | Description |
+| --- | --- |
 | `id` | Opaque memory ID |
 | `content` | Stored memory text |
 | `score` | Relative retrieval score |
@@ -76,6 +85,15 @@ follow-up phrasing and time anchors. To list only one session's memories, use
 
 Empty optional fields are omitted. Ordering is the relevance ranking for that
 call and not a stable contract.
+
+## Review a search
+
+The Rust client provides `Memory::review_search(ReviewSearchTarget::User { user_id },
+ReviewSearchRequest::by_id(search_id))`. The HTTP equivalent is
+`POST /v1/memories/search/review` with
+`{"search_id":"...", "user_id":"user-123"}`. It returns the recorded query,
+ranked result snapshot, and matching indexed source documents. Access is
+checked against the user who ran the search.
 
 ### Errors
 
@@ -99,37 +117,41 @@ curl -X POST http://127.0.0.1:8080/v1/memories/search \
 === "Python"
 
     ```python
-    hits = memory.search("What milk do I prefer?", user_id="user-123", top_k=5)
+    search = memory.search("What milk do I prefer?", user_id="user-123", top_k=5)
+    review = memory.review_search(search["search_id"], "user-123")
     ```
 
 === "Node.js"
 
     ```js
-    const hits = await memory.search('What milk do I prefer?', 'user-123', 5)
+    const search = await memory.search('What milk do I prefer?', 'user-123', { topK: 5 })
+    const review = await memory.reviewSearch(search.search_id, 'user-123')
     ```
 
 === "Rust"
 
     ```rust
-    use membrick::SearchRequest;
+    use membrick::{agent::{ReviewSearchRequest, ReviewSearchTarget}, Memory, SearchOptions};
 
-    let response = memory.search(SearchRequest {
-        query: "What milk do I prefer?".into(),
-        user_id: "user-123".into(),
-        top_k: 5,
-        session_id: None,
-        scope: None,
-        filters: None,
-        reference_date: None,
-        options: None,
-    })?;
+    let response = memory.search(
+        "What milk do I prefer?",
+        "user-123",
+        SearchOptions { top_k: 5, ..Default::default() },
+    )?;
+    let review = memory.review_search(
+        ReviewSearchTarget::User { user_id: "user-123".into() },
+        ReviewSearchRequest::by_id(response.search_id.clone()),
+    )?;
     let hits = response.data;
     ```
 
-Python and Node `Memory.search` both expose `filters`, `scope`,
-`reference_date`, and `options`. `MemorySession.search` in both bindings pins
+Python and Node `Memory.search` return `search_id` with the `data` hit array and
+provide `review_search` / `reviewSearch` for the exact query and matching source
+documents. Both expose `filters`, `scope`, `reference_date`, and `options`.
+`MemorySession.search` in both bindings pins
 the saved session ID and accepts the same search options (apart from
 `session_id`, which the session supplies). The `options` field currently has
-no effect. Python, Node.js, and Rust `Memory.search` return the hit array
-directly. The HTTP response and `MemoryService.search` use a `{ data: [...] }`
-wrapper.
+no effect. The Rust, Python, Node.js, and HTTP client search methods return a
+`search_id` with the `data` hit array. `MemoryService.search` remains the
+in-process retrieval API and returns `{ data: [...] }` without a durable search
+ID.

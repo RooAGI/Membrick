@@ -5,11 +5,11 @@
 
 use crate::memory_api::{
     AddRequest, AddRequestWithMetadata, AddResponse, ListResponse, Mem0FilterExpr, MemoryRecord,
-    Message, SearchMemory, SearchRequest, SearchRequestWithFilterAst, SearchResponse,
-    UpdateRequest, UpdateRequestWithMetadata,
+    Message, SearchMemory, SearchRequest, SearchRequestWithFilterAst, UpdateRequest,
+    UpdateRequestWithMetadata,
 };
 use reqwest::Client as AsyncHttpClient;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod agent_operations;
 pub use agent_operations::{
-    AgentOperationContext, CaptureReceipt, CaptureRequest, CaptureStatus, WorkspaceSearchResponse,
+    AgentOperationContext, CaptureReceipt, CaptureRequest, CaptureStatus, ReviewSearchRequest,
+    ReviewSearchTarget, WorkspaceSearchResponse,
 };
 
 /// Connection and request settings shared by Rust and language bindings.
@@ -129,6 +130,14 @@ impl Default for SearchOptions {
     }
 }
 
+/// A user-scoped memory search together with the ID used to review its exact
+/// query and result snapshot through the resident.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemorySearchResponse {
+    pub search_id: String,
+    pub data: Vec<SearchMemory>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GetOptions {
     pub include_inactive: bool,
@@ -222,7 +231,7 @@ impl MemorySession {
         &self,
         query: &str,
         mut options: SearchOptions,
-    ) -> Result<Vec<SearchMemory>, MemoryError> {
+    ) -> Result<MemorySearchResponse, MemoryError> {
         options.session_id = Some(self.session_id.clone());
         self.client.search(query, &self.user_id, options)
     }
@@ -240,7 +249,7 @@ impl MemorySession {
         &self,
         query: &str,
         mut options: SearchOptions,
-    ) -> Result<Vec<SearchMemory>, MemoryError> {
+    ) -> Result<MemorySearchResponse, MemoryError> {
         options.session_id = Some(self.session_id.clone());
         self.client
             .search_async(query, &self.user_id, options)
@@ -520,7 +529,7 @@ impl Memory {
         query: &str,
         user_id: &str,
         options: SearchOptions,
-    ) -> Result<Vec<SearchMemory>, MemoryError> {
+    ) -> Result<MemorySearchResponse, MemoryError> {
         let client = self.clone();
         let query = query.to_owned();
         let user_id = user_id.to_owned();
@@ -532,7 +541,7 @@ impl Memory {
         query_text: &str,
         user_id: &str,
         options: SearchOptions,
-    ) -> Result<Vec<SearchMemory>, MemoryError> {
+    ) -> Result<MemorySearchResponse, MemoryError> {
         self.search_with_filter_ast_async(query_text, user_id, options, None)
             .await
     }
@@ -545,7 +554,7 @@ impl Memory {
         user_id: &str,
         options: SearchOptions,
         filter_ast: Mem0FilterExpr,
-    ) -> Result<Vec<SearchMemory>, MemoryError> {
+    ) -> Result<MemorySearchResponse, MemoryError> {
         let client = self.clone();
         let query = query.to_owned();
         let user_id = user_id.to_owned();
@@ -562,7 +571,7 @@ impl Memory {
         user_id: &str,
         options: SearchOptions,
         filter_ast: Option<Mem0FilterExpr>,
-    ) -> Result<Vec<SearchMemory>, MemoryError> {
+    ) -> Result<MemorySearchResponse, MemoryError> {
         let request = SearchRequest {
             query: query_text.to_owned(),
             options: options.options,
@@ -577,11 +586,10 @@ impl Memory {
             request,
             filter_ast,
         };
-        Ok(decode::<SearchResponse>(
+        decode::<MemorySearchResponse>(
             self.post_async("/v1/memories/search", &request, false)
                 .await?,
-        )?
-        .data)
+        )
     }
 
     pub fn get(

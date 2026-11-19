@@ -26,9 +26,32 @@ receipt = memory.add(
     [{"role": "user", "content": "I prefer concise answers."}],
     user_id="alice",
 )
-hits = memory.search("How should answers be written?", user_id="alice")
-print(hits)
+search = memory.search("How should answers be written?", user_id="alice")
+print(search["search_id"], search["data"])
+review = memory.review_search(search["search_id"], "alice")
 ```
+
+`search` searches user-scoped memories. To search captured memories and
+workspace memory, use `workspace_search` with the provider identity. A project
+connection uses its connected root as the workspace; a remote connection must
+pass `workspace` explicitly:
+
+```python
+matches = memory.workspace_search(
+    "What did we decide about the API?",
+    provider="codex",
+    top_k=5,
+)
+review = memory.review_search(
+    matches["search_id"],
+    provider="codex",
+)
+```
+
+`review_search` also handles workspace searches. Supply `provider` instead of
+`user_id`; use `workspace` and `session_id` when needed. To page through
+unreviewed workspace searches, omit `search_id` and pass `provider`, optionally
+with `cursor` and `page_size`.
 
 An add receipt includes the resolved `request_id`, `user_id`, and `session_id`.
 Keep the session ID to continue a conversation across calls:
@@ -36,7 +59,8 @@ Keep the session ID to continue a conversation across calls:
 ```python
 conversation = memory.session("alice", receipt["session_id"])
 conversation.add([{"role": "user", "content": "Use bullet points."}])
-hits = conversation.search("What answer format do I prefer?")
+search = conversation.search("What answer format do I prefer?")
+review = conversation.review_search(search["search_id"])
 ```
 
 To create a new project intentionally, initialize it first:
@@ -59,7 +83,8 @@ remote = Memory(
     base_url="http://127.0.0.1:8080",
     api_key="YOUR_SERVER_TOKEN",
 )
-hits = remote.search("When is the launch?", user_id="alice")
+search = remote.search("When is the launch?", user_id="alice")
+review = remote.review_search(search["search_id"], "alice")
 ```
 
 `Memory` is the same client for project and remote connections. Omitting both

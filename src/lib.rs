@@ -72,6 +72,7 @@ mod logging;
 /// the retrieval benchmark so both present hits identically.
 pub mod memory_api;
 mod memory_client;
+mod memory_search_history;
 mod resident_executable;
 /// Internal resident routes shared by Memory and the server router.
 pub const MCP_TOOLS_CALL_PATH: &str = "/provider-memory/mcp/tools/call";
@@ -155,14 +156,14 @@ pub use crate::memory_client::MemoryClientError;
 pub use crate::memory_client::MemoryClientOptions;
 pub use crate::memory_client::{
     AddOptions, GetOptions, ListOptions, Memory, MemoryError, MemoryOptions, MemorySession,
-    SearchOptions, UpdateOptions,
+    MemorySearchResponse, SearchOptions, UpdateOptions,
 };
 
 /// Agent and integration operations carried over the shared resident client.
 pub mod agent {
     pub use crate::memory_client::{
-        AgentOperationContext, CaptureReceipt, CaptureRequest, CaptureStatus,
-        WorkspaceSearchResponse,
+        AgentOperationContext, CaptureReceipt, CaptureRequest, CaptureStatus, ReviewSearchRequest,
+        ReviewSearchTarget, WorkspaceSearchResponse,
     };
 }
 
@@ -522,6 +523,95 @@ impl PySdkMemoryClient {
                         options,
                     },
                 )
+            })
+            .map_err(|error| memory_client_error(py, error))?;
+        json_to_python(py, &result)
+    }
+
+    #[pyo3(signature = (query, provider, top_k=10, workspace=None, session_id=None))]
+    fn workspace_search(
+        &self,
+        py: Python<'_>,
+        query: String,
+        provider: String,
+        top_k: usize,
+        workspace: Option<String>,
+        session_id: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let client = self.client.clone();
+        let context = crate::memory_client::AgentOperationContext {
+            workspace,
+            provider,
+            session_id,
+        };
+        let result = py
+            .detach(move || client.workspace_search(&context, &query, top_k))
+            .map_err(|error| memory_client_error(py, error))?;
+        json_to_python(py, &result)
+    }
+
+    #[pyo3(signature = (search_id=None, user_id=None, provider=None, workspace=None, session_id=None, cursor=None, page_size=None))]
+    fn review_search(
+        &self,
+        py: Python<'_>,
+        search_id: Option<String>,
+        user_id: Option<String>,
+        provider: Option<String>,
+        workspace: Option<String>,
+        session_id: Option<String>,
+        cursor: Option<String>,
+        page_size: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        let (target, request) = match (user_id, provider) {
+            (Some(user_id), None) => {
+                if search_id.is_none()
+                    || workspace.is_some()
+                    || session_id.is_some()
+                    || cursor.is_some()
+                    || page_size.is_some()
+                {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "user search review requires search_id and user_id only",
+                    ));
+                }
+                (
+                    crate::memory_client::ReviewSearchTarget::User { user_id },
+                    crate::memory_client::ReviewSearchRequest::by_id(search_id.unwrap()),
+                )
+            }
+            (None, Some(provider)) => {
+                let request = match search_id {
+                    Some(search_id) => {
+                        if cursor.is_some() || page_size.is_some() {
+                            return Err(pyo3::exceptions::PyValueError::new_err(
+                                "pass either search_id or cursor/page_size for workspace search review",
+                            ));
+                        }
+                        crate::memory_client::ReviewSearchRequest::by_id(search_id)
+                    }
+                    None => crate::memory_client::ReviewSearchRequest::unreviewed(cursor, page_size),
+                };
+                (
+                    crate::memory_client::ReviewSearchTarget::Workspace(
+                        crate::memory_client::AgentOperationContext {
+                            workspace,
+                            provider,
+                            session_id,
+                        },
+                    ),
+                    request,
+                )
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "provide exactly one of user_id or provider for search review",
+                ));
+            }
+        };
+        let client = self.client.clone();
+        let result = py
+            .detach(move || {
+                client.review_search(target, request)
             })
             .map_err(|error| memory_client_error(py, error))?;
         json_to_python(py, &result)
@@ -1221,7 +1311,11 @@ fn mem0_search_with_client(
         Some(filter_ast) => client.search_with_filter_ast(query, user_id, options, filter_ast)?,
         None => client.search(query, user_id, options)?,
     };
-    let mut results = hits.into_iter().map(mem0_search_memory).collect::<Vec<_>>();
+    let mut results = hits
+        .data
+        .into_iter()
+        .map(mem0_search_memory)
+        .collect::<Vec<_>>();
     for item in &mut results {
         if let (Some(requested_run_id), Some(session_id)) = (
             run_id,
@@ -1340,6 +1434,24 @@ impl PySdkMemorySession {
                         reference_date,
                         options,
                     },
+                )
+            })
+            .map_err(|error| memory_client_error(py, error))?;
+        json_to_python(py, &result)
+    }
+
+    fn review_search(
+        &self,
+        py: Python<'_>,
+        search_id: String,
+    ) -> PyResult<Py<PyAny>> {
+        let client = self.client.clone();
+        let user_id = self.user_id.clone();
+        let result = py
+            .detach(move || {
+                client.review_search(
+                    crate::memory_client::ReviewSearchTarget::User { user_id },
+                    crate::memory_client::ReviewSearchRequest::by_id(search_id),
                 )
             })
             .map_err(|error| memory_client_error(py, error))?;

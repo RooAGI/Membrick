@@ -5,6 +5,7 @@ use membrick::{
     MemoryOptions as CoreMemoryOptions, SearchOptions as CoreSearchOptions,
     UpdateOptions as CoreUpdateOptions,
 };
+use membrick::agent::{AgentOperationContext, ReviewSearchRequest, ReviewSearchTarget};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde::{de::DeserializeOwned, Serialize};
@@ -34,6 +35,22 @@ pub struct SearchOptions {
     pub scope: Option<String>,
     pub reference_date: Option<String>,
     pub options: Option<Vec<String>>,
+}
+
+#[napi(object)]
+pub struct WorkspaceSearchOptions {
+    pub top_k: Option<u32>,
+    pub workspace: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[napi(object)]
+pub struct WorkspaceReviewOptions {
+    pub provider: String,
+    pub workspace: Option<String>,
+    pub session_id: Option<String>,
+    pub cursor: Option<String>,
+    pub page_size: Option<u32>,
 }
 
 #[napi(object)]
@@ -184,7 +201,7 @@ impl Memory {
         query: String,
         user_id: String,
         options: Option<SearchOptions>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Value> {
         let options = options.unwrap_or(SearchOptions {
             top_k: None,
             session_id: None,
@@ -214,7 +231,90 @@ impl Memory {
                     },
                 )
                 .map_err(memory_client_error)?;
-            to_values(results)
+            to_value(results)
+        })
+        .await
+    }
+
+    #[napi(js_name = "workspaceSearch")]
+    pub async fn workspace_search(
+        &self,
+        query: String,
+        provider: String,
+        options: Option<WorkspaceSearchOptions>,
+    ) -> Result<Value> {
+        let options = options.unwrap_or(WorkspaceSearchOptions {
+            top_k: None,
+            workspace: None,
+            session_id: None,
+        });
+        let context = AgentOperationContext {
+            workspace: options.workspace,
+            provider,
+            session_id: options.session_id,
+        };
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            client
+                .workspace_search(&context, &query, options.top_k.unwrap_or(10) as usize)
+                .map_err(memory_client_error)
+                .and_then(to_value)
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn review_search(
+        &self,
+        search_id: Option<String>,
+        user_id: Option<String>,
+        options: Option<WorkspaceReviewOptions>,
+    ) -> Result<Value> {
+        let (target, request) = match (user_id, options) {
+            (Some(user_id), None) => {
+                let search_id = search_id.ok_or_else(|| {
+                    Error::from_reason("user search review requires searchId and userId")
+                })?;
+                (
+                    ReviewSearchTarget::User { user_id },
+                    ReviewSearchRequest::by_id(search_id),
+                )
+            }
+            (None, Some(options)) => {
+                let request = match search_id {
+                    Some(search_id) => {
+                        if options.cursor.is_some() || options.page_size.is_some() {
+                            return Err(Error::from_reason(
+                                "pass either searchId or cursor/pageSize for workspace search review",
+                            ));
+                        }
+                        ReviewSearchRequest::by_id(search_id)
+                    }
+                    None => ReviewSearchRequest::unreviewed(
+                        options.cursor,
+                        options.page_size.map(|value| value as usize),
+                    ),
+                };
+                (
+                    ReviewSearchTarget::Workspace(AgentOperationContext {
+                        workspace: options.workspace,
+                        provider: options.provider,
+                        session_id: options.session_id,
+                    }),
+                    request,
+                )
+            }
+            _ => {
+                return Err(Error::from_reason(
+                    "pass userId for user search review or workspace review options",
+                ));
+            }
+        };
+        let client = self.inner.clone();
+        spawn_blocking(move || {
+            client
+                .review_search(target, request)
+                .map_err(memory_client_error)
         })
         .await
     }
@@ -412,7 +512,7 @@ impl MemorySession {
         &self,
         query: String,
         options: Option<SessionSearchOptions>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Value> {
         let options = options.unwrap_or(SessionSearchOptions {
             top_k: None,
             filters: None,
@@ -443,7 +543,23 @@ impl MemorySession {
                     },
                 )
                 .map_err(memory_client_error)?;
-            to_values(results)
+            to_value(results)
+        })
+        .await
+    }
+
+    #[napi]
+    pub async fn review_search(&self, search_id: String) -> Result<Value> {
+        let client = self.inner.clone();
+        let user_id = self.user_id.clone();
+        spawn_blocking(move || {
+            let review = client
+                .review_search(
+                    ReviewSearchTarget::User { user_id },
+                    ReviewSearchRequest::by_id(search_id),
+                )
+                .map_err(memory_client_error)?;
+            to_value(review)
         })
         .await
     }

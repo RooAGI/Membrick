@@ -44,6 +44,26 @@ export interface SearchMemory {
   claim_states?: Array<Record<string, unknown>>
 }
 
+export interface MemorySearchResponse {
+  search_id: string
+  data: SearchMemory[]
+}
+
+export interface WorkspaceSearchResponse {
+  search_id: string
+  results: Array<Record<string, unknown>>
+  [key: string]: unknown
+}
+
+export interface SearchReviewResponse {
+  search_id: string
+  reviewed: boolean
+  search: Record<string, unknown>
+  result: Record<string, unknown>
+  documents: Array<Record<string, unknown>>
+  prior_feedback: unknown | null
+}
+
 export interface AddOptions {
   requestId?: string
   sessionId?: string
@@ -57,6 +77,23 @@ export interface SearchOptions {
   scope?: string
   referenceDate?: string
   options?: string[]
+}
+
+export interface WorkspaceSearchOptions {
+  /** Explicit workspace path; project clients default to their connected root. */
+  workspace?: string
+  sessionId?: string
+  topK?: number
+}
+
+export interface WorkspaceReviewOptions {
+  provider: string
+  /** Explicit workspace path; project clients default to their connected root. */
+  workspace?: string
+  sessionId?: string
+  /** Page token for listing unreviewed workspace searches. */
+  cursor?: string
+  pageSize?: number
 }
 
 export interface ListOptions {
@@ -107,7 +144,10 @@ export declare class Memory {
   constructor(options: MemoryOptions)
   add(messages: Message[], userId: string, options?: AddOptions): Promise<AddResponse>
   addTransaction(requests: AddTransactionRequest[]): Promise<AddResponse[]>
-  search(query: string, userId: string, options?: SearchOptions): Promise<SearchMemory[]>
+  search(query: string, userId: string, options?: SearchOptions): Promise<MemorySearchResponse>
+  workspaceSearch(query: string, provider: string, options?: WorkspaceSearchOptions): Promise<WorkspaceSearchResponse>
+  reviewSearch(searchId: string, userId: string): Promise<SearchReviewResponse>
+  reviewSearch(searchId: string | undefined, userId: undefined, options: WorkspaceReviewOptions): Promise<Record<string, unknown>>
   get(memoryId: string, userId: string, includeInactive?: boolean): Promise<MemoryRecord | null>
   list(userId: string, options?: ListOptions): Promise<ListResponse>
   update(memoryId: string, userId: string, content: string, options?: UpdateOptions): Promise<MemoryRecord | null>
@@ -123,7 +163,8 @@ export declare class MemorySession {
   readonly sessionId: string
   close(): void
   add(messages: Message[], options?: Pick<AddOptions, 'requestId' | 'waitForVisibility'>): Promise<AddResponse>
-  search(query: string, options?: SessionSearchOptions): Promise<SearchMemory[]>
+  search(query: string, options?: SessionSearchOptions): Promise<MemorySearchResponse>
+  reviewSearch(searchId: string): Promise<SearchReviewResponse>
 }
 
 export declare function version(): string

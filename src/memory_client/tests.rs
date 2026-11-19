@@ -66,6 +66,7 @@ async fn async_memory_api_covers_operations_and_keeps_request_and_session_identi
         .await
         .unwrap();
     assert!(hits
+        .data
         .iter()
         .any(|hit| hit.session_id.as_deref() == Some("async-session")));
     assert!(client
@@ -219,13 +220,16 @@ async fn add_handler(
 async fn search_handler(
     State(service): State<SharedService>,
     Json(request): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>, (StatusCode, String)> {
-    service
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let response = service
         .lock()
         .await
         .search(request)
-        .map(Json)
-        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")))
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}")))?;
+    Ok(Json(serde_json::json!({
+        "search_id": "memory:test-search-id",
+        "data": response.data,
+    })))
 }
 
 async fn refresh_handler() -> StatusCode {
@@ -238,6 +242,108 @@ async fn list_handler() -> Json<serde_json::Value> {
 
 async fn missing_handler() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+type WorkspaceCallLog = Arc<Mutex<Vec<serde_json::Value>>>;
+
+async fn workspace_tool_handler(
+    State(calls): State<WorkspaceCallLog>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    calls.lock().await.push(body.clone());
+    match body["tool"].as_str() {
+        Some("search") => Json(serde_json::json!({
+            "search_id": "workspace:search-1",
+            "results": [{"id": "doc-1", "content": "workspace hit"}]
+        })),
+        Some("review_search") if body["arguments"].get("search_id").is_some() => {
+            Json(serde_json::json!({
+                "search_id": body["arguments"]["search_id"],
+                "reviewed": false,
+                "search": {},
+                "result": {},
+                "documents": [],
+                "prior_feedback": null
+            }))
+        }
+        Some("review_search") => Json(serde_json::json!({"searches": [], "next_cursor": null})),
+        _ => Json(serde_json::json!({"error": "unexpected tool"})),
+    }
+}
+
+#[tokio::test]
+async fn workspace_search_and_review_share_provider_and_workspace_context() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/provider-memory/mcp/tools/call", post(workspace_tool_handler))
+        .with_state(calls.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+    });
+    let client = Memory::remote(format!("http://{address}"), MemoryOptions::default()).unwrap();
+    let context = AgentOperationContext {
+        workspace: Some("/workspace/project".into()),
+        provider: "codex".into(),
+        session_id: Some("codex:session-1".into()),
+    };
+
+    let result = client
+        .workspace_search(&context, "where is the deployment guide", 7)
+        .unwrap();
+    assert_eq!(result.metadata["search_id"], "workspace:search-1");
+    assert_eq!(result.results[0]["id"], "doc-1");
+
+    let exact = client
+        .review_search(
+            ReviewSearchTarget::Workspace(context.clone()),
+            ReviewSearchRequest::by_id("workspace:search-1"),
+        )
+        .unwrap();
+    assert_eq!(exact["search_id"], "workspace:search-1");
+
+    client
+        .review_search(
+            ReviewSearchTarget::Workspace(context.clone()),
+            ReviewSearchRequest::unreviewed(Some("next-page".into()), Some(3)),
+        )
+        .unwrap();
+
+    let calls = calls.lock().await;
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["workspace"], "/workspace/project");
+    assert_eq!(calls[0]["provider"], "codex");
+    assert_eq!(calls[0]["session_id"], "codex:session-1");
+    assert_eq!(calls[0]["tool"], "search");
+    assert_eq!(calls[0]["arguments"]["query"], "where is the deployment guide");
+    assert_eq!(calls[0]["arguments"]["top_k"], 7);
+    assert_eq!(calls[1]["arguments"]["search_id"], "workspace:search-1");
+    assert_eq!(calls[2]["arguments"]["cursor"], "next-page");
+    assert_eq!(calls[2]["arguments"]["page_size"], 3);
+    drop(calls);
+
+    let error = client
+        .workspace_search(&AgentOperationContext::new("codex"), "query", 5)
+        .unwrap_err();
+    assert!(error.to_string().contains("explicit workspace"));
+
+    stop.send(()).unwrap();
+    server.join().unwrap();
 }
 
 fn test_service() -> (
@@ -327,6 +433,7 @@ fn add_creates_and_restores_sessions_and_scopes_request_ids_by_user() {
         .search("ceramic tea", SearchOptions::default())
         .unwrap();
     assert!(restored_search
+        .data
         .iter()
         .any(|result| result.session_id.as_deref() == Some(created.session_id.as_str())));
 
