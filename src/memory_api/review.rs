@@ -253,7 +253,10 @@ impl MemoryService {
                 searches: Vec::new(),
                 indexed_bytes: indexed_end,
                 history_bytes: current_history_end.max(captured_end),
-                message: last_error.unwrap_or_else(|| "The resident is rebuilding the search history lookup index. Retry shortly.".to_string()),
+                message: last_error.unwrap_or_else(|| {
+                    "The resident is rebuilding the search history lookup index. Retry shortly."
+                        .to_string()
+                }),
             }));
         }
         let generation = match generation {

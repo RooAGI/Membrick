@@ -1,11 +1,11 @@
 use std::time::Duration;
 
+use membrick::agent::{AgentOperationContext, ReviewSearchRequest, ReviewSearchTarget};
 use membrick::{
     AddOptions as CoreAddOptions, GetOptions, ListOptions as CoreListOptions,
     MemoryOptions as CoreMemoryOptions, SearchOptions as CoreSearchOptions,
     UpdateOptions as CoreUpdateOptions,
 };
-use membrick::agent::{AgentOperationContext, ReviewSearchRequest, ReviewSearchTarget};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde::{de::DeserializeOwned, Serialize};
