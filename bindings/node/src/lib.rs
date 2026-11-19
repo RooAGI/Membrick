@@ -315,6 +315,7 @@ impl Memory {
             client
                 .review_search(target, request)
                 .map_err(memory_client_error)
+                .and_then(to_value)
         })
         .await
     }

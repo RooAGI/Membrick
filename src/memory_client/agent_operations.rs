@@ -1,5 +1,5 @@
-use super::{decode, ensure_success, json_value, Connection, Memory, MemoryError};
-use crate::memory_api::SearchReviewResponse;
+use super::{decode, ensure_success, Connection, Memory, MemoryError};
+use crate::memory_api::{ReviewSearchResult, SearchReviewResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -243,7 +243,7 @@ impl Memory {
         &self,
         target: ReviewSearchTarget,
         request: ReviewSearchRequest,
-    ) -> Result<Value, MemoryError> {
+    ) -> Result<ReviewSearchResult, MemoryError> {
         if request
             .search_id
             .as_deref()
@@ -259,7 +259,7 @@ impl Memory {
                     serde_json::to_value(request).map_err(|error| MemoryError::Configuration {
                         message: format!("invalid review search request: {error}"),
                     })?;
-                self.workspace_tool(&context, "review_search", arguments, false)
+                decode(self.workspace_tool(&context, "review_search", arguments, false)?)
             }
             ReviewSearchTarget::User { user_id } => {
                 if request.search_id.is_none()
@@ -272,7 +272,7 @@ impl Memory {
                 }
                 let search_id = request.search_id.expect("validated above");
                 let response = self.review_memory_search(&search_id, &user_id)?;
-                json_value(&response)
+                Ok(ReviewSearchResult::Exact(response))
             }
         }
     }

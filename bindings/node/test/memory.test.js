@@ -272,9 +272,24 @@ test('Memory workspace search and unified reviewSearch preserve workspace contex
     if (body.tool === 'search') {
       result = { search_id: 'workspace:search-1', results: [{ id: 'doc-1' }] }
     } else if (body.tool === 'review_search' && body.arguments.search_id) {
-      result = { search_id: body.arguments.search_id, reviewed: false, documents: [] }
+      result = {
+        search_id: body.arguments.search_id,
+        reviewed: false,
+        search: {},
+        result: {},
+        documents: [],
+        prior_feedback: null,
+      }
     } else {
-      result = { searches: [], next_cursor: null }
+      result = {
+        searches: [],
+        next_cursor: null,
+        has_more: false,
+        oversized_records_skipped: 0,
+        malformed_records_skipped: 0,
+        first_malformed_offset: null,
+        ambiguous_searches_skipped: 0,
+      }
     }
     response.writeHead(200, { 'content-type': 'application/json' })
     response.end(JSON.stringify(result))

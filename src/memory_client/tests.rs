@@ -285,7 +285,15 @@ async fn workspace_tool_handler(
                 "prior_feedback": null
             }))
         }
-        Some("review_search") => Json(serde_json::json!({"searches": [], "next_cursor": null})),
+        Some("review_search") => Json(serde_json::json!({
+            "searches": [],
+            "next_cursor": null,
+            "has_more": false,
+            "oversized_records_skipped": 0,
+            "malformed_records_skipped": 0,
+            "first_malformed_offset": null,
+            "ambiguous_searches_skipped": 0,
+        })),
         _ => Json(serde_json::json!({"error": "unexpected tool"})),
     }
 }
@@ -334,14 +342,17 @@ async fn workspace_search_and_review_share_provider_and_workspace_context() {
             ReviewSearchRequest::by_id("workspace:search-1"),
         )
         .unwrap();
+    let exact = serde_json::to_value(exact).unwrap();
     assert_eq!(exact["search_id"], "workspace:search-1");
 
-    client
+    let page = client
         .review_search(
             ReviewSearchTarget::Workspace(context.clone()),
             ReviewSearchRequest::unreviewed(Some("next-page".into()), Some(3)),
         )
         .unwrap();
+    let page = serde_json::to_value(page).unwrap();
+    assert_eq!(page["searches"], serde_json::json!([]));
 
     let calls = calls.lock().await;
     assert_eq!(calls.len(), 3);

@@ -13,7 +13,7 @@ impl MemoryService {
     ) -> anyhow::Result<serde_json::Value> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let response = self.review_search_mcp(root, arguments)?;
+            let response = serde_json::to_value(self.review_search_mcp(root, arguments)?)?;
             if response["status"] != "indexing" {
                 return Ok(response);
             }
@@ -4713,9 +4713,12 @@ fn review_search_reports_indexing_while_history_rebuild_is_incomplete() {
     let state = service.search_history_index.state_for(&root);
     state.lock().unwrap().worker_running = true;
 
-    let response = service
-        .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
-        .unwrap();
+    let response = serde_json::to_value(
+        service
+            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap(),
+    )
+    .unwrap();
 
     assert_eq!(response["status"], "indexing");
     assert_eq!(response["search_id"], search_id);
@@ -4755,9 +4758,12 @@ fn review_search_keeps_partial_history_tail_pending() {
         state.worker_running = true;
     }
 
-    let response = service
-        .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
-        .unwrap();
+    let response = serde_json::to_value(
+        service
+            .review_search_mcp(&root, &serde_json::json!({"search_id":search_id}))
+            .unwrap(),
+    )
+    .unwrap();
 
     assert_eq!(response["status"], "indexing");
     std::fs::remove_dir_all(root).unwrap();
@@ -4801,12 +4807,15 @@ fn exact_search_absence_stays_pending_after_history_replacement() {
     std::fs::write(&replacement_path, replacement).unwrap();
     std::fs::rename(&replacement_path, &history_path).unwrap();
 
-    let response = service
-        .review_search_mcp(
-            &root,
-            &serde_json::json!({"search_id":"not-in-replacement"}),
-        )
-        .unwrap();
+    let response = serde_json::to_value(
+        service
+            .review_search_mcp(
+                &root,
+                &serde_json::json!({"search_id":"not-in-replacement"}),
+            )
+            .unwrap(),
+    )
+    .unwrap();
 
     assert_eq!(response["status"], "indexing");
     std::fs::remove_dir_all(root).unwrap();
@@ -4881,9 +4890,12 @@ fn malformed_search_history_rows_are_reported_and_make_absence_uncertain() {
     assert_eq!(page["malformed_records_skipped"], 1);
     assert_eq!(page["first_malformed_offset"], lines[0].len());
 
-    let exact = service
-        .review_search_mcp(&root, &serde_json::json!({"search_id":"never-recorded"}))
-        .unwrap();
+    let exact = serde_json::to_value(
+        service
+            .review_search_mcp(&root, &serde_json::json!({"search_id":"never-recorded"}))
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(exact["status"], "history_incomplete");
     assert_eq!(exact["malformed_records_skipped"], 1);
     std::fs::remove_dir_all(root).unwrap();

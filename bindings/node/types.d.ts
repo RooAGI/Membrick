@@ -64,6 +64,55 @@ export interface SearchReviewResponse {
   prior_feedback: unknown | null
 }
 
+export interface SearchReviewPageEntry {
+  search_id: string
+  search: Record<string, unknown>
+  result: Record<string, unknown>
+  documents: Array<Record<string, unknown>>
+}
+
+export interface SearchReviewPage {
+  searches: SearchReviewPageEntry[]
+  next_cursor: string | null
+  has_more: boolean
+  oversized_records_skipped: number
+  malformed_records_skipped: number
+  first_malformed_offset: number | null
+  ambiguous_searches_skipped: number
+}
+
+export interface SearchReviewExactIndexing {
+  status: 'indexing'
+  search_id: string
+  indexed_bytes: number
+  history_bytes: number
+  message: string
+}
+
+export interface SearchReviewPageIndexing {
+  status: 'indexing'
+  searches: unknown[]
+  indexed_bytes: number
+  history_bytes: number
+  message: string
+}
+
+export interface SearchReviewHistoryIncomplete {
+  status: 'history_incomplete'
+  search_id: string
+  malformed_records_skipped: number
+  oversized_records_skipped: number
+  first_malformed_offset: number | null
+  message: string
+}
+
+export type ReviewSearchResult =
+  | SearchReviewResponse
+  | SearchReviewPage
+  | SearchReviewExactIndexing
+  | SearchReviewPageIndexing
+  | SearchReviewHistoryIncomplete
+
 export interface AddOptions {
   requestId?: string
   sessionId?: string
@@ -147,7 +196,7 @@ export declare class Memory {
   search(query: string, userId: string, options?: SearchOptions): Promise<MemorySearchResponse>
   workspaceSearch(query: string, provider: string, options?: WorkspaceSearchOptions): Promise<WorkspaceSearchResponse>
   reviewSearch(searchId: string, userId: string): Promise<SearchReviewResponse>
-  reviewSearch(searchId: string | undefined, userId: undefined, options: WorkspaceReviewOptions): Promise<Record<string, unknown>>
+  reviewSearch(searchId: string | undefined, userId: undefined, options: WorkspaceReviewOptions): Promise<ReviewSearchResult>
   get(memoryId: string, userId: string, includeInactive?: boolean): Promise<MemoryRecord | null>
   list(userId: string, options?: ListOptions): Promise<ListResponse>
   update(memoryId: string, userId: string, content: string, options?: UpdateOptions): Promise<MemoryRecord | null>

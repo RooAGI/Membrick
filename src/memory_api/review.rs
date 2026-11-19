@@ -140,7 +140,7 @@ impl MemoryService {
         &self,
         project_root: &Path,
         arguments: &serde_json::Value,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<ReviewSearchResult> {
         let args = arguments
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("review_search arguments must be an object"))?;
@@ -159,20 +159,26 @@ impl MemoryService {
             let prior_feedback = self.search_review_entry(project_root, search_id)?;
             let record = match self.lookup_search_history_record(project_root, search_id)? {
                 SearchHistoryLookup::Found(record) => record,
-                SearchHistoryLookup::Pending(progress) => return Ok(progress),
+                SearchHistoryLookup::Pending(progress) => {
+                    return Ok(ReviewSearchResult::ExactIndexing(serde_json::from_value(
+                        progress,
+                    )?));
+                }
                 SearchHistoryLookup::Incomplete {
                     malformed_records,
                     oversized_records,
                     first_malformed_offset,
                 } => {
-                    return Ok(serde_json::json!({
-                        "status": "history_incomplete",
-                        "search_id": search_id,
-                        "malformed_records_skipped": malformed_records,
-                        "oversized_records_skipped": oversized_records,
-                        "first_malformed_offset": first_malformed_offset,
-                        "message": "The search ID was not found, but malformed or oversized history records mean its absence cannot be confirmed."
-                    }));
+                    return Ok(ReviewSearchResult::HistoryIncomplete(
+                        SearchReviewHistoryIncomplete {
+                            status: SearchReviewHistoryStatus::HistoryIncomplete,
+                            search_id: search_id.to_string(),
+                            malformed_records_skipped: malformed_records,
+                            oversized_records_skipped: oversized_records,
+                            first_malformed_offset,
+                            message: "The search ID was not found, but malformed or oversized history records mean its absence cannot be confirmed.".into(),
+                        },
+                    ));
                 }
                 SearchHistoryLookup::Absent => anyhow::bail!(
                     "search_id was not found in recorded MCP history after the resident caught up"
@@ -180,13 +186,16 @@ impl MemoryService {
             };
             let result = search_result_payload(&record);
             let documents = self.documents_for_review(&result)?;
-            let response = serde_json::json!({
-                "search_id": search_id,
-                "reviewed": prior_feedback.is_some(),
-                "search": record,
-                "result": result,
-                "documents": documents,
-                "prior_feedback": prior_feedback.as_ref().and_then(|v| v.get("feedback")),
+            let response = ReviewSearchResult::Exact(SearchReviewResponse {
+                search_id: search_id.to_string(),
+                reviewed: prior_feedback.is_some(),
+                search: serde_json::to_value(record)?,
+                result,
+                documents,
+                prior_feedback: prior_feedback
+                    .as_ref()
+                    .and_then(|value| value.get("feedback"))
+                    .cloned(),
             });
             anyhow::ensure!(
                 serde_json::to_vec(&response)?.len() <= MAX_REVIEW_PAGE_RESPONSE_BYTES,
@@ -239,25 +248,25 @@ impl MemoryService {
             && current_history_end == captured_end
             && generation.as_deref() == Some(current_generation.as_str());
         if !ready {
-            return Ok(serde_json::json!({
-                "status": "indexing",
-                "searches": [],
-                "indexed_bytes": indexed_end,
-                "history_bytes": current_history_end.max(captured_end),
-                "message": last_error.unwrap_or_else(|| "The resident is rebuilding the search history lookup index. Retry shortly.".to_string())
+            return Ok(ReviewSearchResult::PageIndexing(SearchReviewPageIndexing {
+                status: SearchReviewIndexingStatus::Indexing,
+                searches: Vec::new(),
+                indexed_bytes: indexed_end,
+                history_bytes: current_history_end.max(captured_end),
+                message: last_error.unwrap_or_else(|| "The resident is rebuilding the search history lookup index. Retry shortly.".to_string()),
             }));
         }
         let generation = match generation {
             Some(generation) => generation,
             None => {
-                return Ok(serde_json::json!({
-                    "searches": [],
-                    "next_cursor": null,
-                    "has_more": false,
-                    "oversized_records_skipped": 0,
-                    "malformed_records_skipped": 0,
-                    "first_malformed_offset": null,
-                    "ambiguous_searches_skipped": 0,
+                return Ok(ReviewSearchResult::Page(SearchReviewPage {
+                    searches: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                    oversized_records_skipped: 0,
+                    malformed_records_skipped: 0,
+                    first_malformed_offset: None,
+                    ambiguous_searches_skipped: 0,
                 }));
             }
         };
@@ -334,12 +343,12 @@ impl MemoryService {
             let record =
                 read_search_history_location(&history_path, &generation, location, search_id)?;
             let result = search_result_payload(&record);
-            let item = serde_json::json!({
-                "search_id": search_id,
-                "search": record,
-                "result": result,
-                "documents": self.documents_for_review(&result)?,
-            });
+            let item = SearchReviewPageEntry {
+                search_id: search_id.clone(),
+                search: serde_json::to_value(record)?,
+                result: result.clone(),
+                documents: self.documents_for_review(&result)?,
+            };
             let item_bytes = serde_json::to_vec(&item)?.len();
             if page_response_bytes.saturating_add(item_bytes) > MAX_REVIEW_PAGE_RESPONSE_BYTES {
                 anyhow::ensure!(
@@ -365,14 +374,14 @@ impl MemoryService {
         } else {
             None
         };
-        Ok(serde_json::json!({
-            "searches": page,
-            "next_cursor": next_cursor,
-            "has_more": has_more,
-            "oversized_records_skipped": oversized,
-            "malformed_records_skipped": malformed,
-            "first_malformed_offset": first_malformed_offset,
-            "ambiguous_searches_skipped": ambiguous_searches_skipped,
+        Ok(ReviewSearchResult::Page(SearchReviewPage {
+            searches: page,
+            next_cursor,
+            has_more,
+            oversized_records_skipped: oversized,
+            malformed_records_skipped: malformed,
+            first_malformed_offset,
+            ambiguous_searches_skipped,
         }))
     }
 

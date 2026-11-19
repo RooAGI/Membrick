@@ -1747,6 +1747,7 @@ pub(crate) fn call_mcp_tool_with_backend(
             }
             "review_search" => service
                 .review_search_mcp(root, arguments)
+                .and_then(|response| serde_json::to_value(response).map_err(Into::into))
                 .map_err(|error| format!("{error:#}")),
             _ => Err(format!("unknown tool: {tool_name}")),
         }

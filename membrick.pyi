@@ -1,6 +1,6 @@
 """Typed public API for the Membrick Python extension."""
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, TypedDict, Union, overload
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, TypedDict, Union, overload
 
 
 class MembrickError(Exception):
@@ -36,6 +36,57 @@ class SearchReviewResponse(TypedDict):
     result: Dict[str, Any]
     documents: List[Dict[str, Any]]
     prior_feedback: Optional[Any]
+
+
+class SearchReviewPageEntry(TypedDict):
+    search_id: str
+    search: Dict[str, Any]
+    result: Dict[str, Any]
+    documents: List[Dict[str, Any]]
+
+
+class SearchReviewPage(TypedDict):
+    searches: List[SearchReviewPageEntry]
+    next_cursor: Optional[str]
+    has_more: bool
+    oversized_records_skipped: int
+    malformed_records_skipped: int
+    first_malformed_offset: Optional[int]
+    ambiguous_searches_skipped: int
+
+
+class SearchReviewExactIndexing(TypedDict):
+    status: Literal["indexing"]
+    search_id: str
+    indexed_bytes: int
+    history_bytes: int
+    message: str
+
+
+class SearchReviewPageIndexing(TypedDict):
+    status: Literal["indexing"]
+    searches: List[Any]
+    indexed_bytes: int
+    history_bytes: int
+    message: str
+
+
+class SearchReviewHistoryIncomplete(TypedDict):
+    status: Literal["history_incomplete"]
+    search_id: str
+    malformed_records_skipped: int
+    oversized_records_skipped: int
+    first_malformed_offset: Optional[int]
+    message: str
+
+
+ReviewSearchResult = Union[
+    SearchReviewResponse,
+    SearchReviewPage,
+    SearchReviewExactIndexing,
+    SearchReviewPageIndexing,
+    SearchReviewHistoryIncomplete,
+]
 
 
 class Memory:
@@ -114,7 +165,7 @@ class Memory:
         session_id: Optional[str] = ...,
         cursor: Optional[str] = ...,
         page_size: Optional[int] = ...,
-    ) -> Dict[str, Any]: ...
+    ) -> ReviewSearchResult: ...
 
     def get(
         self, memory_id: str, user_id: str, include_inactive: bool = ...

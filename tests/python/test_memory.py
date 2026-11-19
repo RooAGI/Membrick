@@ -42,9 +42,24 @@ def _workspace_tool_server():
             if body.get("tool") == "search":
                 result = {"search_id": "workspace:search-1", "results": [{"id": "doc-1"}]}
             elif body.get("tool") == "review_search" and "search_id" in arguments:
-                result = {"search_id": arguments["search_id"], "reviewed": False, "documents": []}
+                result = {
+                    "search_id": arguments["search_id"],
+                    "reviewed": False,
+                    "search": {},
+                    "result": {},
+                    "documents": [],
+                    "prior_feedback": None,
+                }
             else:
-                result = {"searches": [], "next_cursor": None}
+                result = {
+                    "searches": [],
+                    "next_cursor": None,
+                    "has_more": False,
+                    "oversized_records_skipped": 0,
+                    "malformed_records_skipped": 0,
+                    "first_malformed_offset": None,
+                    "ambiguous_searches_skipped": 0,
+                }
             encoded = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

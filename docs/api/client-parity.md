@@ -25,8 +25,9 @@ APIs. They are not aliases for the application's `Memory` operations.
 Rust, Python, and Node.js `Memory.search` return the search ID and result data.
 Exact user search review returns the same `SearchReviewResponse` DTO in all
 three clients, containing the recorded query, ranked result snapshot, matching
-source documents, and prior feedback. Rust workspace review pages remain
-available through `Memory::review_search` and have a dynamic response shape.
+source documents, and prior feedback. Workspace review uses typed
+`ReviewSearchResult` variants for exact reviews, pages, indexing progress, and
+incomplete history while preserving those variants' existing JSON shapes.
 
 Field names in JSON are snake_case. Node method parameters and option objects
 use camelCase; the Node binding translates them at the boundary. Python uses

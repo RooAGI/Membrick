@@ -159,8 +159,11 @@ or user-scoped searches and their available source documents. `AgentOperationCon
 the provider, workspace, and host session identity. Use
 `ReviewSearchRequest::by_id(search_id)` to review an exact search, or
 `ReviewSearchRequest::unreviewed(cursor, page_size)` to page through unreviewed
-searches. The review response is returned as `serde_json::Value` because exact
-reviews and history pages have different response shapes.
+searches. `Memory::review_search` deserializes the response as the
+`ReviewSearchResult` enum; its
+`SearchReviewResponse`, `SearchReviewPage`, `SearchReviewExactIndexing`,
+`SearchReviewPageIndexing`, and `SearchReviewHistoryIncomplete` variants
+preserve the existing JSON contract.
 
 Workspace review applies to searches recorded by the resident workspace
 `search` tool, across provider adapters. User-scoped `Memory::search` returns
