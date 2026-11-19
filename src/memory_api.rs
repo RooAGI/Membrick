@@ -263,6 +263,21 @@ pub struct SearchResponse {
     pub data: Vec<SearchMemory>,
 }
 
+/// Recorded search details and source documents returned by an exact review.
+///
+/// This response shape is shared by the Rust, Python, and Node.js memory
+/// clients. Workspace history pages and indexing status use separate dynamic
+/// response shapes through the agent tools API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchReviewResponse {
+    pub search_id: String,
+    pub reviewed: bool,
+    pub search: serde_json::Value,
+    pub result: serde_json::Value,
+    pub documents: Vec<serde_json::Value>,
+    pub prior_feedback: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteRequest {
     pub user_id: String,

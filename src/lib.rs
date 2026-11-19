@@ -146,7 +146,7 @@ pub use crate::memory_api::{
 };
 pub use crate::memory_api::{
     AddRequestWithMetadata, AddResponse, ListResponse, MemoryRecord, Message, SearchMemory,
-    SearchResponse, StagedAddResponse,
+    SearchResponse, SearchReviewResponse, StagedAddResponse,
 };
 #[deprecated(note = "use MemoryError")]
 #[allow(deprecated)]
@@ -172,7 +172,7 @@ pub mod agent {
 pub mod embedded {
     pub use crate::memory_api::{
         AddRequest, AddRequestWithMetadata, DeleteRequest, GetRequest, ListRequest, MemoryService,
-        SearchRequest, SupersedeRequest, UpdateRequest,
+        SearchRequest, SearchReviewResponse, SupersedeRequest, UpdateRequest,
     };
     pub use crate::pipeline::PipelineOptions;
 }

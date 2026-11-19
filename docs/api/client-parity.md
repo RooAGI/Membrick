@@ -15,6 +15,7 @@ APIs. They are not aliases for the application's `Memory` operations.
 | Add | `POST /v1/memories` | `add(messages, user_id, AddOptions)` | `add(messages, user_id, request_id=None, session_id=None, wait_for_visibility=False)` | `add(messages, userId, options?)` |
 | Atomic add transaction | `POST /add/batch?wait_for_visibility=true` | `add_transaction(requests)` | `add_transaction(requests)` | `addTransaction(requests)` |
 | Search | `POST /v1/memories/search` | `search(query, user_id, SearchOptions)` | `search(query, user_id, top_k=10, ...)` | `search(query, userId, options?)` |
+| Review exact user search | `POST /v1/memories/search/review` | `review_memory_search(search_id, user_id)` | `review_search(search_id, user_id)` | `reviewSearch(searchId, userId)` |
 | Get | `GET /v1/memories/{id}?user_id=...` | `get(id, user_id, GetOptions)` | `get(memory_id, user_id, include_inactive=False)` | `get(memoryId, userId, includeInactive?)` |
 | List | `GET /v1/memories?user_id=...` | `list(user_id, ListOptions)` | `list(user_id, session_id=None, limit=100, cursor=None, include_inactive=False)` | `list(userId, options?)` |
 | Update | `PATCH /v1/memories/{id}` | `update(id, user_id, content, UpdateOptions)` | `update(memory_id, user_id, content, ...)` | `update(memoryId, userId, content, options?)` |
@@ -22,8 +23,10 @@ APIs. They are not aliases for the application's `Memory` operations.
 | Refresh | `POST /v1/memories/refresh` | `refresh()` | `refresh()` | `refresh()` |
 
 Rust, Python, and Node.js `Memory.search` return the search ID and result data.
-Use `review_search` (Python/Rust) or `reviewSearch` (Node.js) to retrieve the
-recorded query, ranked result snapshot, and matching source documents.
+Exact user search review returns the same `SearchReviewResponse` DTO in all
+three clients, containing the recorded query, ranked result snapshot, matching
+source documents, and prior feedback. Rust workspace review pages remain
+available through `Memory::review_search` and have a dynamic response shape.
 
 Field names in JSON are snake_case. Node method parameters and option objects
 use camelCase; the Node binding translates them at the boundary. Python uses

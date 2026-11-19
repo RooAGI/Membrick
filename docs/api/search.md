@@ -88,8 +88,9 @@ call and not a stable contract.
 
 ## Review a search
 
-The Rust client provides `Memory::review_search(ReviewSearchTarget::User { user_id },
-ReviewSearchRequest::by_id(search_id))`. The HTTP equivalent is
+The Rust client provides `Memory::review_memory_search(search_id, user_id)`,
+which returns the `SearchReviewResponse` DTO shared with the Python and Node.js
+bindings. The HTTP equivalent is
 `POST /v1/memories/search/review` with
 `{"search_id":"...", "user_id":"user-123"}`. It returns the recorded query,
 ranked result snapshot, and matching indexed source documents. Access is
@@ -131,17 +132,14 @@ curl -X POST http://127.0.0.1:8080/v1/memories/search \
 === "Rust"
 
     ```rust
-    use membrick::{agent::{ReviewSearchRequest, ReviewSearchTarget}, Memory, SearchOptions};
+    use membrick::{Memory, SearchOptions};
 
     let response = memory.search(
         "What milk do I prefer?",
         "user-123",
         SearchOptions { top_k: 5, ..Default::default() },
     )?;
-    let review = memory.review_search(
-        ReviewSearchTarget::User { user_id: "user-123".into() },
-        ReviewSearchRequest::by_id(response.search_id.clone()),
-    )?;
+    let review = memory.review_memory_search(&response.search_id, "user-123")?;
     let hits = response.data;
     ```
 

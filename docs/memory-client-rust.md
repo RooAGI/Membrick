@@ -165,10 +165,10 @@ reviews and history pages have different response shapes.
 Workspace review applies to searches recorded by the resident workspace
 `search` tool, across provider adapters. User-scoped `Memory::search` returns
 its own `search_id` in `MemorySearchResponse`; use
-`Memory::review_search(ReviewSearchTarget::User { user_id },
-ReviewSearchRequest::by_id(search_id))` to retrieve that query, result snapshot,
-and matching source documents. The resident checks ownership against the user
-who ran the search. Capture acknowledgements let adapters
+`Memory::review_memory_search(search_id, user_id)` to retrieve that query,
+result snapshot, and matching source documents as `SearchReviewResponse`. This
+is the same DTO exposed by the Python and Node.js clients. The resident checks
+ownership against the user who ran the search. Capture acknowledgements let adapters
 advance transcript cursors only after durable acceptance. Host event parsing
 and response formatting remain in the adapters. The read-only routes for
 boards and flows are documented in the [Boards](api/boards/index.md) and

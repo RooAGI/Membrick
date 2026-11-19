@@ -558,7 +558,7 @@ impl MemoryService {
         project_root: &Path,
         search_id: &str,
         user_id: &str,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<SearchReviewResponse> {
         anyhow::ensure!(!search_id.trim().is_empty(), "search_id must not be blank");
         anyhow::ensure!(!user_id.trim().is_empty(), "user_id must not be blank");
         let record = crate::memory_search_history::read_search(project_root, search_id)?
@@ -570,20 +570,23 @@ impl MemoryService {
         let result = serde_json::json!({"results": record.response.data.clone()});
         let documents = self.documents_for_review(&result)?;
         let prior_feedback = self.search_review_entry(project_root, search_id)?;
-        let response = serde_json::json!({
-            "search_id": search_id,
-            "reviewed": prior_feedback.is_some(),
-            "search": {
+        let response = SearchReviewResponse {
+            search_id: search_id.to_string(),
+            reviewed: prior_feedback.is_some(),
+            search: serde_json::json!({
                 "provider": "rust-sdk",
                 "tool": "memory_search",
                 "arguments": record.request,
                 "response": record.response,
                 "created_at_ms": record.created_at_ms,
-            },
-            "result": result,
-            "documents": documents,
-            "prior_feedback": prior_feedback.as_ref().and_then(|value| value.get("feedback")),
-        });
+            }),
+            result,
+            documents,
+            prior_feedback: prior_feedback
+                .as_ref()
+                .and_then(|value| value.get("feedback"))
+                .cloned(),
+        };
         anyhow::ensure!(
             serde_json::to_vec(&response)?.len() <= MAX_REVIEW_PAGE_RESPONSE_BYTES,
             "search review exceeds the response byte limit; the recorded result is too large to return safely"

@@ -232,6 +232,25 @@ async fn search_handler(
     })))
 }
 
+async fn review_memory_search_handler(
+    Json(request): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "search_id": request["search_id"],
+        "reviewed": false,
+        "search": {
+            "provider": "rust-sdk",
+            "tool": "memory_search",
+            "arguments": {"query": "tea"},
+            "response": {"data": []},
+            "created_at_ms": 123,
+        },
+        "result": {"results": []},
+        "documents": [],
+        "prior_feedback": null,
+    }))
+}
+
 async fn refresh_handler() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -358,6 +377,10 @@ fn test_service() -> (
     let app = Router::new()
         .route("/v1/memories", get(list_handler).post(add_handler))
         .route("/v1/memories/search", post(search_handler))
+        .route(
+            "/v1/memories/search/review",
+            post(review_memory_search_handler),
+        )
         .route("/v1/memories/refresh", post(refresh_handler))
         .route(
             "/v1/memories/{id}",
@@ -503,6 +526,27 @@ fn add_creates_and_restores_sessions_and_scopes_request_ids_by_user() {
     );
     drop(service);
     let _ = stop.send(());
+    server.join().unwrap();
+}
+
+#[test]
+fn user_search_review_uses_the_shared_search_review_dto() {
+    let (client, _service, stop, server) = test_service();
+
+    let review = client
+        .review_memory_search("memory:test-search-id", "alice")
+        .unwrap();
+    assert_eq!(review.search_id, "memory:test-search-id");
+    assert_eq!(review.search["tool"], "memory_search");
+    assert_eq!(review.result["results"], serde_json::json!([]));
+    assert!(review.documents.is_empty());
+    assert_eq!(review.prior_feedback, None);
+    assert_eq!(
+        serde_json::to_value(&review).unwrap()["search"]["provider"],
+        "rust-sdk"
+    );
+
+    stop.send(()).unwrap();
     server.join().unwrap();
 }
 

@@ -92,16 +92,29 @@ class Memory:
         session_id: Optional[str] = ...,
     ) -> Dict[str, Any]: ...
 
+    @overload
+    def review_search(
+        self,
+        search_id: str,
+        user_id: str,
+        provider: None = ...,
+        workspace: None = ...,
+        session_id: None = ...,
+        cursor: None = ...,
+        page_size: None = ...,
+    ) -> SearchReviewResponse: ...
+
+    @overload
     def review_search(
         self,
         search_id: Optional[str] = ...,
-        user_id: Optional[str] = ...,
+        user_id: None = ...,
         provider: Optional[str] = ...,
         workspace: Optional[str] = ...,
         session_id: Optional[str] = ...,
         cursor: Optional[str] = ...,
         page_size: Optional[int] = ...,
-    ) -> Union[SearchReviewResponse, Dict[str, Any]]: ...
+    ) -> Dict[str, Any]: ...
 
     def get(
         self, memory_id: str, user_id: str, include_inactive: bool = ...

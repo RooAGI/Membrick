@@ -1,4 +1,5 @@
-use super::{decode, ensure_success, Connection, Memory, MemoryError};
+use super::{decode, ensure_success, json_value, Connection, Memory, MemoryError};
+use crate::memory_api::SearchReviewResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -132,6 +133,31 @@ impl ReviewSearchRequest {
 }
 
 impl Memory {
+    /// Retrieve the recorded details and source documents for a user-scoped
+    /// memory search. The response is the same DTO exposed by the Python and
+    /// Node.js clients.
+    pub fn review_memory_search(
+        &self,
+        search_id: &str,
+        user_id: &str,
+    ) -> Result<SearchReviewResponse, MemoryError> {
+        if search_id.trim().is_empty() {
+            return Err(MemoryError::Configuration {
+                message: "review search_id must not be empty".into(),
+            });
+        }
+        if user_id.trim().is_empty() {
+            return Err(MemoryError::Configuration {
+                message: "review user_id must not be empty".into(),
+            });
+        }
+        let payload = json!({"search_id": search_id, "user_id": user_id});
+        let (status, body) =
+            self.request("POST", "/v1/memories/search/review", Some(&payload), false)?;
+        ensure_success(status, &body)?;
+        decode(body)
+    }
+
     /// Queue a provider transcript for durable background capture. A receipt
     /// means accepted by the queue, not yet persisted/searchable.
     pub fn submit_capture(
@@ -236,11 +262,6 @@ impl Memory {
                 self.workspace_tool(&context, "review_search", arguments, false)
             }
             ReviewSearchTarget::User { user_id } => {
-                if user_id.trim().is_empty() {
-                    return Err(MemoryError::Configuration {
-                        message: "review user_id must not be empty".into(),
-                    });
-                }
                 if request.search_id.is_none()
                     || request.cursor.is_some()
                     || request.page_size.is_some()
@@ -249,14 +270,9 @@ impl Memory {
                         message: "user search review requires only an exact search_id".into(),
                     });
                 }
-                let payload = json!({
-                    "search_id": request.search_id,
-                    "user_id": user_id,
-                });
-                let (status, body) =
-                    self.request("POST", "/v1/memories/search/review", Some(&payload), false)?;
-                ensure_success(status, &body)?;
-                Ok(body)
+                let search_id = request.search_id.expect("validated above");
+                let response = self.review_memory_search(&search_id, &user_id)?;
+                json_value(&response)
             }
         }
     }
