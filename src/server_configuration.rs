@@ -68,7 +68,7 @@ impl ServerConfiguration {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read settings file {}", path.display()))?;
-        Self::parse(&raw).with_context(|| format!("failed to parse settings file {}", path.display()))
+        Self::parse(&raw).with_context(|| format!("cannot parse settings file {}", path.display()))
     }
 
     /// Parse one settings document using the same schema at every call site.

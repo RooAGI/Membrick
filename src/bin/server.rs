@@ -3700,10 +3700,19 @@ mod tests {
             .await
             .unwrap();
         runtime
-            .staged_writer
-            .read_view()
+            .service
+            .read()
             .unwrap()
             .note_active_session("codex", "codex:resident-test-session");
+        assert_eq!(
+            runtime
+                .staged_writer
+                .read_view()
+                .unwrap()
+                .current_session_id("codex")
+                .as_deref(),
+            Some("codex:resident-test-session")
+        );
         let mut search = context(
             "search",
             json!({
@@ -3713,8 +3722,8 @@ mod tests {
         );
         search.as_object_mut().unwrap().remove("session_id");
         // The search inherits the active session established by add_memory.
-        // Its session attribution is internal transport metadata, removed by
-        // the provider adapter before the response reaches the agent.
+        // Session attribution is recorded in local search history and stays
+        // out of the provider-facing result.
         let response = app
             .clone()
             .oneshot(
@@ -3732,14 +3741,16 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body.get("__membrick_telemetry").is_none());
+        let search_id = body["search_id"].as_str().unwrap();
+        let history = crate::telemetry::mcp_search_record_by_trace_id(&root, search_id)
+            .unwrap()
+            .expect("the resident search should be recorded for review");
         assert_eq!(
-            body["__membrick_telemetry"]["session_id"],
-            "codex:resident-test-session"
+            history.session_id.as_deref(),
+            Some("codex:resident-test-session")
         );
-        assert_eq!(
-            body["__membrick_telemetry"]["session_attribution"],
-            "inferred"
-        );
+        assert_eq!(history.session_attribution, "inferred");
         assert!(body["results"]
             .as_array()
             .is_some_and(|results| !results.is_empty()));
