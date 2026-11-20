@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::rc::Rc;
 
+const SEARCH_FEEDBACK_GUIDANCE: &str = "If these results do not answer the question or miss important context, call search_feedback with this search_id, an overall label, and one relevance judgment for every returned doc_id. Use relevant, partially_relevant, or not_relevant. Use enrich_doc separately if a source document needs improvement. If the results are adequate, no feedback call is needed.";
+
 pub(crate) fn provider_filter_values() -> Vec<&'static str> {
     crate::provider_sources::PROVIDERS
         .iter()
@@ -168,6 +170,7 @@ pub(crate) fn call_resident_tool(
                 crate::memory_client::MemoryError::Unavailable { .. } => -32002,
                 crate::memory_client::MemoryError::Uncertain { .. } => -32003,
                 crate::memory_client::MemoryError::Rejected { .. }
+                | crate::memory_client::MemoryError::WorkspaceSearch(_)
                 | crate::memory_client::MemoryError::Configuration { .. } => -32602,
             };
             return Ok(resident_error_response(id, code, &error.to_string()));
@@ -219,24 +222,22 @@ pub(crate) fn record_mcp_tool_response(
                     .to_string();
                 let mut body = serde_json::from_str::<Value>(&text).ok()?;
                 let object = body.as_object_mut()?;
-                session_attribution = object
-                    .remove("__membrick_telemetry")
-                    .and_then(|metadata| {
-                        let session_id = metadata
-                            .get("session_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        let attribution = metadata
-                            .get("session_attribution")
-                            .and_then(Value::as_str)?
-                            .to_string();
-                        matches!(attribution.as_str(), "explicit" | "inferred" | "absent")
-                            .then_some((session_id, attribution))
-                    });
+                session_attribution = object.remove("__membrick_telemetry").and_then(|metadata| {
+                    let session_id = metadata
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let attribution = metadata
+                        .get("session_attribution")
+                        .and_then(Value::as_str)?
+                        .to_string();
+                    matches!(attribution.as_str(), "explicit" | "inferred" | "absent")
+                        .then_some((session_id, attribution))
+                });
                 object.insert("search_id".to_string(), json!(trace_id));
                 object.insert(
                     "feedback_guidance".to_string(),
-                    json!("If these results do not answer the question or miss important context, call search_feedback with this search_id, an overall label, and one relevance judgment for every returned doc_id. Use relevant, partially_relevant, or not_relevant. Use enrich_doc separately if a source document needs improvement. If the results are adequate, no feedback call is needed."),
+                    json!(SEARCH_FEEDBACK_GUIDANCE),
                 );
                 let encoded = serde_json::to_string_pretty(&body).ok()?;
                 *response
@@ -346,6 +347,96 @@ pub(crate) fn record_mcp_tool_response(
             });
         }
     }
+}
+
+/// Assign and persist a review ID for successful searches made through the
+/// resident's direct provider-tool route. Unlike provider adapters, SDK calls
+/// do not pass through `record_mcp_tool_response`, so this path must record its
+/// own MCP-shaped history entry before returning the search result.
+pub(crate) fn record_workspace_search_response(
+    root: &Path,
+    provider: &str,
+    request_id: Option<Value>,
+    arguments: &Value,
+    duration_ms: u64,
+    mut payload: Value,
+) -> anyhow::Result<Value> {
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("workspace search returned a non-object result"))?;
+    let metadata = object.remove("__membrick_telemetry");
+    let metadata_session_id = metadata
+        .as_ref()
+        .and_then(|value| value.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let session_attribution = metadata
+        .as_ref()
+        .and_then(|value| value.get("session_attribution"))
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "explicit" | "inferred" | "absent"))
+        .unwrap_or("absent")
+        .to_string();
+    let (timestamp_ms, search_id) =
+        crate::telemetry::mcp_trace_id_for_call(provider, "search", &request_id, arguments)?;
+    object.insert("search_id".to_string(), json!(search_id));
+    object.insert(
+        "feedback_guidance".to_string(),
+        json!(SEARCH_FEEDBACK_GUIDANCE),
+    );
+    let response_text = serde_json::to_string_pretty(&payload)?;
+    crate::telemetry::record_mcp_call_with_trace_id_and_attribution(
+        root,
+        provider,
+        "search",
+        request_id,
+        arguments,
+        duration_ms,
+        false,
+        json!({
+            "result": {"content": [{"type": "text", "text": response_text}]},
+            "error": null,
+        }),
+        timestamp_ms,
+        search_id,
+        metadata_session_id,
+        &session_attribution,
+    )?;
+    Ok(payload)
+}
+
+/// Record a failed search made through the direct provider-tool route using
+/// the same trace-ID and history contract as provider MCP calls.
+pub(crate) fn record_workspace_search_failure(
+    root: &Path,
+    provider: &str,
+    request_id: Option<Value>,
+    arguments: &Value,
+    duration_ms: u64,
+    error: &anyhow::Error,
+) -> anyhow::Result<String> {
+    let (timestamp_ms, search_id) = crate::telemetry::mcp_trace_id_for_call(
+        provider,
+        "search",
+        &request_id,
+        arguments,
+    )?;
+    crate::telemetry::record_mcp_call_with_trace_id(
+        root,
+        provider,
+        "search",
+        request_id,
+        arguments,
+        duration_ms,
+        true,
+        json!({
+            "result": null,
+            "error": {"code": -32603, "message": format!("{error:#}")},
+        }),
+        timestamp_ms,
+        search_id.clone(),
+    )?;
+    Ok(search_id)
 }
 
 /// Save capture work in the resident before returning from the provider hook.

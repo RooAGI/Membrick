@@ -607,6 +607,10 @@ fn memory_client_error(error: membrick::MemoryError) -> Error {
         membrick::MemoryError::Rejected { status, message } => Error::from_reason(format!(
             "[MEMBRICK_ERROR code=REJECTED status={status}] request rejected ({status}): {message}"
         )),
+        membrick::MemoryError::WorkspaceSearch(workspace_search) => Error::from_reason(format!(
+            "[MEMBRICK_ERROR code=WORKSPACE_SEARCH status={} search_id={}] {}",
+            workspace_search.status, workspace_search.search_id, workspace_search.message
+        )),
         membrick::MemoryError::Configuration { message } => Error::from_reason(format!(
             "[MEMBRICK_ERROR code=CONFIGURATION] invalid client configuration: {message}"
         )),

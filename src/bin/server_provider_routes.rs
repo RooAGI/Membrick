@@ -469,13 +469,37 @@ pub(super) async fn provider_mcp_tool_call(
     };
     let arguments = value.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if !arguments.is_object() {
+        if tool == "search" {
+            let error = anyhow::anyhow!("arguments must be an object");
+            let search_id = match crate::integrations::mcp_tools::record_workspace_search_failure(
+                    &runtime.project_root,
+                    provider,
+                    value.get("request_id").cloned(),
+                    &arguments,
+                    0,
+                    &error,
+                ) {
+                Ok(search_id) => search_id,
+                Err(record_error) => {
+                    tracing::error!("Could not record failed workspace search: {record_error:#}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail":"search failure could not be recorded"}))).into_response();
+                }
+            };
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"detail":"arguments must be an object", "search_id": search_id})),
+            )
+                .into_response();
+        }
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"detail":"arguments must be an object"})),
         )
             .into_response();
     }
+    let search_arguments = arguments.clone();
     let workspace = runtime.project_root.to_string_lossy().into_owned();
+    let call_started = std::time::Instant::now();
     let result: anyhow::Result<Value> = async {
         // Derive trusted invocation metadata only from the resident's active
         // provider session. Request JSON, including top-level transport fields
@@ -719,6 +743,53 @@ pub(super) async fn provider_mcp_tool_call(
         }
     }
     .await;
+    let result = if tool == "search" {
+        match result {
+            Ok(payload) => match crate::integrations::mcp_tools::record_workspace_search_response(
+                &runtime.project_root,
+                provider,
+                value.get("request_id").cloned(),
+                &search_arguments,
+                call_started.elapsed().as_millis() as u64,
+                payload,
+            ) {
+                Ok(payload) => Ok(payload),
+                Err(error) => {
+                    tracing::error!("Could not save workspace search for review: {error:#}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"detail":"search results could not be saved for review; retry the search"})),
+                    )
+                        .into_response();
+                }
+            },
+            Err(error) => {
+                let status =
+                    server_writer::mutation_status(&error, StatusCode::UNPROCESSABLE_ENTITY);
+                let search_id = match crate::integrations::mcp_tools::record_workspace_search_failure(
+                        &runtime.project_root,
+                        provider,
+                        value.get("request_id").cloned(),
+                        &search_arguments,
+                        call_started.elapsed().as_millis() as u64,
+                        &error,
+                    ) {
+                    Ok(search_id) => search_id,
+                    Err(record_error) => {
+                        tracing::error!("Could not record failed workspace search: {record_error:#}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail":"search failure could not be recorded"}))).into_response();
+                    }
+                };
+                return (
+                    status,
+                    Json(json!({"detail": format!("{error:#}"), "search_id": search_id})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        result
+    };
     match result {
         Ok(payload) => Json(payload).into_response(),
         Err(error) => (

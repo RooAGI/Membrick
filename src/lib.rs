@@ -159,7 +159,7 @@ pub use crate::memory_client::MemoryClientError;
 pub use crate::memory_client::MemoryClientOptions;
 pub use crate::memory_client::{
     AddOptions, GetOptions, ListOptions, Memory, MemoryError, MemoryOptions, MemorySession,
-    MemorySearchResponse, SearchOptions, UpdateOptions,
+    MemorySearchResponse, SearchOptions, UpdateOptions, WorkspaceSearchError,
 };
 
 /// Agent and integration operations carried over the shared resident client.
@@ -279,7 +279,7 @@ fn json_to_python<T: serde::Serialize>(py: Python<'_>, value: &T) -> PyResult<Py
 }
 
 #[cfg(feature = "python")]
-static PYTHON_MEMORY_ERRORS: PyOnceLock<[Py<PyType>; 4]> = PyOnceLock::new();
+static PYTHON_MEMORY_ERRORS: PyOnceLock<[Py<PyType>; 5]> = PyOnceLock::new();
 
 #[cfg(feature = "python")]
 fn create_python_exception(
@@ -335,12 +335,22 @@ fn initialize_python_memory_errors(py: Python<'_>, module: &Bound<'_, PyModule>)
         "UncertainError",
         vec![builtins.getattr("RuntimeError")?, base_any],
     )?;
+    let workspace_search = create_python_exception(
+        py,
+        &type_fn,
+        "WorkspaceSearchError",
+        vec![builtins.getattr("RuntimeError")?, base.bind(py).clone().into_any()],
+    )?;
     module.add("MembrickError", base.bind(py))?;
     module.add("RejectedError", rejected.bind(py))?;
     module.add("ConfigurationError", configuration.bind(py))?;
     module.add("UnavailableError", unavailable.bind(py))?;
     module.add("UncertainError", uncertain.bind(py))?;
-    let _ = PYTHON_MEMORY_ERRORS.set(py, [rejected, configuration, unavailable, uncertain]);
+    module.add("WorkspaceSearchError", workspace_search.bind(py))?;
+    let _ = PYTHON_MEMORY_ERRORS.set(
+        py,
+        [rejected, configuration, unavailable, uncertain, workspace_search],
+    );
     Ok(())
 }
 
@@ -357,25 +367,37 @@ fn python_memory_error(py: Python<'_>, index: usize, message: impl Into<String>)
 #[cfg(feature = "python")]
 fn memory_client_error(py: Python<'_>, error: crate::memory_client::MemoryError) -> pyo3::PyErr {
     use crate::memory_client::MemoryError;
-    let (index, message, status) = match error {
+    let (index, message, status, search_id) = match error {
         MemoryError::Rejected { status, message } => (
             0,
             format!("request rejected ({status}): {message}"),
             Some(status),
+            None,
         ),
         MemoryError::Configuration { mut message } => {
             message = message.replace(
                 "initialize it explicitly with Memory::init",
                 "initialize it explicitly with Memory.init",
             );
-            (1, message, None)
+            (1, message, None, None)
         }
-        MemoryError::Unavailable { message } => (2, message, None),
-        MemoryError::Uncertain { message } => (3, format!("outcome uncertain: {message}"), None),
+        MemoryError::Unavailable { message } => (2, message, None, None),
+        MemoryError::Uncertain { message } => (3, format!("outcome uncertain: {message}"), None, None),
+        MemoryError::WorkspaceSearch(workspace_search) => (
+            4,
+            workspace_search.message.clone(),
+            Some(workspace_search.status),
+            Some(workspace_search.search_id),
+        ),
     };
-    let error = python_memory_error(py, index, message);
+    let error = python_memory_error(py, index, message.clone());
     if let Some(status) = status {
         let _ = error.value(py).setattr("status", status);
+    }
+    if let Some(search_id) = search_id {
+        let _ = error.value(py).setattr("search_id", search_id);
+        let _ = error.value(py).setattr("code", "WORKSPACE_SEARCH");
+        let _ = error.value(py).setattr("message", message);
     }
     error
 }

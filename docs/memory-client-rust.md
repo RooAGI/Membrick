@@ -165,6 +165,13 @@ searches. `Memory::review_search` deserializes the response as the
 `SearchReviewPageIndexing`, and `SearchReviewHistoryIncomplete` variants
 preserve the existing JSON contract.
 
+`Memory::workspace_search` returns `WorkspaceSearchResponse` with a typed
+`search_id` and `results`. Pass `response.search_id` to
+`ReviewSearchRequest::by_id` with the same `AgentOperationContext` to retrieve
+the recorded query and result. If the server records a failed workspace search,
+`MemoryError::WorkspaceSearch` contains a `WorkspaceSearchError` with its HTTP
+status, message, and `search_id` so the failure can be reviewed by ID as well.
+
 Workspace review applies to searches recorded by the resident workspace
 `search` tool, across provider adapters. User-scoped `Memory::search` returns
 its own `search_id` in `MemorySearchResponse`; use

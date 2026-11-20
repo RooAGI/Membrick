@@ -31,7 +31,7 @@ def _status_server(status):
     return server, f"http://127.0.0.1:{server.server_port}"
 
 
-def _workspace_tool_server():
+def _workspace_tool_server(search_failure=None):
     calls = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -40,7 +40,19 @@ def _workspace_tool_server():
             calls.append(body)
             arguments = body.get("arguments", {})
             if body.get("tool") == "search":
-                result = {"search_id": "workspace:search-1", "results": [{"id": "doc-1"}]}
+                if search_failure is not None:
+                    encoded = json.dumps(search_failure[1]).encode("utf-8")
+                    self.send_response(search_failure[0])
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                    return
+                result = {
+                    "search_id": "workspace:search-1",
+                    "results": [{"id": "doc-1"}],
+                    "feedback_guidance": "Search result review guidance",
+                }
             elif body.get("tool") == "review_search" and "search_id" in arguments:
                 result = {
                     "search_id": arguments["search_id"],
@@ -173,6 +185,25 @@ class MemoryBindingTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             memory.review_search(result["search_id"], provider="codex", page_size=1)
+
+    def test_workspace_search_failure_exposes_typed_review_error(self):
+        server, base_url, _calls = _workspace_tool_server(
+            (422, {"detail": "query could not be processed", "search_id": "mcp:workspace-search-1"})
+        )
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        memory = membrick.Memory(base_url=base_url)
+
+        with self.assertRaises(membrick.WorkspaceSearchError) as context:
+            memory.workspace_search(
+                "invalid query", provider="codex", workspace="/remote/project"
+            )
+
+        error = context.exception
+        self.assertEqual(error.code, "WORKSPACE_SEARCH")
+        self.assertEqual(error.status, 422)
+        self.assertEqual(error.message, "query could not be processed")
+        self.assertEqual(error.search_id, "mcp:workspace-search-1")
 
 
 class TestRemoteLifecycle(unittest.TestCase):

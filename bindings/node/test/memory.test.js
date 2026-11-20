@@ -270,7 +270,11 @@ test('Memory workspace search and unified reviewSearch preserve workspace contex
     calls.push(body)
     let result
     if (body.tool === 'search') {
-      result = { search_id: 'workspace:search-1', results: [{ id: 'doc-1' }] }
+      result = {
+        search_id: 'workspace:search-1',
+        results: [{ id: 'doc-1' }],
+        feedback_guidance: 'Search result review guidance',
+      }
     } else if (body.tool === 'review_search' && body.arguments.search_id) {
       result = {
         search_id: body.arguments.search_id,
@@ -346,6 +350,33 @@ test('Memory errors expose stable codes and rejected HTTP status', async (t) => 
   await assert.rejects(
     client.add([{ role: 'user', content: 'rejected' }], 'alice'),
     (error) => error.code === 'REJECTED' && error.status === 422,
+  )
+})
+
+test('workspace search failures expose the recorded ID and shared error fields', async (t) => {
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* consume the dispatched request */ }
+    response.writeHead(422, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({
+      detail: 'query could not be processed',
+      search_id: 'mcp:workspace-search-1',
+    }))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())))
+  const address = server.address()
+  const client = new Memory({ baseUrl: `http://127.0.0.1:${address.port}` })
+
+  await assert.rejects(
+    client.workspaceSearch('invalid query', 'codex', { workspace: '/remote/project' }),
+    (error) => {
+      assert.equal(isMemoryError(error), true)
+      assert.equal(error.code, 'WORKSPACE_SEARCH')
+      assert.equal(error.status, 422)
+      assert.equal(error.message, 'query could not be processed')
+      assert.equal(error.search_id, 'mcp:workspace-search-1')
+      return true
+    },
   )
 })
 

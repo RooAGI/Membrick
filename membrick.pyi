@@ -24,9 +24,27 @@ class UncertainError(RuntimeError, MembrickError):
     """The operation may have reached the service; do not blindly replay it."""
 
 
+class WorkspaceSearchError(RuntimeError, MembrickError):
+    """A workspace search failed after the server recorded its search ID."""
+    code: Literal["WORKSPACE_SEARCH"]
+    status: int
+    message: str
+    search_id: str
+
+
 class MemorySearchResponse(TypedDict):
     search_id: str
     data: List[Dict[str, Any]]
+
+
+class _WorkspaceSearchResponseOptional(TypedDict, total=False):
+    comparison: Dict[str, Any]
+
+
+class WorkspaceSearchResponse(_WorkspaceSearchResponseOptional):
+    search_id: str
+    results: List[Dict[str, Any]]
+    feedback_guidance: str
 
 
 class SearchReviewResponse(TypedDict):
@@ -141,7 +159,7 @@ class Memory:
         top_k: int = ...,
         workspace: Optional[str] = ...,
         session_id: Optional[str] = ...,
-    ) -> Dict[str, Any]: ...
+    ) -> WorkspaceSearchResponse: ...
 
     @overload
     def review_search(

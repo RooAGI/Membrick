@@ -2699,6 +2699,84 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
+    #[tokio::test]
+    async fn direct_workspace_search_returns_id_that_review_search_can_resolve() {
+        let root = security_test_root();
+        let app = app_router(provider_memory_test_state(&root));
+
+        let (status, search) = call_provider_tool(
+            &app,
+            &root,
+            "search",
+            json!({"query":"reviewable direct SDK search","top_k":5}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{search}");
+        let search_id = search["search_id"].as_str().expect("search ID");
+        assert!(search_id.starts_with("mcp:"));
+        assert!(search.get("__membrick_telemetry").is_none());
+
+        let mut review = Value::Null;
+        for _ in 0..50 {
+            let (status, response) =
+                call_provider_tool(&app, &root, "review_search", json!({"search_id":search_id}))
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            review = response;
+            if review["status"] != "indexing" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(review["search_id"], search_id);
+        assert_eq!(review["search"]["trace_id"], search_id);
+        assert_eq!(review["result"]["search_id"], search_id);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_search_records_failed_searches_for_review() {
+        let root = security_test_root();
+        let app = app_router(provider_memory_test_state(&root));
+
+        let (status, error) =
+            call_provider_tool(&app, &root, "search", json!({"query":"","top_k":5})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        let response_search_id = error["search_id"].as_str().expect("error search ID");
+        assert!(response_search_id.starts_with("mcp:"));
+        assert!(error["detail"].as_str().is_some_and(|detail| !detail.is_empty()));
+
+        let mut page = Value::Null;
+        for _ in 0..50 {
+            let (status, response) =
+                call_provider_tool(&app, &root, "review_search", json!({})).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            page = response;
+            if page["status"] != "indexing" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let entry = &page["searches"][0];
+        let search_id = entry["search_id"].as_str().expect("failed search ID");
+        assert_eq!(search_id, response_search_id);
+        assert!(search_id.starts_with("mcp:"));
+        assert_eq!(entry["search"]["error"], true);
+        assert_eq!(entry["search"]["tool"], "search");
+        assert_eq!(entry["result"], Value::Null);
+
+        let (status, exact) =
+            call_provider_tool(&app, &root, "review_search", json!({"search_id":search_id})).await;
+        assert_eq!(status, StatusCode::OK, "{exact}");
+        assert_eq!(exact["search_id"], search_id);
+        assert_eq!(exact["search"]["error"], true);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn encode_path_segment(value: &str) -> String {
         value
             .bytes()

@@ -37,6 +37,28 @@ fn status_mapping_keeps_timeout_uncertain_and_rate_limit_retryable_by_status() {
     ));
 }
 
+#[test]
+fn workspace_search_error_preserves_typed_review_fields() {
+    let error = ensure_success(
+        422,
+        &serde_json::json!({
+            "detail": "query could not be processed",
+            "search_id": "mcp:workspace-search-1",
+        }),
+    )
+    .expect_err("workspace search should fail");
+
+    match error {
+        MemoryError::WorkspaceSearch(error) => {
+            assert_eq!(error.code, "WORKSPACE_SEARCH");
+            assert_eq!(error.status, 422);
+            assert_eq!(error.message, "query could not be processed");
+            assert_eq!(error.search_id, "mcp:workspace-search-1");
+        }
+        other => panic!("expected WorkspaceSearchError, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn async_memory_api_covers_operations_and_keeps_request_and_session_identity() {
     let (client, _, stop, server) = test_service();
@@ -273,7 +295,8 @@ async fn workspace_tool_handler(
     match body["tool"].as_str() {
         Some("search") => Json(serde_json::json!({
             "search_id": "workspace:search-1",
-            "results": [{"id": "doc-1", "content": "workspace hit"}]
+            "results": [{"id": "doc-1", "content": "workspace hit"}],
+            "feedback_guidance": "Search result review guidance"
         })),
         Some("review_search") if body["arguments"].get("search_id").is_some() => {
             Json(serde_json::json!({
@@ -333,7 +356,7 @@ async fn workspace_search_and_review_share_provider_and_workspace_context() {
     let result = client
         .workspace_search(&context, "where is the deployment guide", 7)
         .unwrap();
-    assert_eq!(result.metadata["search_id"], "workspace:search-1");
+    assert_eq!(result.search_id, "workspace:search-1");
     assert_eq!(result.results[0]["id"], "doc-1");
 
     let exact = client
