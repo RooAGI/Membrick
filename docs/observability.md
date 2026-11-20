@@ -6,8 +6,37 @@ together in one place.
 
 ## Dashboard
 
-When the Membrick server is running, open
+The dashboard is served by the Membrick server. Its URL depends on the server
+listener and port, so use the project settings when Membrick started the local
+resident.
+
+### Find and open the dashboard
+
+In the project where Membrick is installed, open
+`.membrick/server.toml` and look for `dashboard_url`:
+
+```toml
+resident_http_bind = "127.0.0.1:8465"
+dashboard_url = "http://127.0.0.1:8465/dashboard"
+```
+
+Open the value of `dashboard_url` in a browser. The port can differ between
+projects or machines. If `dashboard_url` is missing but `resident_http_bind` is
+present, append `/dashboard` to that address. A standalone server uses its
+`bind` setting or `--bind` command-line value; append `/dashboard` to that
+address instead. The common standalone example is
 [`http://127.0.0.1:8080/dashboard`](http://127.0.0.1:8080/dashboard).
+
+You can inspect the setting from a terminal with:
+
+```bash
+rg '^dashboard_url' /path/to/project/.membrick/server.toml
+```
+
+Replace `/path/to/project` with the project directory. The file is created
+when Membrick initializes project state. If the server requires a token, enter
+the token in the dashboard's **API token** field; the page itself can load
+without one, but its data endpoints use the server's configured authentication.
 
 ### Start the dashboard
 
@@ -27,6 +56,24 @@ server discovers the project's `.membrick/` data and the dashboard shows
 separate provider views when their features are compiled and their integrations
 have reported activity. See the [HTTP server guide](server.md) for server
 options and API behavior.
+
+### Use the dashboard sections
+
+The left navigation contains four main views. **Refresh** reloads the data,
+which otherwise refreshes automatically every five seconds.
+
+| Section | What to use it for |
+|---|---|
+| **Overview** | Check document and record counts, query rate, latency, errors, and empty results. It also shows the primary-index snapshot, transcript-capture progress, and recent activity across providers. |
+| **Index** | Inspect the primary query index, its segment topology, and document distribution. Use this when checking index health or how project documents are divided across segments. |
+| **Providers** | Inspect one agent integration at a time: observed sessions, tool activity, memory stores, and token usage when available. Select a provider in the **Integrations** list in the sidebar; providers appear after they create an index or send telemetry. |
+| **Search reviews** | Read feedback submitted for recorded searches, including usefulness labels and document relevance judgments. This view contains searches with submitted feedback, not every search request. |
+
+Start with **Overview** for a health check, open **Index** to investigate the
+workspace index, then select an integration to inspect its activity under
+**Providers**. Use **Search reviews** to inspect feedback on retrieval quality.
+For the matching read-only HTTP endpoints, see the
+[dashboard API overview](api/dashboard/index.md).
 
 <section class="dashboard-slideshow" data-dashboard-slideshow aria-label="Membrick dashboard screenshots">
   <div class="dashboard-slideshow__stage">
