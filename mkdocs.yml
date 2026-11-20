@@ -47,6 +47,7 @@ nav:
       - Command line: cli.md
       - MCP memory server: mcp-memory-server.md
       - HTTP server: server.md
+      - Server configuration: server-configuration.md
       - Docker: docker.md
       - Python: python.md
       - Node.js: node.md

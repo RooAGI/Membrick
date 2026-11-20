@@ -126,57 +126,13 @@ struct Args {
     max_active_workspaces: usize,
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct ServerSettings {
-    bind: Option<String>,
-    resident_http_bind: Option<String>,
-    resident_http_auto_port: Option<bool>,
-    index: Option<PathBuf>,
-    project_root: Option<PathBuf>,
-    server_token: Option<String>,
-    server_token_file: Option<PathBuf>,
-    tenant_id: Option<String>,
-    jwt_secret: Option<String>,
-    /// Paths the project scan skips, matched as fragments of the path relative
-    /// to the project root. Read through `adapters::project_ignore_paths`;
-    /// declared here so a wrongly typed value fails the settings parse.
-    #[allow(dead_code)]
-    ignore_paths: Option<Vec<String>>,
-    /// Allow `bind` and `resident_http_bind` to use a non-loopback address.
-    /// The same rule as `--allow-non-loopback` applies: a server token or JWT
-    /// secret must be configured. This is the only way to opt in for a
-    /// resident started automatically by an agent, since those get no flags.
-    allow_non_loopback: Option<bool>,
-    adaptive_segment_max_n: Option<usize>,
-    freshness: Option<crate::temporal::FreshnessPolicy>,
-}
-
 /// The command-line flag turns non-loopback binding on; otherwise the
 /// settings file decides, and the default is loopback only.
-fn effective_allow_non_loopback(flag: bool, settings: &ServerSettings) -> bool {
+fn effective_allow_non_loopback(
+    flag: bool,
+    settings: &crate::server_configuration::ServerConfiguration,
+) -> bool {
     flag || settings.allow_non_loopback.unwrap_or(false)
-}
-
-fn settings_path(args: &Args) -> anyhow::Result<PathBuf> {
-    if let Some(path) = &args.settings {
-        return Ok(path.clone());
-    }
-    let root = args
-        .project_root
-        .clone()
-        .unwrap_or(std::env::current_dir()?);
-    Ok(root.join(".membrick").join("server.toml"))
-}
-
-fn load_server_settings(path: &std::path::Path) -> anyhow::Result<ServerSettings> {
-    if !path.exists() {
-        return Ok(ServerSettings::default());
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read settings file {}", path.display()))?;
-    toml::from_str(&raw)
-        .with_context(|| format!("failed to parse settings file {}", path.display()))
 }
 
 /// CLI-selectable segment routing strategies. Variant names map to the router
@@ -251,6 +207,7 @@ struct WorkspaceRuntime {
     _owner_lock: Arc<crate::memory_api::workspace::WorkspaceOwnerLock>,
     project_root: PathBuf,
     workspace_index_root: PathBuf,
+    ignore_paths: Vec<String>,
 }
 
 struct WorkspaceRegistry {
@@ -441,11 +398,18 @@ fn open_workspace_runtime(
     options: PipelineOptions,
     schedule: server_writer::WriteSchedule,
 ) -> anyhow::Result<WorkspaceRuntime> {
+    let settings = crate::server_configuration::ServerConfiguration::for_project(&project_root)?;
+    let ignore_paths = settings.effective_ignore_paths();
     let owner_lock = crate::memory_api::workspace::WorkspaceOwnerLock::acquire(&project_root)?;
     let workspace_index_root = project_root
         .join(".membrick")
         .join(crate::memory_api::workspace::WORKSPACE_MEMORY_NAME);
-    let owner = open_workspace_owner_at(&project_root, &workspace_index_root, options.clone())?;
+    let owner = open_workspace_owner_at(
+        &project_root,
+        &workspace_index_root,
+        options.clone(),
+        &ignore_paths,
+    )?;
     let service = Arc::new(RwLock::new(owner));
     let staged_writer = StagedWriter::start_with_schedule(service.clone(), schedule)?;
     let owner_lock = Arc::new(owner_lock);
@@ -458,6 +422,7 @@ fn open_workspace_runtime(
         _owner_lock: owner_lock,
         project_root,
         workspace_index_root,
+        ignore_paths,
     };
     Ok(runtime)
 }
@@ -465,7 +430,7 @@ fn open_workspace_runtime(
 fn start_runtime_workspace_watcher(runtime: Arc<WorkspaceRuntime>) {
     let watcher = match crate::pipeline::WorkspaceWatcher::new(
         &runtime.project_root,
-        &provider_memory_ignore_paths(&runtime.project_root),
+        &runtime.ignore_paths,
     ) {
         Ok(watcher) => Arc::new(watcher),
         Err(error) => {
@@ -495,7 +460,7 @@ fn start_runtime_watcher_with_handle(
     let root = runtime.project_root.clone();
     let index_root = runtime.workspace_index_root.clone();
     let writer = runtime.staged_writer.for_workspace();
-    let ignore_paths = provider_memory_ignore_paths(&root);
+    let ignore_paths = runtime.ignore_paths.clone();
     tokio::spawn(async move {
         let mut poll = tokio::time::interval(Duration::from_millis(500));
         let mut refresh_pending = false;
@@ -713,20 +678,17 @@ struct DashboardSession {
     last_event: String,
 }
 
-/// The project's `ignore_paths` from `.membrick/server.toml`, or the defaults.
-fn provider_memory_ignore_paths(root: &std::path::Path) -> Vec<String> {
-    crate::adapters::project_ignore_paths(root)
-}
-
 #[cfg(test)]
 fn open_workspace_owner(root: &std::path::Path) -> anyhow::Result<MemoryService> {
     let workspace_root = root
         .join(".membrick")
         .join(crate::memory_api::workspace::WORKSPACE_MEMORY_NAME);
+    let ignore_paths = crate::adapters::project_ignore_paths(root)?;
     open_workspace_owner_at(
         root,
         &workspace_root,
         crate::memory_api::workspace::segmented_store_options(),
+        &ignore_paths,
     )
 }
 
@@ -734,8 +696,8 @@ fn open_workspace_owner_at(
     root: &std::path::Path,
     workspace_root: &std::path::Path,
     options: PipelineOptions,
+    ignore_paths: &[String],
 ) -> anyhow::Result<MemoryService> {
-    let ignore_paths = provider_memory_ignore_paths(root);
     let mut owner = MemoryService::open_workspace_owner_with_options_at(
         root,
         workspace_root,
@@ -783,8 +745,13 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let mut matches = Args::command().get_matches();
     let bind_was_set = matches.value_source("bind") == Some(clap::parser::ValueSource::CommandLine);
     let mut args = Args::from_arg_matches_mut(&mut matches)?;
-    let settings_file = settings_path(&args)?;
-    let settings = load_server_settings(&settings_file)?;
+    let settings_file = crate::server_configuration::ServerConfiguration::settings_path(
+        args.settings.as_deref(),
+        args.project_root.as_deref(),
+    )?;
+    let settings = crate::server_configuration::ServerConfiguration::load(&settings_file)?;
+    crate::logging::init_with_settings(crate::logging::Role::Server, &settings);
+    let ignore_paths = settings.effective_ignore_paths();
     let resident_http_bind = settings.resident_http_bind.clone();
     let resident_http_auto_port = settings.resident_http_auto_port.unwrap_or(false);
     args.allow_non_loopback = effective_allow_non_loopback(args.allow_non_loopback, &settings);
@@ -863,6 +830,14 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         .project_root
         .unwrap_or(std::env::current_dir()?)
         .canonicalize()?;
+    if args.resident_server {
+        let project_settings = project_root.join(".membrick").join("server.toml");
+        anyhow::ensure!(
+            settings_file.canonicalize()? == project_settings.canonicalize()?,
+            "a project resident must use {}; omit --settings or pass that file",
+            project_settings.display()
+        );
+    }
     // The effective settings after command-line flags and server.toml are
     // merged, with where this process started from. Secrets are reported
     // only as set or unset.
@@ -931,8 +906,12 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     });
     let workspace_index_root =
         selected_index.unwrap_or_else(|| project_root.join(".membrick").join("workspace-memory"));
-    let owner = open_workspace_owner_at(&project_root, &workspace_index_root, options.clone())?;
-    let ignore_paths = provider_memory_ignore_paths(&project_root);
+    let owner = open_workspace_owner_at(
+        &project_root,
+        &workspace_index_root,
+        options.clone(),
+        &ignore_paths,
+    )?;
     let watcher = crate::pipeline::WorkspaceWatcher::new(&project_root, &ignore_paths)?;
     {
         let documents = owner
@@ -1010,6 +989,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         _owner_lock: owner_lock,
         project_root: state.project_root.clone(),
         workspace_index_root: state.workspace_index_root.clone(),
+        ignore_paths: ignore_paths.clone(),
     });
     if let (Some(watcher), Some(workspace_writer)) = (
         state.workspace_watcher.clone(),
@@ -1020,7 +1000,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     ) {
         let project_root = state.project_root.clone();
         let workspace_index_root = state.workspace_index_root.clone();
-        let ignore_paths = provider_memory_ignore_paths(&project_root);
+        let ignore_paths = ignore_paths.clone();
         tokio::spawn(async move {
             let mut poll = tokio::time::interval(Duration::from_millis(500));
             let mut refresh_pending = false;
@@ -2288,7 +2268,7 @@ mod tests {
 
     #[test]
     fn server_settings_load_relative_freshness_and_default_to_relative() {
-        let settings: ServerSettings =
+        let settings: crate::server_configuration::ServerConfiguration =
             toml::from_str("[freshness]\nmode = 'relative'\nhalf_life_days = 45.0\nweight = 0.3\n")
                 .expect("freshness settings should deserialize");
         let policy = settings.freshness.unwrap().validate().unwrap();
@@ -2296,7 +2276,8 @@ mod tests {
         assert_eq!(policy.half_life_days, 45.0);
         assert_eq!(policy.weight, 0.3);
 
-        let defaults: ServerSettings = toml::from_str("").expect("empty settings are valid");
+        let defaults: crate::server_configuration::ServerConfiguration =
+            toml::from_str("").expect("empty settings are valid");
         assert_eq!(
             defaults.freshness.unwrap_or_default().mode,
             crate::temporal::FreshnessMode::Relative
@@ -2327,6 +2308,7 @@ mod tests {
             root,
             root,
             crate::memory_api::workspace::segmented_store_options(),
+            &crate::adapters::project_ignore_paths(root).unwrap(),
         )
         .unwrap();
         let owner_lock = crate::memory_api::workspace::WorkspaceOwnerLock::acquire(root).unwrap();
@@ -2357,6 +2339,7 @@ mod tests {
             _owner_lock: owner_lock,
             project_root: root.to_path_buf(),
             workspace_index_root: root.to_path_buf(),
+            ignore_paths: crate::adapters::project_ignore_paths(root).unwrap(),
         });
         AppState {
             service,
@@ -4499,7 +4482,9 @@ mod tests {
 
     #[test]
     fn settings_file_can_allow_non_loopback_binds() {
-        let parse = |raw: &str| -> ServerSettings { toml::from_str(raw).unwrap() };
+        let parse = |raw: &str| -> crate::server_configuration::ServerConfiguration {
+            toml::from_str(raw).unwrap()
+        };
         assert!(!effective_allow_non_loopback(false, &parse("")));
         assert!(!effective_allow_non_loopback(false, &parse("allow_non_loopback = false\n")));
         assert!(effective_allow_non_loopback(false, &parse("allow_non_loopback = true\n")));

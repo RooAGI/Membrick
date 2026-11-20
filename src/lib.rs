@@ -89,6 +89,7 @@ mod segments;
 pub mod semantic_audit;
 mod semantic_relations;
 mod session_prepare;
+mod server_configuration;
 mod source;
 pub mod state_paths;
 mod telemetry;
@@ -225,10 +226,12 @@ pub fn run_binary(name: &str) -> anyhow::Result<()> {
         logging::Role::from_args(&args)
     };
     // Residents, adapters and hooks start in their project root.
-    logging::init(
-        role,
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    );
+    if name != "server" {
+        logging::init(
+            role,
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )?;
+    }
     if matches!(name, "membrick" | "lint-ai") {
         updater::check_for_update();
     }

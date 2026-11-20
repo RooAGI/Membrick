@@ -5,6 +5,48 @@ server throughput for specific workloads, not retrieval quality or a universal
 capacity guarantee. The runs used a local release build, a seeded corpus of
 23,366 records, and Tantivy 0.25.0 unless noted otherwise.
 
+## Single-writer consolidation verification (2026-10-11)
+
+The consolidation passed 39 server/writer tests, 97 `MemoryService` tests, and
+`cargo check --all-targets`. Coverage included shared queue admission,
+acceptance while a generation was paused, a global visibility barrier across
+both stores, recovery after a queued delete, and retained immutable views. A
+board-write regression failed against the previous implementation with
+`acknowledged board post is absent from the published search snapshot`, passed
+with the consolidated writer, and failed again after restoring and recompiling
+the previous implementation.
+
+The broader library suite had five hook-test failures that also reproduced on
+the pre-consolidation source: Claude and Codex session-start directory and
+session-summary formatting assertions, plus the OpenClaw legacy bootstrap
+composition test. They were separate from the passing resident owner, queue,
+visibility, and recovery checks.
+
+Paired release measurements used isolated workspaces with 13,974 synthetic
+records across 14 seed batches. Query cells used 100 measured requests and five
+warmups at concurrency 1 and 10. Batch-write cells used batch size 128, eight
+seconds of writes, two warmups, and three repetitions.
+
+| Measurement | Previous two writers | One resident writer |
+|---|---:|---:|
+| Warm `/search` p50, concurrency 1 | 1.853 ms | 1.894 ms |
+| Warm `/search` p50, concurrency 10 | 8.980 ms | 9.172 ms |
+| Accepted batch-write records/s, median | 5,961.83 | 6,017.54 |
+| Published batch-write records/s, median including final flush | 2,786.94 | 2,902.42 |
+| Batch-write acknowledgement p99, median | 5.018 ms | 5.011 ms |
+
+These short synthetic measurements support comparable warm-query and staged
+write performance; they are not a cold-start measurement of the real workspace
+or a long-duration throughput guarantee. All measured final writes were
+searchable after flush. Raw results are in
+`comparison/results/query-single-writer-{control,refactor}-2026-10-11.json`
+and
+`comparison/results/write-only-single-writer-batch8s-{control,refactor}-2026-10-11.json`.
+The earlier three-second write trials are retained in
+`comparison/results/write-only-single-writer-{control,refactor}-2026-10-11.json`;
+their batch results varied with whether a request crossed snapshot capture at
+the end of the measurement window.
+
 ## Latest diagnostic runs (2026-10-12)
 
 These working-tree diagnostics use the release server built from revision

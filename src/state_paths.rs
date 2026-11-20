@@ -265,6 +265,8 @@ pub fn record_install_settings(root: &Path) -> anyhow::Result<PathBuf> {
             return Err(error).with_context(|| format!("cannot read {}", settings.display()));
         }
     };
+    crate::server_configuration::ServerConfiguration::parse(&text)
+        .with_context(|| format!("cannot parse {}", settings.display()))?;
     let mut document: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("cannot parse {}", settings.display()))?;
@@ -288,6 +290,8 @@ pub fn record_install_settings(root: &Path) -> anyhow::Result<PathBuf> {
             .with_context(|| format!("{} [logging] must be a table", settings.display()))?;
         logging["level"] = toml_edit::value(DEFAULT_INSTALL_LOG_LEVEL);
     }
+    crate::server_configuration::ServerConfiguration::parse(&document.to_string())
+        .with_context(|| format!("invalid settings in {}", settings.display()))?;
     let temporary = settings_temporary_path(&state)?;
     fs::write(&temporary, document.to_string())?;
     if let Err(error) = fs::rename(&temporary, &settings) {
@@ -308,31 +312,27 @@ pub(crate) fn validate_project_root(root: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("project root {} does not exist", root.display()))?;
     let settings = root.join(".membrick").join("server.toml");
     let reinstall = format!("run `membrick install <provider> {}`", root.display());
-    let text = fs::read_to_string(&settings).with_context(|| {
-        format!(
-            "{} is not a Membrick project root: {} is missing; {reinstall}",
-            root.display(),
-            settings.display()
-        )
-    })?;
-    let parsed: toml::Value =
-        toml::from_str(&text).with_context(|| format!("cannot parse {}", settings.display()))?;
-    let recorded = parsed
-        .get("project_root")
-        .and_then(toml::Value::as_str)
-        .with_context(|| {
+    anyhow::ensure!(
+        settings.is_file(),
+        "{} is not a Membrick project root: {} is missing; {reinstall}",
+        root.display(),
+        settings.display()
+    );
+    let parsed = crate::server_configuration::ServerConfiguration::load(&settings)?;
+    let recorded = parsed.project_root.as_deref().with_context(|| {
             format!(
                 "{} does not set project_root; {reinstall}",
                 settings.display()
             )
         })?;
-    let same = Path::new(recorded)
+    let same = recorded
         .canonicalize()
         .is_ok_and(|recorded| recorded == root);
     anyhow::ensure!(
         same,
-        "{} records project_root {recorded} but belongs to {}; the project was moved or copied, {reinstall}",
+        "{} records project_root {} but belongs to {}; the project was moved or copied, {reinstall}",
         settings.display(),
+        recorded.display(),
         root.display()
     );
     Ok(root)
@@ -432,7 +432,7 @@ mod tests {
         // it, and reading it back gives the same list the scan uses.
         assert!(parsed["ignore_paths"].as_array().is_some());
         assert_eq!(
-            crate::adapters::project_ignore_paths(&workspace),
+            crate::adapters::project_ignore_paths(&workspace).unwrap(),
             crate::adapters::DEFAULT_IGNORE_PATHS
                 .iter()
                 .map(|path| path.to_string())
