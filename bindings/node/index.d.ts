@@ -52,6 +52,8 @@ export interface MemorySearchResponse {
 export interface WorkspaceSearchResponse {
   search_id: string
   results: Array<Record<string, unknown>>
+  comparison?: Record<string, unknown>
+  feedback_guidance: string
   [key: string]: unknown
 }
 
@@ -160,11 +162,15 @@ export interface UpdateOptions {
 
 export interface SessionSearchOptions extends Omit<SearchOptions, 'sessionId'> {}
 
-export type MemoryErrorCode = 'REJECTED' | 'UNCERTAIN' | 'UNAVAILABLE' | 'CONFIGURATION'
-export interface MemoryError extends Error {
-  code: MemoryErrorCode
-  status?: number
+export type MemoryErrorCode = 'REJECTED' | 'UNCERTAIN' | 'UNAVAILABLE' | 'CONFIGURATION' | 'WORKSPACE_SEARCH'
+export interface WorkspaceSearchError extends Error {
+  code: 'WORKSPACE_SEARCH'
+  status: number
+  search_id: string
 }
+export type MemoryError =
+  | (Error & { code: Exclude<MemoryErrorCode, 'WORKSPACE_SEARCH'>; status?: number })
+  | WorkspaceSearchError
 export declare function isMemoryError(value: unknown): value is MemoryError
 
 export interface ListResponse {

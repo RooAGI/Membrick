@@ -6,8 +6,58 @@ together in one place.
 
 ## Dashboard
 
-When the Membrick server is running, open
+The dashboard is served by the Membrick server. Its URL depends on the server
+listener and port, so use the project settings when Membrick started the local
+resident.
+
+### Find and open the dashboard
+
+In the project where Membrick is installed, open
+`.membrick/server.toml` and look for `dashboard_url`:
+
+```toml
+resident_http_bind = "127.0.0.1:8465"
+dashboard_url = "http://127.0.0.1:8465/dashboard"
+```
+
+Open the value of `dashboard_url` in a browser. The port can differ between
+projects or machines. If `dashboard_url` is missing but `resident_http_bind` is
+present, append `/dashboard` to that address. A standalone server uses its
+`bind` setting or `--bind` command-line value; append `/dashboard` to that
+address instead. The common standalone example is
 [`http://127.0.0.1:8080/dashboard`](http://127.0.0.1:8080/dashboard).
+See [Server configuration](server-configuration.md) for what these settings
+mean and how the resident listener differs from the standalone server.
+
+You can inspect the setting from a terminal with:
+
+```bash
+rg '^dashboard_url' /path/to/project/.membrick/server.toml
+```
+
+Replace `/path/to/project` with the project directory. The file is created
+when Membrick initializes project state. If the server requires a token, enter
+the token in the dashboard's **API token** field; the page itself can load
+without one, but its data endpoints use the server's configured authentication.
+
+### Remote dashboard access and OAuth
+
+For access from outside the machine, put the server behind HTTPS and an
+OAuth/OIDC-protected reverse proxy or secure access gateway. Membrick does not
+provide an OAuth login flow for the dashboard. The proxy must protect both
+`/dashboard` and the dashboard's `/api/*` requests, including the live events
+endpoint; protecting only the page leaves its data endpoints exposed.
+
+The Membrick server still checks its own API authentication. Configure either
+a `server_token`/`server_token_file`, or `jwt_secret` for per-user HS256 JWTs.
+The dashboard's **API token** field sends its value as a bearer token. With a
+proxy-managed OAuth login, configure the proxy to pass or inject a Membrick
+accepted bearer token for authenticated requests, or have each dashboard user
+enter their API token. If using `jwt_secret`, the supplied JWT needs a non-empty
+`sub`, a valid `exp`, and a subject matching the requested user scope. An OAuth
+login cookie by itself is not a Membrick API token. See the [HTTP server
+guide](server.md#run-locally) for server-side authentication settings and the
+[Docker guide](docker.md) for deployment details.
 
 ### Start the dashboard
 
@@ -27,6 +77,24 @@ server discovers the project's `.membrick/` data and the dashboard shows
 separate provider views when their features are compiled and their integrations
 have reported activity. See the [HTTP server guide](server.md) for server
 options and API behavior.
+
+### Use the dashboard sections
+
+The left navigation contains four main views. **Refresh** reloads the data,
+which otherwise refreshes automatically every five seconds.
+
+| Section | What to use it for |
+|---|---|
+| **Overview** | Check document and record counts, query rate, latency, errors, and empty results. It also shows the primary-index snapshot, transcript-capture progress, and recent activity across providers. |
+| **Index** | Inspect the primary query index, its segment topology, and document distribution. Use this when checking index health or how project documents are divided across segments. |
+| **Providers** | Inspect one agent integration at a time: observed sessions, tool activity, memory stores, and token usage when available. Select a provider in the **Integrations** list in the sidebar; providers appear after they create an index or send telemetry. |
+| **Search reviews** | Read feedback submitted for recorded searches, including usefulness labels and document relevance judgments. This view contains searches with submitted feedback, not every search request. |
+
+Start with **Overview** for a health check, open **Index** to investigate the
+workspace index, then select an integration to inspect its activity under
+**Providers**. Use **Search reviews** to inspect feedback on retrieval quality.
+For the matching read-only HTTP endpoints, see the
+[dashboard API overview](api/dashboard/index.md).
 
 <section class="dashboard-slideshow" data-dashboard-slideshow aria-label="Membrick dashboard screenshots">
   <div class="dashboard-slideshow__stage">
@@ -122,6 +190,62 @@ stored and how long it is retained.
 Provider state is based on events actually received. An agent may be installed
 but show no recent activity until its hooks or MCP connection send an event.
 Token usage also depends on what that agent makes available.
+
+### Read turns, subagents, and memory use
+
+In **Providers**, select an integration and open a session under **Main agent ·
+Turns by session**. The dashboard groups lifecycle events into turns so you can
+follow one request from its prompt through memory retrieval and tool calls to
+the agent's response:
+
+```mermaid
+sequenceDiagram
+    participant M as Main-agent turn
+    participant R as Memory retrieval or search
+    participant T as Tool calls
+    participant S as Subagent turn
+    M->>R: MemoryRetrieved or Membrick search results
+    R->>T: Later tool calls in the same turn
+    M->>S: Subagent starts
+    S->>S: Its own start, tools, retrievals, and stop
+    M->>M: Final response / Stop
+```
+
+- **Main-agent turns:** a prompt starts a turn. Its timeline lists retrievals,
+  paired tool calls, subagent work, and the final response when those events
+  were reported. A session can contain many turns. The newest turns appear
+  first; expand one to see its event sequence and any reported token usage.
+- **Subagents:** each subagent appears in the separate **Subagents · Subagent
+  turns** section and has its own turn timeline. The main-agent turn that was
+  active when the subagent started also contains that subagent turn inline.
+  The subagent entry says which prompt and session started it. This lets you
+  inspect delegated work separately while still seeing where it fits in the
+  parent turn. A resumed run with the same agent ID is shown as another turn
+  for that subagent.
+- **Turn status:** `completed` means a stop event was received. `running` means
+  the latest turn has recent activity and no stop yet. `no recent activity`
+  means it has been quiet for at least 30 minutes. `session ended` means the
+  session ended before a stop arrived. `continued in next turn` or `resumed
+  later` means a later turn started before the earlier one got a stop event.
+  Missing prompt or start details can also mean the corresponding event aged
+  out of the bounded telemetry window.
+- **Memory and tools:** a hook retrieval appears as a `MemoryRetrieved` event.
+  A `mcp__membrick__search` tool call shows its search results. For either
+  source, the dashboard examines later tool calls in that same turn, up to the
+  next memory retrieval or search. A tool call may show a **Memory match** when
+  its arguments or result refer to a retrieved document ID, source path,
+  matching search term, or wording from a returned excerpt. The memory detail
+  also summarizes these follow-on calls and the evidence used for matches.
+  These links show observed association and timing; they do not prove that the
+  memory caused the tool call or its result. Only retained, reported events are
+  included, so missing instrumentation or expired events can make a sequence
+  incomplete.
+
+Tool calls are paired from the host's start and result events when both are
+available. A missing result can mean the host did not report one or that the
+event is outside the retained window. Event names and the detail available vary
+by provider; see [telemetry details](telemetry.md) for provider coverage and
+retention.
 
 ## Local data and privacy
 

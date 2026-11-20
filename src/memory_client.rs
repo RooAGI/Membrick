@@ -54,14 +54,32 @@ impl Default for MemoryOptions {
     }
 }
 
-/// Definitive rejection, uncertain dispatch outcome, unavailable service, or
-/// local client/response configuration failure.
+/// A rejected request, failed workspace search with its review ID, uncertain
+/// dispatch outcome, unavailable service, or local client configuration error.
+#[derive(Debug)]
+pub struct WorkspaceSearchError {
+    pub code: &'static str,
+    pub status: u16,
+    pub message: String,
+    pub search_id: String,
+}
+
 #[derive(Debug)]
 pub enum MemoryError {
-    Rejected { status: u16, message: String },
-    Uncertain { message: String },
-    Unavailable { message: String },
-    Configuration { message: String },
+    Rejected {
+        status: u16,
+        message: String,
+    },
+    WorkspaceSearch(WorkspaceSearchError),
+    Uncertain {
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+    Configuration {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for MemoryError {
@@ -69,6 +87,13 @@ impl std::fmt::Display for MemoryError {
         match self {
             Self::Rejected { status, message } => {
                 write!(f, "memory request rejected ({status}): {message}")
+            }
+            Self::WorkspaceSearch(error) => {
+                write!(
+                    f,
+                    "workspace search failed ({}, search_id {}): {}",
+                    error.status, error.search_id, error.message
+                )
             }
             Self::Uncertain { message } => write!(f, "memory request outcome uncertain: {message}"),
             Self::Unavailable { message } => write!(f, "memory service unavailable: {message}"),
@@ -1079,6 +1104,14 @@ fn ensure_success(status: u16, body: &Value) -> Result<(), MemoryError> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| body.to_string());
+    if let Some(search_id) = body.get("search_id").and_then(Value::as_str) {
+        return Err(MemoryError::WorkspaceSearch(WorkspaceSearchError {
+            code: "WORKSPACE_SEARCH",
+            status,
+            message,
+            search_id: search_id.to_owned(),
+        }));
+    }
     if status == 408 {
         // A timeout response does not prove the server did not apply a write.
         Err(MemoryError::Uncertain { message })

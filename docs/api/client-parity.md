@@ -29,6 +29,15 @@ source documents, and prior feedback. Workspace review uses typed
 `ReviewSearchResult` variants for exact reviews, pages, indexing progress, and
 incomplete history while preserving those variants' existing JSON shapes.
 
+Provider-scoped workspace search also returns `WorkspaceSearchResponse` in
+Rust, Python, and Node.js. It contains `search_id`, `results`, and
+`feedback_guidance`; `comparison` is present only for two-sided comparison
+queries. The ID is accepted by workspace `review_search`. Failed workspace
+searches are recorded in the same review history and appear when paging
+unreviewed searches; the failed call itself returns the normal SDK error rather
+than a success response DTO. That typed error exposes the same recorded ID:
+`WorkspaceSearchError` with `status`, `message`, and `search_id` in each SDK.
+
 Field names in JSON are snake_case. Node method parameters and option objects
 use camelCase; the Node binding translates them at the boundary. Python uses
 snake_case. Rust uses typed option structs. In all interfaces `user_id` is

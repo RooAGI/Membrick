@@ -421,6 +421,9 @@ pub(crate) async fn request_for_memory_client(
             let bind = tokio::task::spawn_blocking(move || configured_http_bind(&settings_root))
                 .await
                 .map_err(|error| ClientTransportError::BeforeDispatch(error.to_string()))?;
+            let bind = bind.map_err(|error| ClientTransportError::BeforeDispatch(format!(
+                "cannot load resident HTTP settings: {error:#}"
+            )))?;
             let Some(bind) = bind else {
                 return Err(ClientTransportError::BeforeDispatch(ipc_error));
             };
@@ -626,20 +629,14 @@ pub(crate) async fn request_with_sender_for_memory_client(
     Ok((status, value))
 }
 
-pub(crate) fn configured_http_bind(root: &Path) -> Option<String> {
-    let settings = fs::read_to_string(root.join(".membrick").join("server.toml")).ok()?;
-    settings
-        .parse::<toml::Value>()
-        .ok()?
-        .get("resident_http_bind")?
-        .as_str()
-        .map(str::to_owned)
+pub(crate) fn configured_http_bind(root: &Path) -> anyhow::Result<Option<String>> {
+    Ok(crate::server_configuration::ServerConfiguration::for_project(root)?.resident_http_bind)
 }
 
 pub(crate) fn transport_endpoint(root: &Path, transport: &str) -> Option<String> {
     match transport {
         "ipc" => endpoint(root).ok(),
-        "http" => configured_http_bind(root),
+        "http" => configured_http_bind(root).ok().flatten(),
         "file-queue" => Some(
             root.join(".membrick/runtime/requests")
                 .display()

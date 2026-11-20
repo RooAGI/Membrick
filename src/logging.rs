@@ -95,16 +95,34 @@ pub(crate) fn active_level() -> Option<(LevelFilter, &'static str)> {
 
 /// The level a process of `role` started in `project_root` logs at, and where
 /// it came from.
-fn effective_level(role: Role, project_root: &Path) -> (LevelFilter, &'static str) {
-    match configured_level(project_root) {
+fn effective_level(role: Role, project_root: &Path) -> anyhow::Result<(LevelFilter, &'static str)> {
+    let settings = crate::server_configuration::ServerConfiguration::for_project(project_root)?;
+    Ok(effective_level_from_settings(role, &settings))
+}
+
+fn effective_level_from_settings(
+    role: Role,
+    settings: &crate::server_configuration::ServerConfiguration,
+) -> (LevelFilter, &'static str) {
+    match settings.logging_level().and_then(parse_level) {
         Some(level) => (level, "server.toml"),
         None => (role.default_level(), "default"),
     }
 }
 
 /// Install the process-wide logger. Later calls keep the first logger.
-pub(crate) fn init(role: Role, project_root: &Path) {
-    let (level, source) = effective_level(role, project_root);
+pub(crate) fn init(role: Role, project_root: &Path) -> anyhow::Result<()> {
+    let settings = crate::server_configuration::ServerConfiguration::for_project(project_root)?;
+    init_with_settings(role, &settings);
+    Ok(())
+}
+
+/// Initialize logging from the already-resolved settings file.
+pub(crate) fn init_with_settings(
+    role: Role,
+    settings: &crate::server_configuration::ServerConfiguration,
+) {
+    let (level, source) = effective_level_from_settings(role, settings);
     let _ = ACTIVE_LEVEL.set((level, source));
     let filter = Targets::new()
         .with_target("membrick", level)
@@ -117,20 +135,6 @@ pub(crate) fn init(role: Role, project_root: &Path) {
         .with_writer(std::io::stderr)
         .with_filter(filter);
     let _ = tracing_subscriber::registry().with(layer).try_init();
-}
-
-/// `[logging] level` from `<root>/.membrick/server.toml`, if set and valid.
-fn configured_level(project_root: &Path) -> Option<LevelFilter> {
-    let path = project_root.join(".membrick").join("server.toml");
-    let settings = std::fs::read_to_string(path).ok()?;
-    let level = settings
-        .parse::<toml::Value>()
-        .ok()?
-        .get("logging")?
-        .get("level")?
-        .as_str()?
-        .to_owned();
-    parse_level(&level)
 }
 
 fn parse_level(level: &str) -> Option<LevelFilter> {
@@ -211,22 +215,28 @@ mod tests {
     fn level_comes_from_the_logging_table_in_server_settings() {
         let root = std::env::temp_dir().join(format!("membrick-logging-{}", std::process::id()));
         std::fs::create_dir_all(root.join(".membrick")).unwrap();
-        assert_eq!(configured_level(&root), None);
+        assert_eq!(
+            effective_level(Role::Cli, &root).unwrap(),
+            (LevelFilter::WARN, "default")
+        );
         std::fs::write(
             root.join(".membrick/server.toml"),
             "bind = \"127.0.0.1:8080\"\n[logging]\nlevel = \"Debug\"\n",
         )
         .unwrap();
-        assert_eq!(configured_level(&root), Some(LevelFilter::DEBUG));
+        assert_eq!(
+            effective_level(Role::Cli, &root).unwrap(),
+            (LevelFilter::DEBUG, "server.toml")
+        );
         std::fs::write(
             root.join(".membrick/server.toml"),
             "[logging]\nlevel = \"loud\"\n",
         )
         .unwrap();
         assert_eq!(
-            configured_level(&root),
-            None,
-            "an unknown level falls back to the default"
+            effective_level(Role::Cli, &root).unwrap(),
+            (LevelFilter::WARN, "default"),
+            "an unknown level falls back to the role default"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -238,12 +248,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         assert_eq!(
-            effective_level(Role::Resident, &root),
+            effective_level(Role::Resident, &root).unwrap(),
             (LevelFilter::INFO, "default")
         );
         crate::state_paths::initialize_project_state(&root).unwrap();
         assert_eq!(
-            effective_level(Role::Resident, &root),
+            effective_level(Role::Resident, &root).unwrap(),
             (LevelFilter::INFO, "server.toml")
         );
         // A level the user sets afterwards is what the next resident uses.
@@ -253,7 +263,7 @@ mod tests {
             .replace("level = \"info\"", "level = \"debug\"");
         std::fs::write(&settings, text).unwrap();
         assert_eq!(
-            effective_level(Role::Resident, &root),
+            effective_level(Role::Resident, &root).unwrap(),
             (LevelFilter::DEBUG, "server.toml")
         );
         let _ = std::fs::remove_dir_all(root);

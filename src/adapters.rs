@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::config::normalize_list;
 use crate::graph::{Graph, Tier0Record};
 use crate::source::SourceDocument;
+pub(crate) use crate::server_configuration::DEFAULT_IGNORE_PATHS;
 
 #[derive(Debug, Clone)]
 pub struct AdapterInput<'a> {
@@ -36,36 +37,14 @@ pub(crate) fn scan_base(root: &Path) -> std::path::PathBuf {
     root.to_path_buf()
 }
 
-/// Paths the project scan skips when `.membrick/server.toml` does not set
-/// `ignore_paths`. Each entry is matched as a fragment of the lowercase path
-/// relative to the project root.
-pub(crate) const DEFAULT_IGNORE_PATHS: &[&str] = &[
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "vendor",
-    "coverage",
-    ".git",
-    // Python virtual environments (`.venv`, `venv`) and installed packages,
-    // which hold many package README.md and LICENSE.txt files.
-    "venv",
-    ".tox",
-    "site-packages",
-];
-
 /// The project's `ignore_paths` from `.membrick/server.toml`, or
 /// [`DEFAULT_IGNORE_PATHS`] when the file or the key is absent. Setting the
-/// key replaces the defaults, so `ignore_paths = []` skips nothing. A file the
-/// resident cannot parse also falls back to the defaults here; the resident
-/// itself refuses to start on it and reports the error.
-pub(crate) fn project_ignore_paths(root: &Path) -> Vec<String> {
-    let configured = std::fs::read_to_string(root.join(".membrick").join("server.toml"))
-        .ok()
-        .and_then(|raw| raw.parse::<toml::Value>().ok())
-        .and_then(|settings| settings.get("ignore_paths").cloned())
-        .and_then(|value| value.try_into::<Vec<String>>().ok());
-    configured.unwrap_or_else(|| DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect())
+/// key replaces the defaults, so `ignore_paths = []` skips nothing. Malformed
+/// settings are returned as errors so callers fail consistently with server
+/// startup.
+pub(crate) fn project_ignore_paths(root: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(crate::server_configuration::ServerConfiguration::for_project(root)?
+        .effective_ignore_paths())
 }
 
 /// One readable file found by [`scan_text_files`].
@@ -467,19 +446,19 @@ mod tests {
         let defaults: Vec<String> = DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect();
         let root = temp_dir("ignore-settings");
         // No settings file, then a file without the key.
-        assert_eq!(project_ignore_paths(&root), defaults);
+        assert_eq!(project_ignore_paths(&root).unwrap(), defaults);
         fs::create_dir_all(root.join(".membrick")).unwrap();
         let settings = root.join(".membrick").join("server.toml");
         fs::write(&settings, "bind = \"127.0.0.1:8080\"\n").unwrap();
-        assert_eq!(project_ignore_paths(&root), defaults);
+        assert_eq!(project_ignore_paths(&root).unwrap(), defaults);
         // A configured list replaces the defaults, including an empty one.
         fs::write(&settings, "ignore_paths = [\"drafts\", \"vendor\"]\n").unwrap();
-        assert_eq!(project_ignore_paths(&root), vec!["drafts", "vendor"]);
+        assert_eq!(project_ignore_paths(&root).unwrap(), vec!["drafts", "vendor"]);
         fs::write(&settings, "ignore_paths = []\n").unwrap();
-        assert!(project_ignore_paths(&root).is_empty());
-        // A wrongly typed value falls back to the defaults.
+        assert!(project_ignore_paths(&root).unwrap().is_empty());
+        // A wrongly typed value is rejected consistently with server startup.
         fs::write(&settings, "ignore_paths = \"drafts\"\n").unwrap();
-        assert_eq!(project_ignore_paths(&root), defaults);
+        assert!(project_ignore_paths(&root).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

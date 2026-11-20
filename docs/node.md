@@ -88,7 +88,7 @@ try {
   await memory.add([{ role: 'user', content: 'I prefer concise answers.' }], 'alice')
 } catch (error) {
   if (isMemoryError(error)) {
-    console.error(error.code, error.status)
+    console.error(error.code, error.status, error.searchId)
   }
   throw error
 }
@@ -99,6 +99,11 @@ JavaScript option names and method parameters use camelCase, such as
 returned memory records keep their snake_case wire names, such as
 `expires_at_ms`, `user_id`, and `session_id`, so they retain the same JSON field
 shape as Rust and Python values.
+
+Failed workspace searches throw an error with `code === 'WORKSPACE_SEARCH'`,
+the HTTP `status`, `message`, and recorded `search_id`. Python raises
+`WorkspaceSearchError`; Rust returns `MemoryError::WorkspaceSearch` containing
+the same `WorkspaceSearchError` data type.
 
 ## Remote memory service
 

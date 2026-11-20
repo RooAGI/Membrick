@@ -8,13 +8,14 @@ const marker = '// membrick:error-codes:start'
 let entry = fs.readFileSync(entryPath, 'utf8')
 if (!entry.includes(marker)) {
   entry += `\n\n${marker}
-const __memoryErrorCodes = new Set(['REJECTED', 'UNCERTAIN', 'UNAVAILABLE', 'CONFIGURATION'])
+const __memoryErrorCodes = new Set(['REJECTED', 'UNCERTAIN', 'UNAVAILABLE', 'CONFIGURATION', 'WORKSPACE_SEARCH'])
 function __decorateMemoryError(error) {
   if (!error || typeof error.message !== 'string') return error
-  const match = /^\\[MEMBRICK_ERROR code=(REJECTED|UNCERTAIN|UNAVAILABLE|CONFIGURATION)(?: status=(\\d+))?\\]\\s*/.exec(error.message)
+  const match = /^\\[MEMBRICK_ERROR code=(REJECTED|UNCERTAIN|UNAVAILABLE|CONFIGURATION|WORKSPACE_SEARCH)(?: status=(\\d+))?(?: search_id=([^\\]\\s]+))?\\]\\s*/.exec(error.message)
   if (!match) return error
   error.code = match[1]
   if (match[2] !== undefined) error.status = Number(match[2])
+  if (match[3] !== undefined) error.search_id = match[3]
   error.message = error.message.slice(match[0].length)
   return error
 }
@@ -29,7 +30,7 @@ function __wrapMemoryMethod(prototype, name) {
     }
   }
 }
-for (const name of ['add', 'search', 'get', 'list', 'update', 'delete', 'refresh']) {
+for (const name of ['add', 'search', 'workspaceSearch', 'get', 'list', 'update', 'delete', 'refresh']) {
   __wrapMemoryMethod(module.exports.Memory && module.exports.Memory.prototype, name)
   __wrapMemoryMethod(module.exports.MemorySession && module.exports.MemorySession.prototype, name)
 }
@@ -87,5 +88,14 @@ if (__nativeMemory) {
 module.exports.isMemoryError = (value) =>
   value instanceof Error && __memoryErrorCodes.has(value.code)
 `
+  fs.writeFileSync(entryPath, entry)
+} else {
+  entry = entry
+    .replace("new Set(['REJECTED', 'UNCERTAIN', 'UNAVAILABLE', 'CONFIGURATION'])", "new Set(['REJECTED', 'UNCERTAIN', 'UNAVAILABLE', 'CONFIGURATION', 'WORKSPACE_SEARCH'])")
+    .replace(String.raw`(REJECTED|UNCERTAIN|UNAVAILABLE|CONFIGURATION)(?: status=(\d+))?`, String.raw`(REJECTED|UNCERTAIN|UNAVAILABLE|CONFIGURATION|WORKSPACE_SEARCH)(?: status=(\d+))?(?: search_id=([^\]\s]+))?`)
+    .replaceAll("error.searchId = match[3]", "error.search_id = match[3]")
+    .replace("  if (match[2] !== undefined) error.status = Number(match[2])", "  if (match[2] !== undefined) error.status = Number(match[2])\n  if (match[3] !== undefined) error.search_id = match[3]")
+    .replace("  if (match[3] !== undefined) error.search_id = match[3]\n  if (match[3] !== undefined) error.search_id = match[3]", "  if (match[3] !== undefined) error.search_id = match[3]")
+    .replace("['add', 'search', 'get', 'list', 'update', 'delete', 'refresh']", "['add', 'search', 'workspaceSearch', 'get', 'list', 'update', 'delete', 'refresh']")
   fs.writeFileSync(entryPath, entry)
 }

@@ -4,6 +4,7 @@ import {
   type MemoryError,
   type MemoryOptions,
   type ReviewSearchResult,
+  type WorkspaceSearchError,
 } from "../index"
 
 const projectOptions: MemoryOptions = { path: "./project" }
@@ -33,5 +34,12 @@ function getMemoryErrorCode(error: unknown): MemoryError["code"] | undefined {
   return isMemoryError(error) ? error.code : undefined
 }
 
+function workspaceSearchErrorFields(error: unknown): string | undefined {
+  if (!isMemoryError(error) || error.code !== "WORKSPACE_SEARCH") return undefined
+  const typedError: WorkspaceSearchError = error
+  return `${typedError.status}:${typedError.message}:${typedError.search_id}`
+}
+
 void initializedClient
 void getMemoryErrorCode
+void workspaceSearchErrorFields

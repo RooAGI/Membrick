@@ -38,38 +38,9 @@ cargo run --release --bin server -- --settings .membrick/server.toml
 The server reads `.membrick/server.toml` under the current directory by
 default. Set `project_root` to select a workspace root, or use `--settings PATH`
 to select a settings file directly. Command-line flags override values from
-the file. For example:
-
-```toml
-bind = "127.0.0.1:8080"
-project_root = "/path/to/project"
-index = "/var/lib/membrick/memory-index"
-server_token = "replace-with-a-secret"
-# Or use a protected secret file instead of storing the value in TOML:
-# server_token_file = "/path/to/server-token"
-tenant_id = "team-a"
-adaptive_segment_max_n = 32
-jwt_secret = "replace-with-a-secret"
-# Paths the project scan skips, matched as part of the path relative to the
-# project root. Unset means these defaults; setting it replaces them.
-ignore_paths = ["node_modules", "target", "dist", "build", "vendor", "coverage", ".git", "venv", ".tox", "site-packages"]
-# Allow `bind` or `resident_http_bind` to use a non-loopback address such as
-# 0.0.0.0. Requires server_token, server_token_file, or jwt_secret.
-# allow_non_loopback = true
-
-# Optional freshness override. The default is relative freshness for
-# CurrentState queries only.
-[freshness]
-mode = "relative" # relative, legacy, or disabled
-half_life_days = 30.0
-weight = 0.25
-```
-
-`freshness` is read at server startup from the same settings file. Relative
-freshness is query-time only and does not rebuild the index. The same effective
-policy is used by ordinary and structured retrieval. Omit the table to use the
-default CurrentState-only relative policy. Set `mode = "legacy"` to restore the
-previous ranking policy, or `mode = "disabled"` to disable generic freshness.
+the file. See [Server configuration](server-configuration.md) for all
+recognized settings, defaults, and examples, including authentication,
+resident listener, ignore paths, and freshness options.
 
 Keep secrets in a user-private settings file and restrict its filesystem
 permissions. The server does not read configuration from environment variables.
@@ -310,46 +281,15 @@ for the local request path.
 does not contain a workspace and it writes to the primary workspace. Use the
 workspace-aware MCP upsert and hook routes for additional project roots.
 
-### Single-writer verification, 2026-10-11
+### Single-writer guarantee
 
-The refactor passes 39 server/writer tests, 97 `MemoryService` tests, and
-`cargo check --all-targets`. Coverage includes shared queue admission,
-acceptance while a generation is paused, a global visibility barrier covering
-both stores, recovery after a queued delete, and retained immutable views.
-A board-write regression fails on the previous implementation with
-`acknowledged board post is absent from the published search snapshot`, passes
-with the new path, and fails again after restoring and recompiling the old
-implementation.
-
-The broader library suite has five hook-test failures that also reproduce
-on the pre-consolidation source: Claude/Codex session-start directory and
-session-summary formatting assertions, plus the OpenClaw legacy bootstrap
-composition test. These are existing failures, separate from the passing
-resident owner, queue, visibility, and recovery checks.
-
-Paired release measurements use isolated workspaces with 13,974 synthetic
-records across 14 seed batches. Query cells use 100 measured requests and
-five warmups at concurrency 1 and 10. Batch-write cells use batch size 128,
-eight seconds of writes, two warmups, and three repetitions.
-
-| Measurement | Previous two writers | One resident writer |
-|---|---:|---:|
-| Warm `/search` p50, concurrency 1 | 1.853 ms | 1.894 ms |
-| Warm `/search` p50, concurrency 10 | 8.980 ms | 9.172 ms |
-| Accepted batch-write records/s, median | 5,961.83 | 6,017.54 |
-| Published batch-write records/s, median including final flush | 2,786.94 | 2,902.42 |
-| Batch-write acknowledgement p99, median | 5.018 ms | 5.011 ms |
-
-These short synthetic measurements support comparable warm-query and staged
-write performance; they are not a new cold-start measurement of the real
-workspace or a long-duration throughput guarantee. All measured final writes
-were searchable after flush. Raw results are in
-`comparison/results/query-single-writer-{control,refactor}-2026-10-11.json`
-and `comparison/results/write-only-single-writer-batch8s-{control,refactor}-2026-10-11.json`.
-The earlier three-second write trials are retained in
-`comparison/results/write-only-single-writer-{control,refactor}-2026-10-11.json`;
-their batch results varied with whether a request crossed snapshot capture
-at the end of the measurement window.
+One resident process owns and writes each workspace store. Route all writes
+through that owner; do not run multiple server processes against the same
+workspace. The resident serializes mutations and publishes immutable search
+snapshots, allowing searches to continue on the last published generation
+while updates are applied. See [Index concurrency](index-concurrency.md) for
+the ownership and publication model, and [HTTP server benchmarks](http-server-benchmarks.md#single-writer-consolidation-verification-2026-10-11)
+for the dated correctness checks and paired measurements.
 
 Codex, Claude Code, Gemini, Agy, Muse, OpenClaw, and Hermes MCP memory tools
 use `POST /provider-memory/mcp/tools/call`. Each request supplies the
@@ -404,6 +344,65 @@ writes to the primary workspace; its `/provider-memory/search` request can
 include an optional `workspace` field. Configure their HTTP connection in each
 provider's plugin configuration file. For remote agents, use a separately
 secured tunnel or proxy.
+
+## Run remotely
+
+For a server that agents or people reach over a network, use a public HTTPS
+endpoint terminated by a reverse proxy or secure access gateway. Keep Membrick
+on a private interface or network, and do not expose its plain HTTP listener
+directly to the public internet. The proxy should restrict access to the
+intended users and protect the dashboard and API routes.
+
+For a proxy running on the same host, keep Membrick bound to loopback and
+configure API authentication in `.membrick/server.toml`:
+
+```toml
+bind = "127.0.0.1:8080"
+index = "/var/lib/membrick/memory-index"
+server_token_file = "/path/to/server-token"
+```
+
+See [Server configuration](server-configuration.md) for the available
+settings and their defaults.
+
+Start the server with this settings file (from a source checkout):
+
+```bash
+cargo run --release --bin server -- --settings /etc/membrick/server.toml
+```
+
+Configure the proxy's public route, such as
+`https://memories.example.com/dashboard`, to forward to
+`http://127.0.0.1:8080`.
+
+The proxy can authenticate users through OAuth/OIDC and forward an
+`Authorization: Bearer <token>` header to Membrick. Alternatively, a user can
+enter the Membrick API token in the dashboard's **API token** field. Protect
+both `/dashboard` and its `/api/*` requests; OAuth login at the proxy does not
+replace Membrick's API authentication. Choose a configured shared token or
+HS256 JWT authentication. When `jwt_secret` is set, JWT authentication takes
+precedence. The JWT must have a non-empty `sub`, a valid `exp`, and a subject
+matching the requested user scope. Membrick does not implement the OAuth login
+flow itself. See the
+[Observability guide](observability.md#remote-dashboard-access-and-oauth) for
+the dashboard-specific details.
+
+If the reverse proxy runs on another host or in a separate network namespace,
+bind Membrick to an interface reachable by that proxy and explicitly allow the
+non-loopback listener:
+
+```toml
+bind = "0.0.0.0:8080"
+allow_non_loopback = true
+server_token_file = "/path/to/server-token"
+```
+
+Restrict the listener with a firewall or private network so only the proxy can
+reach it. The server requires authentication for non-loopback listeners, and
+the listener itself uses HTTP; terminate TLS at the trusted proxy. For
+containerized or Kubernetes deployments, follow [Run Membrick with
+Docker](docker.md), which includes persistent storage, secret configuration,
+and a localhost-only default port mapping.
 
 ## Dashboard and observability
 

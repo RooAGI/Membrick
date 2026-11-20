@@ -88,7 +88,14 @@ pub struct CaptureReceipt {
 /// format host-specific context without reimplementing search policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSearchResponse {
+    /// ID accepted by `review_search` for this exact workspace search.
+    pub search_id: String,
     pub results: Vec<Value>,
+    /// Present when the query has two comparison operands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<Value>,
+    /// Guidance for evaluating these results with the workspace review tools.
+    pub feedback_guidance: String,
     #[serde(flatten)]
     pub metadata: serde_json::Map<String, Value>,
 }

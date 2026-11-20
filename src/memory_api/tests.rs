@@ -5905,7 +5905,7 @@ fn workspace_source_documents_cover_every_scanned_format() {
 /// service runs the project scan through its source-document callback, with
 /// the project's `ignore_paths` applied.
 fn open_scanned_workspace(root: &Path) -> MemoryService {
-    let ignore_paths = crate::adapters::project_ignore_paths(root);
+    let ignore_paths = crate::adapters::project_ignore_paths(root).unwrap();
     MemoryService::open_workspace(
         root,
         crate::integrations::mcp_index::SHARED_MEMORY_DIR,
