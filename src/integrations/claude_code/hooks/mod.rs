@@ -1334,13 +1334,19 @@ mod tests {
 
     #[test]
     fn relevant_excerpt_selects_matching_lines_and_enforces_byte_limit() {
+        // The "Request" line sits more than two lines from the match, so the
+        // +/-2 context window around the hit must not pull it in. The
+        // "Filler: three" line is adjacent to the hit and is expected in
+        // the excerpt (LoCoMo fix: the answer usually sits next to the
+        // matched line, not in it).
         let content = format!(
-            "Memory type: outcome\nRequest: update unrelated documentation\nResult: {}\nNoise: {}",
+            "Memory type: outcome\nRequest: update unrelated documentation\nFiller: one\nFiller: two\nFiller: three\nResult: {}\nNoise: {}",
             "Implemented LocalDistinctiveness routing for IndexStore",
             "x".repeat(2_000)
         );
         let excerpt = relevant_excerpt(&content, "IndexStore routing", &[], MAX_EXCERPT_BYTES);
         assert!(excerpt.contains("LocalDistinctiveness routing"));
+        assert!(excerpt.contains("Filler: three"));
         assert!(!excerpt.contains("unrelated documentation"));
         assert!(excerpt.len() <= MAX_EXCERPT_BYTES + 3);
     }

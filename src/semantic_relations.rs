@@ -1279,9 +1279,12 @@ fn make_claim_in_scope(
         object,
         source_doc_id: doc.doc_id.clone(),
         evidence: evidence.trim().to_string(),
-        effective_at: (doc.timestamp_kind() != crate::source::TimestampKind::SourceModified)
-            .then(|| doc.timestamp.clone())
-            .flatten(),
+        // Luyi 2026-11-20: file modification time counts as claim
+        // chronology, so a newer file supersedes an older one on the same
+        // canonical claim. Previously source_modified timestamps were
+        // excluded here, which left same-domain value changes unresolved
+        // as conflicts.
+        effective_at: doc.timestamp.clone(),
         scope,
         confidence: 0.85,
         assertion_status: None,

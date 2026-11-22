@@ -109,6 +109,66 @@ fn default_k() -> usize {
     5
 }
 
+/// LoCoMo session dates are written as "6:55 pm on 20 October, 2023".
+/// The shared search formatter only prefixes a session date it can parse
+/// as a timestamp, so normalize to RFC3339 at ingest (UTC; the source
+/// carries no timezone). Unparseable values pass through unchanged
+/// (fail-open: the prefix is dropped, as before). Restores the Sep 2026
+/// fix (289bfbe) that was lost when the server moved to the shared
+/// formatter: hits again carry an absolute date the reader can resolve
+/// relative expressions against.
+fn normalize_locomo_date(raw: &str) -> String {
+    let parsed = (|| {
+        let (time, date) = raw.split_once(" on ")?;
+        let (hour, rest) = time.split_once(':')?;
+        let (minute, ampm) = rest.split_once(' ')?;
+        let mut hour: u32 = hour.trim().parse().ok()?;
+        let minute: u32 = minute.trim().parse().ok()?;
+        hour = match ampm.trim().to_ascii_lowercase().as_str() {
+            "am" => {
+                if hour == 12 {
+                    0
+                } else {
+                    hour
+                }
+            }
+            "pm" => {
+                if hour == 12 {
+                    12
+                } else {
+                    hour + 12
+                }
+            }
+            _ => return None,
+        };
+        let mut parts = date.split_whitespace();
+        let day: u32 = parts.next()?.trim_end_matches(',').parse().ok()?;
+        let month = match parts.next()?.trim_end_matches(',') {
+            "January" => 1,
+            "February" => 2,
+            "March" => 3,
+            "April" => 4,
+            "May" => 5,
+            "June" => 6,
+            "July" => 7,
+            "August" => 8,
+            "September" => 9,
+            "October" => 10,
+            "November" => 11,
+            "December" => 12,
+            _ => return None,
+        };
+        let year: i32 = parts.next()?.trim_end_matches(',').parse().ok()?;
+        let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?
+            .and_hms_opt(hour, minute, 0)?;
+        Some(
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+    })();
+    parsed.unwrap_or_else(|| raw.to_string())
+}
+
 #[derive(Debug, Serialize)]
 struct Hit {
     session_id: String,
@@ -147,7 +207,7 @@ fn build_conv_index(conv: &LocomoConversation) -> Result<ConvIndex> {
             .conversation
             .get(&date_key)
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(normalize_locomo_date);
         let turns: Vec<LocomoTurn> = serde_json::from_value(
             conv.conversation
                 .get(&key)
@@ -156,6 +216,13 @@ fn build_conv_index(conv: &LocomoConversation) -> Result<ConvIndex> {
         )
         .with_context(|| format!("failed to parse turns for {key}"))?;
         let group_id = format!("{}::session_{n}", conv.sample_id);
+        // One document per session, mirroring production capture ("one
+        // searchable turn document" per session transcript, docs/agents.md):
+        // the excerpt window in `relevant_excerpt` can then show the turns
+        // around a match, where the answer usually sits. Per-turn docs made
+        // every hit a single line and let one session eat several top-k
+        // slots. Luyi 2026-11-21: LoCoMo single-hop retrieval fix.
+        let mut lines: Vec<String> = Vec::new();
         for (turn_idx, turn) in turns.iter().enumerate() {
             // Image turns carry their visual content in blip_caption/query;
             // index it inline so it is routable and reader-visible. One
@@ -178,34 +245,36 @@ fn build_conv_index(conv: &LocomoConversation) -> Result<ConvIndex> {
             {
                 line.push_str(&format!(" [image topic: {}]", q));
             }
-            let mut filters = BTreeMap::new();
-            filters.insert("memory_user_id".to_string(), LOCOMO_USER_ID.to_string());
-            filters.insert("timestamp_kind".to_string(), "session".to_string());
             let doc_id = format!("{group_id}::turn{turn_idx}");
             rel_turns.push(RelationTurn {
                 speaker: turn.speaker.clone(),
                 text: turn.text.clone(),
                 session_id: group_id.clone(),
                 turn_idx,
-                doc_id: doc_id.clone(),
+                doc_id,
                 session_date: date.clone(),
             });
-            docs.push(SourceDocument {
-                doc_id,
-                source: format!("locomo/{}/session/{n}/turn/{turn_idx}", conv.sample_id),
-                content: line.into(),
-                concept: "locomo-turn".to_string(),
-                group_id: Some(group_id.clone()),
-                filters,
-                headings: vec![format!("session:{group_id}")],
-                links: vec![],
-                timestamp: date.clone(),
-                doc_length: turn.text.len(),
-                author_agent: None,
-                key_phrases: Vec::new(),
-                key_phrase_extraction_hash: String::new(),
-            });
+            lines.push(line);
         }
+        let content = lines.join("\n");
+        let mut filters = BTreeMap::new();
+        filters.insert("memory_user_id".to_string(), LOCOMO_USER_ID.to_string());
+        filters.insert("timestamp_kind".to_string(), "session".to_string());
+        docs.push(SourceDocument {
+            doc_id: group_id.clone(),
+            source: format!("locomo/{}/session/{n}", conv.sample_id),
+            content: content.clone().into(),
+            concept: "locomo-session".to_string(),
+            group_id: Some(group_id.clone()),
+            filters,
+            headings: vec![format!("session:{group_id}")],
+            links: vec![],
+            timestamp: date.clone(),
+            doc_length: content.len(),
+            author_agent: None,
+            key_phrases: Vec::new(),
+            key_phrase_extraction_hash: String::new(),
+        });
     }
 
     // Production retrieval options: the benchmark measures the production
@@ -274,9 +343,8 @@ async fn health() -> Json<serde_json::Value> {
 /// Run one benchmark query through the agent's search entry point:
 /// [`MemoryService::search_with_filters`], the same function the MCP `search`
 /// tools call, with hits shaped by the shared `search_results` formatter so
-/// the reader sees exactly what an agent sees. The per-conversation session
-/// id scopes follow-up resolution and the conversational reranker; hits are
-/// matched turns only (no full-session expansion).
+/// the reader sees exactly what an agent sees. One document per session, so a
+/// hit is a session with a windowed excerpt around the matched lines.
 fn run_search(index: &ConvIndex, conv: &str, query: &str, k: usize) -> Result<Vec<Hit>> {
     let mut filters = BTreeMap::new();
     filters.insert("memory_user_id".to_string(), LOCOMO_USER_ID.to_string());
@@ -482,6 +550,28 @@ mod tests {
             searcher: Mutex::new(service),
             phrases_by_session: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn locomo_dates_normalize_to_rfc3339() {
+        assert_eq!(
+            normalize_locomo_date("6:55 pm on 20 October, 2023"),
+            "2023-10-20T18:55:00Z"
+        );
+        assert_eq!(
+            normalize_locomo_date("12:09 am on 13 September, 2023"),
+            "2023-09-13T00:09:00Z"
+        );
+        assert_eq!(
+            normalize_locomo_date("12:20 pm on 8 December, 2023"),
+            "2023-12-08T12:20:00Z"
+        );
+        assert_eq!(
+            normalize_locomo_date("1:14 pm on 25 May, 2023"),
+            "2023-05-25T13:14:00Z"
+        );
+        // Fail-open: unparseable values pass through unchanged.
+        assert_eq!(normalize_locomo_date("sometime"), "sometime");
     }
 
     #[test]

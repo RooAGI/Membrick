@@ -102,7 +102,7 @@ fn cli_query_and_llm_context_suppress_explicitly_superseded_markdown() {
 }
 
 #[test]
-fn source_modified_timestamps_do_not_resolve_conflicting_configuration_values() {
+fn source_modified_timestamps_resolve_conflicting_configuration_values() {
     let root = temp_dir();
     let old_path = root.join("decision-a.md");
     let new_path = root.join("decision-b.md");
@@ -148,12 +148,11 @@ fn source_modified_timestamps_do_not_resolve_conflicting_configuration_values() 
     let results = payload["results"].as_array().unwrap();
     assert_eq!(
         results.len(),
-        2,
-        "file modification times must not be treated as factual chronology: {payload:#}"
+        1,
+        "newer file modification time must supersede the older value: {payload:#}"
     );
-    assert!(results
-        .iter()
-        .all(|result| result["semantic_status"] == "conflicted"));
+    assert_eq!(results[0]["doc_id"], "decision-b.md");
+    assert_eq!(results[0]["semantic_status"], "current");
     assert!(payload["aggregation"].is_null());
 
     let output = Command::new(bin)
@@ -174,12 +173,16 @@ fn source_modified_timestamps_do_not_resolve_conflicting_configuration_values() 
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     let chunks = payload["top_chunks"].as_array().unwrap();
+    assert!(!chunks.is_empty());
     assert!(chunks
         .iter()
         .all(|chunk| chunk["doc_id"] != "decision-a.md"));
-    assert!(
-        chunks.is_empty(),
-        "automatic LLM context must not inject unresolved conflicting values: {payload:#}"
-    );
+    assert!(chunks.iter().any(|chunk| {
+        chunk["doc_id"] == "decision-b.md"
+            && chunk["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("retry attempts: 2")
+    }));
     let _ = fs::remove_dir_all(root);
 }
