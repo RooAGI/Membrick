@@ -514,32 +514,52 @@ pub(crate) fn relevant_excerpt(
     }
 
     let terms = excerpt_terms(query, matched_terms);
-    let mut lines = content
+    let lines: Vec<&str> = content
         .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut scored: Vec<(usize, usize)> = lines
+        .iter()
         .enumerate()
         .map(|(index, line)| {
             let lower = line.to_ascii_lowercase();
             let score = terms.iter().filter(|term| lower.contains(*term)).count();
-            (index, score, line.trim())
+            (index, score)
         })
-        .filter(|(_, _, line)| !line.is_empty())
-        .collect::<Vec<_>>();
-    lines.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        .collect();
+    scored.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
 
-    let mut selected = lines
+    let mut selected: Vec<usize> = scored
         .iter()
-        .filter(|(_, score, _)| *score > 0)
+        .filter(|(_, score)| *score > 0)
         .take(3)
-        .cloned()
-        .collect::<Vec<_>>();
+        .map(|(index, _)| *index)
+        .collect();
     if selected.is_empty() {
-        selected.extend(lines.into_iter().take(2));
+        selected = scored.iter().take(2).map(|(index, _)| *index).collect();
     }
-    selected.sort_by_key(|(index, _, _)| *index);
+    // Keep the lines around each hit as well. An answer usually sits in the
+    // turn next to the matched line, not in the matched line itself: a list
+    // of dishes, the reply to a question, the turn after a cue. Showing only
+    // matched lines shows the question and hides the answer. Luyi 2026-11-21
+    // (LoCoMo single-hop misses: the gold turn shares no words with the
+    // question, so it only ever appears as a neighbour).
+    const CONTEXT_LINES: usize = 2;
+    let mut wanted: Vec<usize> = selected
+        .iter()
+        .flat_map(|index| {
+            let start = index.saturating_sub(CONTEXT_LINES);
+            let end = (*index + CONTEXT_LINES).min(lines.len().saturating_sub(1));
+            start..=end
+        })
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
     truncate_utf8(
-        &selected
-            .into_iter()
-            .map(|(_, _, line)| line)
+        &wanted
+            .iter()
+            .map(|index| lines[*index])
             .collect::<Vec<_>>()
             .join("\n"),
         max_bytes,
@@ -717,11 +737,29 @@ mod tests {
         );
 
         assert!(excerpt.contains("7. Transcriptionist"), "{excerpt}");
+        assert!(excerpt.contains("1. Virtual customer service representative"), "{excerpt}");
+        assert!(excerpt.contains("8. Social media manager"), "{excerpt}");
+    }
+
+    #[test]
+    fn excerpt_keeps_the_lines_around_a_match() {
+        // The answer turn shares no words with the question; it only ever
+        // appears as a neighbour of a matched line. Luyi 2026-11-21.
+        let content = "Maria: We had dinner with my mother last night.\n\
+            Maria: It had lots of great things like salads, sandwiches, and homemade desserts.\n\
+            John: That sounds wonderful, Maria.\n\
+            Maria: My favorite is the banana split sundae.";
+        let excerpt = relevant_excerpt(
+            content,
+            "what kind of food did Maria have on her dinner spread with her mother",
+            &["maria".into(), "dinner".into(), "mother".into()],
+            4_000,
+        );
         assert!(
-            excerpt.contains("1. Virtual customer service representative"),
+            excerpt.contains("salads, sandwiches, and homemade desserts"),
             "{excerpt}"
         );
-        assert!(excerpt.contains("8. Social media manager"), "{excerpt}");
+        assert!(excerpt.contains("dinner with my mother"), "{excerpt}");
     }
 
     #[test]
