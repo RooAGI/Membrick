@@ -500,6 +500,121 @@ fn incremental_refresh_matches_full_rebuild_across_mutations() {
     });
 }
 
+/// Two successive refreshes through the RAM lexical path: the second carries
+/// forward the RAM index the first refresh built, so this exercises
+/// carry-forward of carry-forward. The final snapshot must still match a
+/// full rebuild bit-for-bit, and each earlier snapshot's lexical index must
+/// stay pinned to its own generation (a later edit must not leak into it).
+#[test]
+fn ram_lexical_index_survives_successive_refreshes_and_pins_old_snapshots() {
+    let base = differential_base_records();
+    let previous = SegmentedMemoryIndex::from_records_by_group_id_with_generation(&base, 7);
+
+    // First refresh: insert into alpha, edit a-1 in place.
+    let mut first_records = base.clone();
+    first_records.push(record("a-3", "alpha", "alpha five six", &["golf"]));
+    let edited = record("a-1", "alpha", "alpha one two JULIET", &["juliet"]);
+    *first_records
+        .iter_mut()
+        .find(|record| record.doc_id == "a-1")
+        .unwrap() = edited;
+    let first_map: HashMap<String, DocRecord> = first_records
+        .iter()
+        .map(|record| (record.doc_id.clone(), record.clone()))
+        .collect();
+    let first = SegmentedMemoryIndex::refresh_incremental(
+        &previous,
+        &first_map,
+        &HashSet::from(["a-1".to_string()]),
+        8,
+    )
+    .expect("first incremental refresh should succeed");
+
+    // The old snapshot's lexical index must not see the edit; the refreshed
+    // one must. This reads the tantivy index directly, not the merged query
+    // path, so a leaked commit cannot hide behind the postings.
+    let lexical_hits = |snapshot: &SegmentedMemoryIndex, query: &str| {
+        snapshot
+            .segments
+            .iter()
+            .find(|segment| segment.segment_id == "alpha")
+            .unwrap()
+            .index
+            .lexical_bm25_with_doc_filter(query, 5, None, None)
+            .unwrap()
+    };
+    assert!(
+        !lexical_hits(&previous, "juliet").contains_key("a-1"),
+        "old snapshot's lexical index must not see the edit"
+    );
+    assert!(
+        lexical_hits(&first, "juliet").contains_key("a-1"),
+        "refreshed snapshot's lexical index must see the edit"
+    );
+
+    // Second refresh: insert into beta, edit a-2, delete b-2. Carries forward
+    // the RAM index the first refresh built.
+    let mut second_records = first_records.clone();
+    second_records.push(record("b-3", "beta", "beta five six", &["india"]));
+    let edited = record("a-2", "alpha", "alpha three four KILO", &["kilo"]);
+    *second_records
+        .iter_mut()
+        .find(|record| record.doc_id == "a-2")
+        .unwrap() = edited;
+    second_records.retain(|record| record.doc_id != "b-2");
+    let second_map: HashMap<String, DocRecord> = second_records
+        .iter()
+        .map(|record| (record.doc_id.clone(), record.clone()))
+        .collect();
+    let second = SegmentedMemoryIndex::refresh_incremental(
+        &first,
+        &second_map,
+        &HashSet::from(["a-2".to_string()]),
+        9,
+    )
+    .expect("second incremental refresh should succeed");
+
+    // The final snapshot must match a full rebuild bit-for-bit.
+    let oracle = SegmentedMemoryIndex::from_records_by_group_id_with_generation(&second_records, 9);
+    assert_eq!(
+        format!("{:?}", second.manifest()),
+        format!("{:?}", oracle.manifest()),
+        "segment membership diverged"
+    );
+    assert_eq!(
+        normalized_catalog(&second.catalog),
+        normalized_catalog(&oracle.catalog),
+        "catalog summaries/profiles diverged"
+    );
+    assert_eq!(
+        second.catalog.derived_maps_snapshot(),
+        oracle.catalog.derived_maps_snapshot(),
+        "derived routing maps diverged"
+    );
+    for query in ["alpha", "juliet", "kilo", "india", "beta one two"] {
+        assert_eq!(
+            projected_results(&second.query(query, 5, 8)),
+            projected_results(&oracle.query(query, 5, 8)),
+            "query results diverged for query {query:?}"
+        );
+    }
+
+    // And the first snapshot still answers its own generation: the second
+    // edit is invisible to it, the first edit still finds its document.
+    assert!(
+        !lexical_hits(&first, "kilo").contains_key("a-2"),
+        "first snapshot's lexical index must not see the second edit"
+    );
+    assert!(
+        lexical_hits(&first, "juliet").contains_key("a-1"),
+        "first snapshot's lexical index must still see its own edit"
+    );
+    assert!(
+        lexical_hits(&second, "kilo").contains_key("a-2"),
+        "second snapshot's lexical index must see the second edit"
+    );
+}
+
 #[test]
 fn raw_constructor_rejects_duplicate_segment_ids() {
     let segments = vec![

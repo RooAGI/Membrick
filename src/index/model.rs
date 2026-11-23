@@ -605,6 +605,13 @@ pub struct MemoryIndex {
 pub(crate) struct LexicalIndex {
     pub(crate) index: Index,
     pub(crate) reader: IndexReader,
+    /// True when the tantivy index lives only in RAM (no on-disk directory).
+    /// A RAM index is carried forward across publications with a delta and an
+    /// in-RAM commit, so publishing never opens, garbage-collects, or fsyncs
+    /// a disk index. A disk-backed index (built at load) migrates to RAM on
+    /// its first refresh; the on-disk folder is only a load-time rebuild
+    /// target, never a per-publish write.
+    pub(crate) ram_only: bool,
     pub(crate) doc_id_f: Field,
     pub(crate) content_f: Field,
     pub(crate) headings_f: Field,
