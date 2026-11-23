@@ -3001,7 +3001,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn staged_http_add_flush_wait_and_user_isolation() {
+    async fn staged_http_search_publishes_pending_writes_and_user_isolation() {
         use tower::ServiceExt;
         let root = security_test_root();
         let mut state = provider_memory_test_state(&root);
@@ -3052,7 +3052,9 @@ mod tests {
             json!({"query":"quartz","user_id":"alice","top_k":10}),
         )
         .await;
-        assert!(before["data"].as_array().unwrap().is_empty());
+        // The first search after a write publishes the pending writes, so
+        // the staged write is already visible without an explicit flush.
+        assert_eq!(before["data"].as_array().unwrap().len(), 1);
         assert_eq!(
             post(&app, "/flush", json!({})).await.0,
             StatusCode::NO_CONTENT
