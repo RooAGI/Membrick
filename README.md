@@ -17,6 +17,8 @@
   <a href="https://github.com/RooAGI/Membrick/discussions">Discussions</a>
 </p>
 
+- MCP Registry name: `mcp-name: io.github.RooAGI/membrick`
+
 # Membrick: persistent memory for AI coding agents
 
 **One memory for every agent. 75% fewer tokens.**
