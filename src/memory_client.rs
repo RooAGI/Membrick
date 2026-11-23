@@ -522,7 +522,10 @@ impl Memory {
             if explicit_request_id {
                 retry_session_id(user_id, &request_id)
             } else {
-                generated_id()
+                // Bare adds share one stable session for this memory and
+                // user, so they land in the same segment instead of minting
+                // a fresh session (and segment) per call.
+                self.default_session_id(user_id)
             }
         });
         let request = AddRequest {
@@ -1174,6 +1177,30 @@ pub(crate) fn retry_session_id(user_id: &str, request_id: &str) -> String {
     digest.update((request_id.len() as u64).to_be_bytes());
     digest.update(request_id.as_bytes());
     format!("rest-retry-{:x}", digest.finalize())
+}
+
+/// Stable session for bare adds: when the caller supplies neither a session
+/// nor a request id, every add from this memory lands in the same session
+/// (hence the same segment) instead of minting a fresh session per call.
+/// Derived deterministically from the store identity and the user, so it is
+/// stable across client clones and reconnects, and distinct users and
+/// stores never share one. Explicit sessions and the request-id retry
+/// derivation are unaffected.
+impl Memory {
+    pub(crate) fn default_session_id(&self, user_id: &str) -> String {
+        use sha2::Digest;
+        let store = match &self.connection {
+            Connection::Project { root, .. } => root.to_string_lossy().into_owned(),
+            Connection::Remote { base_url, .. } => base_url.clone(),
+        };
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"membrick-default-session-v1\0");
+        digest.update((store.len() as u64).to_be_bytes());
+        digest.update(store.as_bytes());
+        digest.update((user_id.len() as u64).to_be_bytes());
+        digest.update(user_id.as_bytes());
+        format!("default-{:x}", digest.finalize())
+    }
 }
 fn path_segment(value: &str) -> String {
     value
