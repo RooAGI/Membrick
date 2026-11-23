@@ -365,31 +365,50 @@ pub(crate) fn build_memory_index_segment_with_shared_records(
     }
 }
 
-pub(crate) fn build_memory_index_segment_with_lexical_delta(
+/// Build a segment whose live lexical index lives only in RAM. The previous
+/// snapshot's segment index is carried forward with a delta and an in-RAM
+/// commit, so a publication never opens, garbage-collects, or fsyncs a disk
+/// index. A disk-backed previous index (built at load) migrates to a fresh
+/// RAM index once; later refreshes carry that RAM index forward. A brand-new
+/// segment (no previous) is populated in RAM from its records.
+///
+/// The segment still holds its stable folder under `lexical_root`: the
+/// folder is the segment's on-disk home for the manifest and for load-time
+/// rebuilds, and it is created here so the "one lexical folder per live
+/// segment" invariant holds. Its content is not written on the publish path;
+/// load rebuilds it from the records, which are the truth.
+pub(crate) fn build_memory_index_segment_with_ram_lexical(
     segment_id: String,
     mut segment_records: Vec<Arc<DocRecord>>,
-    lexical_root: Option<&Path>,
+    previous: Option<&MemoryIndexSegment>,
     changed_doc_ids: HashSet<String>,
     removed_doc_ids: HashSet<String>,
-    rebuild: bool,
+    lexical_root: Option<&Path>,
 ) -> MemoryIndexSegment {
     segment_records.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
     let doc_ids = segment_records
         .iter()
         .map(|record| record.doc_id.clone())
         .collect::<Vec<_>>();
-    let lexical_dir =
-        lexical_root.map(|root| SegmentLexicalDir::hold(segment_lexical_dir(root, &segment_id)));
-    let index = Arc::new(MemoryIndex::from_shared_records_with_lexical_delta(
-        segment_records,
-        lexical_dir.as_deref().map(SegmentLexicalDir::path),
-        changed_doc_ids,
-        removed_doc_ids,
-        rebuild,
-        false,
-        false,
-        false,
-    ));
+    let lexical_dir = lexical_root.map(|root| {
+        let dir = segment_lexical_dir(root, &segment_id);
+        let _ = std::fs::create_dir_all(&dir);
+        SegmentLexicalDir::hold(dir)
+    });
+    let index = Arc::new(match previous.and_then(|segment| segment.index.lexical.as_ref()) {
+        Some(previous_lexical) => MemoryIndex::from_shared_records_with_previous_lexical(
+            segment_records,
+            previous_lexical,
+            changed_doc_ids,
+            removed_doc_ids,
+            false,
+            false,
+            false,
+        ),
+        None => MemoryIndex::from_shared_records_with_lexical_dir(
+            segment_records, None, false, false, false,
+        ),
+    });
     MemoryIndexSegment {
         segment_id,
         doc_ids,

@@ -65,6 +65,11 @@ enum Command {
     ReplaceWorkspace(Vec<crate::SourceDocument>, Reply),
     Mutate(Mutation, Reply),
     Flush(Reply),
+    /// Light publication: makes pending writes searchable without a
+    /// checkpoint. Used by the search handler so the first search after a
+    /// write sees it. Journaled adds are durable before admission returns,
+    /// so visibility needs only a published view, not a checkpoint.
+    Publish(Reply),
 }
 
 // A target is a facade over the same queue, never a second mutable owner or
@@ -528,6 +533,25 @@ fn run_writer(
                             let _ = reply.send(Err(anyhow::anyhow!("memory writer poisoned")));
                         }
                     }
+                    Command::Publish(reply) => {
+                        if barriers.len() >= QUEUE_CAPACITY {
+                            let _ = reply.send(Err(PendingWriteLimit.into()));
+                        } else if let Ok(owner) = service.read() {
+                            let mut revisions = [0; 2];
+                            for &target in &targets {
+                                revisions[target.slot()] =
+                                    owner.memory_store(target).publication_revisions().0;
+                            }
+                            barriers.push(BarrierReply {
+                                revisions,
+                                require_checkpoint: false,
+                                work: BarrierWork::None,
+                                reply,
+                            });
+                        } else {
+                            let _ = reply.send(Err(anyhow::anyhow!("memory writer poisoned")));
+                        }
+                    }
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -936,6 +960,20 @@ impl StagedWriter {
             .map_err(Self::status)?;
         Ok(())
     }
+    /// Light publication: makes pending writes searchable without a
+    /// checkpoint. Used by the search handler so the first search after a
+    /// write sees it. Resolves as soon as the publication covering the
+    /// current accepted revision is visible; if nothing is pending, the
+    /// barrier resolves on the next writer pass with no build.
+    pub(super) async fn publish(&self) -> Result<(), StatusCode> {
+        let (reply, receive) = oneshot::channel();
+        self.send(Command::Publish(reply))?;
+        receive
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .map_err(Self::status)?;
+        Ok(())
+    }
     pub(super) async fn replace_workspace_documents(
         &self,
         documents: Vec<crate::SourceDocument>,
@@ -1245,6 +1283,47 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_barrier_makes_staged_write_searchable_without_checkpoint() {
+        let owner = owner();
+        let worker = StagedWriter::start_with_schedule(
+            owner.clone(),
+            WriteSchedule {
+                refresh_interval: Duration::from_secs(30),
+                batch_size: 10000,
+                checkpoint_interval: Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        worker.add(vec![request(1)], false).await.unwrap();
+        assert_eq!(
+            worker
+                .read_view()
+                .unwrap()
+                .search_cached(query())
+                .unwrap()
+                .data
+                .len(),
+            0
+        );
+        let (_, _, durable_before) = owner.read().unwrap().publication_revisions();
+        worker.publish().await.unwrap();
+        assert_eq!(
+            worker
+                .read_view()
+                .unwrap()
+                .search_cached(query())
+                .unwrap()
+                .data
+                .len(),
+            1
+        );
+        let (accepted, published, durable) = owner.read().unwrap().publication_revisions();
+        assert_eq!(published, accepted);
+        assert_eq!(durable, durable_before);
+        assert_eq!(owner.read().unwrap().pending_document_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

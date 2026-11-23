@@ -491,13 +491,13 @@ impl SegmentedMemoryIndex {
                         changed_in_segment.insert(doc_id.clone());
                     }
                 }
-                segments.push(build_memory_index_segment_with_lexical_delta(
+                segments.push(build_memory_index_segment_with_ram_lexical(
                     segment.segment_id.clone(),
                     segment_records,
-                    lexical_root,
+                    Some(segment),
                     changed_in_segment,
                     removed_from_segment,
-                    false,
+                    lexical_root,
                 ));
             }
         }
@@ -510,13 +510,13 @@ impl SegmentedMemoryIndex {
                 .into_iter()
                 .map(|id| Arc::clone(&records[id]))
                 .collect();
-            segments.push(build_memory_index_segment_with_lexical_delta(
+            segments.push(build_memory_index_segment_with_ram_lexical(
                 segment_id.to_string(),
                 segment_records,
-                lexical_root,
+                None,
                 changed_doc_ids,
                 HashSet::new(),
-                true,
+                lexical_root,
             ));
         }
         segments.sort_unstable_by(|a, b| a.segment_id.cmp(&b.segment_id));
