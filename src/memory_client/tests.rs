@@ -1074,3 +1074,82 @@ fn remote_get_list_update_delete_decode_results_and_send_ownership_context() {
     assert!(observed[3].0.starts_with("DELETE /v1/memories/memory-1?"));
     assert!(observed[3].0.contains("user_id=alice"));
 }
+
+#[test]
+fn default_session_id_is_stable_per_user_and_store() {
+    let client = Memory::remote("http://127.0.0.1:9", MemoryOptions::default()).unwrap();
+    let first = client.default_session_id("alice");
+    assert!(first.starts_with("default-"), "default session must be marked: {first}");
+    assert_eq!(first, client.default_session_id("alice"));
+    assert_eq!(first, client.clone().default_session_id("alice"));
+    assert_ne!(first, client.default_session_id("bob"));
+    assert_ne!(first, retry_session_id("alice", "some-request"));
+    let other_store =
+        Memory::remote("http://127.0.0.1:10", MemoryOptions::default()).unwrap();
+    assert_ne!(first, other_store.default_session_id("alice"));
+}
+
+#[tokio::test]
+async fn bare_adds_reuse_one_session_over_resident_ipc() {
+    let root = temp_store().join("bare-adds-reuse-session");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let client = Memory::init_async(&root).await.unwrap();
+    let service = Arc::new(Mutex::new(crate::MemoryService::in_memory(
+        crate::PipelineOptions::default(),
+    )));
+    let app = Router::new()
+        .route("/v1/memories", post(add_handler))
+        .with_state(service);
+    let shutdown_root = root.clone();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let resident = tokio::spawn(async move {
+        crate::local_ipc::serve(
+            app,
+            &shutdown_root,
+            async move {
+                let _ = stopped.await;
+                None
+            },
+            None,
+            false,
+            None,
+        )
+        .await
+    });
+
+    let record_path = crate::local_ipc::resident_record_path(&root);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if record_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("test resident should publish its IPC socket record");
+
+    let first = client
+        .add_async(vec![message("Alice prefers tea")], "alice", AddOptions::default())
+        .await
+        .expect("first bare add should succeed");
+    let second = client
+        .add_async(vec![message("Alice prefers coffee")], "alice", AddOptions::default())
+        .await
+        .expect("second bare add should succeed");
+    assert_eq!(
+        first.session_id, second.session_id,
+        "bare adds from one memory must reuse the same session"
+    );
+    assert_eq!(
+        first.session_id,
+        client.default_session_id("alice"),
+        "the reused session must be the memory's default session"
+    );
+
+    client.close();
+    shutdown.send(()).unwrap();
+    resident.await.unwrap().unwrap();
+    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+}

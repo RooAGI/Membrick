@@ -156,6 +156,35 @@ fn build_doc_scoring_tokens(
     (topics, doc_types, claims)
 }
 
+/// The tantivy field handles a lexical document is written with. Shared by
+/// the on-disk builder and the in-RAM refresh so both write identical
+/// documents and cannot drift apart.
+struct LexicalFields {
+    doc_id_f: Field,
+    content_f: Field,
+    headings_f: Field,
+    terms_f: Field,
+    entities_f: Field,
+    temporal_f: Field,
+    tags_f: Field,
+    subword_f: Field,
+}
+
+impl LexicalFields {
+    fn from_lexical(lex: &LexicalIndex) -> Self {
+        Self {
+            doc_id_f: lex.doc_id_f,
+            content_f: lex.content_f,
+            headings_f: lex.headings_f,
+            terms_f: lex.terms_f,
+            entities_f: lex.entities_f,
+            temporal_f: lex.temporal_f,
+            tags_f: lex.tags_f,
+            subword_f: lex.subword_f,
+        }
+    }
+}
+
 impl MemoryIndex {
     pub fn from_records(records: Vec<DocRecord>) -> Self {
         Self::from_records_with_lexical_dir(records, None, false, false, false)
@@ -171,6 +200,7 @@ impl MemoryIndex {
         Self::from_records_internal(
             records.into_iter().map(std::sync::Arc::new).collect(),
             lexical_dir,
+            None,
             None,
             None,
             text_rerank_ngram,
@@ -191,18 +221,18 @@ impl MemoryIndex {
             lexical_dir,
             None,
             None,
+            None,
             text_rerank_ngram,
             text_rerank_lcs,
             claim_scoring,
         )
     }
 
-    pub(crate) fn from_shared_records_with_lexical_delta(
+    pub(crate) fn from_shared_records_with_previous_lexical(
         records: Vec<std::sync::Arc<DocRecord>>,
-        lexical_dir: Option<&Path>,
+        previous_lexical: &LexicalIndex,
         changed_doc_ids: std::collections::HashSet<String>,
         removed_doc_ids: std::collections::HashSet<String>,
-        rebuild: bool,
         text_rerank_ngram: bool,
         text_rerank_lcs: bool,
         claim_scoring: bool,
@@ -213,9 +243,10 @@ impl MemoryIndex {
         };
         Self::from_records_internal(
             records,
-            lexical_dir,
             None,
-            Some((delta, rebuild)),
+            None,
+            Some((delta, false)),
+            Some(previous_lexical),
             text_rerank_ngram,
             text_rerank_lcs,
             claim_scoring,
@@ -235,6 +266,7 @@ impl MemoryIndex {
             None,
             Some(semantic_aggregate),
             None,
+            None,
             text_rerank_ngram,
             text_rerank_lcs,
             claim_scoring,
@@ -246,6 +278,7 @@ impl MemoryIndex {
         lexical_dir: Option<&Path>,
         semantic_aggregate: Option<SemanticAggregate>,
         lexical_delta: Option<(LexicalIndexDelta, bool)>,
+        previous_lexical: Option<&LexicalIndex>,
         text_rerank_ngram: bool,
         text_rerank_lcs: bool,
         claim_scoring: bool,
@@ -634,12 +667,27 @@ impl MemoryIndex {
             });
         }
 
-        let lexical = match Self::build_lexical_index(&docs, lexical_dir, lexical_delta) {
-            Ok(index) => Some(index),
-            Err(err) => {
-                tracing::warn!("lexical BM25 index disabled: {}", err);
-                None
+        // A carried-forward RAM index is refreshed in memory (delta + in-RAM
+        // commit, no disk write). Every other path builds through the
+        // on-disk/RAM builder below. A failed lexical build only disables
+        // BM25 for this segment; the in-memory postings still answer.
+        let lexical = match previous_lexical {
+            Some(previous) => {
+                match Self::refresh_lexical_index_in_ram(previous, &docs, lexical_delta) {
+                    Ok(index) => Some(index),
+                    Err(err) => {
+                        tracing::warn!("lexical BM25 index disabled: {}", err);
+                        None
+                    }
+                }
             }
+            None => match Self::build_lexical_index(&docs, lexical_dir, lexical_delta) {
+                Ok(index) => Some(index),
+                Err(err) => {
+                    tracing::warn!("lexical BM25 index disabled: {}", err);
+                    None
+                }
+            },
         };
 
         let (doc_topic_tokens, doc_type_tokens, doc_claim_tokens) =
@@ -979,6 +1027,146 @@ impl MemoryIndex {
         Ok(())
     }
 
+    /// Semantic tags for one document: the `semantic_tag` key phrases (Luyi
+    /// 2026-10-08: "use key_phrases for semantic tags"), sorted and deduped.
+    fn semantic_tags_for(doc: &DocRecord) -> Vec<String> {
+        let mut tags: Vec<String> = doc
+            .key_phrases
+            .iter()
+            .filter(|kp| kp.kind == "semantic_tag")
+            .map(|kp| kp.text.clone())
+            .collect();
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    /// Write one document into a tantivy writer with the field layout the
+    /// on-disk builder uses. The caller deletes a changed document first
+    /// (delete-then-add), so the index holds exactly one entry per doc_id,
+    /// the same as a full rebuild.
+    fn add_lexical_document(
+        writer: &mut tantivy::IndexWriter,
+        doc: &DocRecord,
+        tags: &[String],
+        fields: &LexicalFields,
+    ) -> Result<()> {
+        let headings_text = doc
+            .section_chunks
+            .iter()
+            .map(|c| c.heading.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let terms_text = doc
+            .section_chunks
+            .iter()
+            .flat_map(|c| c.important_terms.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let entities_text = doc
+            .section_chunks
+            .iter()
+            .flat_map(|c| c.key_entities.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let content_text = lexical_content_text(doc);
+        // Luyi 2026-10-11: DO NOT inject tags into content field.
+        // Categories ("leisure", "travel") in content let unrelated docs
+        // match. Tags stay in the tags field only, where they chain via the
+        // category without polluting lexical matching.
+        let temporal_text = doc.temporal_terms.join(" ");
+        let tags_text = tags.join(" ");
+        writer.add_document(doc!(
+            fields.doc_id_f => doc.doc_id.clone(),
+            fields.content_f => content_text,
+            fields.headings_f => headings_text,
+            fields.terms_f => terms_text,
+            fields.entities_f => entities_text,
+            fields.temporal_f => temporal_text,
+            fields.tags_f => tags_text,
+            fields.subword_f => content_text
+        ))?;
+        Ok(())
+    }
+
+    /// Refresh a segment's lexical index in RAM from the previous snapshot's
+    /// index, applying only the delta. The previous index is cloned (a
+    /// tantivy `Index` is cheap to clone), a writer applies deletes plus
+    /// changed documents, and the commit lands in the RAM directory only:
+    /// no index open, no directory scan, no fsync. Readers on the previous
+    /// snapshot stay pinned to their generation (manual reload policy), so
+    /// the old snapshot keeps answering pre-refresh results.
+    ///
+    /// Only pure additions can be carried forward exactly. Deleted documents
+    /// linger in a tantivy index until a merge purges them, and they still
+    /// count toward BM25 statistics: `total_num_tokens` counts "all
+    /// documents (including deleted documents)" and term doc_freqs include
+    /// deleted postings, so a delta that deletes or rewrites a document
+    /// would score differently from a full rebuild. A delta with any removal
+    /// or rewrite therefore rebuilds the RAM index from the full record set
+    /// instead, which is exactly a full rebuild. A disk-backed previous
+    /// index (built at load) migrates the same way, once; later refreshes
+    /// carry that RAM index forward.
+    fn refresh_lexical_index_in_ram(
+        previous: &LexicalIndex,
+        docs: &HashMap<String, std::sync::Arc<DocRecord>>,
+        lexical_delta: Option<(LexicalIndexDelta, bool)>,
+    ) -> Result<LexicalIndex> {
+        if !previous.ram_only {
+            return Self::build_lexical_index(docs, None, None);
+        }
+        let Some((delta, _)) = lexical_delta else {
+            return Self::build_lexical_index(docs, None, None);
+        };
+        if !delta.removed_doc_ids.is_empty() {
+            return Self::build_lexical_index(docs, None, None);
+        }
+        // A changed doc_id already present in the index is a rewrite, not a
+        // new document: its old entry would linger as a deleted doc and skew
+        // the statistics. Only when every changed doc_id is absent is the
+        // delta pure additions.
+        let searcher = previous.reader.searcher();
+        for doc_id in &delta.changed_doc_ids {
+            let term = Term::from_field_text(previous.doc_id_f, doc_id);
+            if searcher.doc_freq(&term).unwrap_or(0) > 0 {
+                return Self::build_lexical_index(docs, None, None);
+            }
+        }
+        let index = previous.index.clone();
+        let fields = LexicalFields::from_lexical(previous);
+        let mut writer = index.writer(50_000_000)?;
+        writer.garbage_collect_files().wait()?;
+        let mut changed: Vec<&String> = delta.changed_doc_ids.iter().collect();
+        changed.sort();
+        for doc_id in changed {
+            let Some(doc) = docs.get(doc_id) else {
+                continue;
+            };
+            let tags = Self::semantic_tags_for(doc);
+            Self::add_lexical_document(&mut writer, doc, &tags, &fields)?;
+        }
+        writer.commit()?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        Ok(LexicalIndex {
+            index,
+            reader,
+            doc_id_f: fields.doc_id_f,
+            content_f: fields.content_f,
+            headings_f: fields.headings_f,
+            terms_f: fields.terms_f,
+            entities_f: fields.entities_f,
+            temporal_f: fields.temporal_f,
+            tags_f: fields.tags_f,
+            subword_f: fields.subword_f,
+            is_synthetic_f: previous.is_synthetic_f,
+            tag_links_f: previous.tag_links_f,
+            ram_only: true,
+        })
+    }
+
     fn build_lexical_index(
         docs: &HashMap<String, std::sync::Arc<DocRecord>>,
         lexical_dir: Option<&Path>,
@@ -1022,20 +1210,8 @@ impl MemoryIndex {
         // KeyPhrase entries with kind="semantic_tag" in the DocRecord.
         // Single truth: SourceDocument (via DocRecord.key_phrases) is the
         // basic unit; no separate derivation path.
-        let tags_per_doc: Vec<Vec<String>> = ordered
-            .iter()
-            .map(|doc| {
-                let mut tags: Vec<String> = doc
-                    .key_phrases
-                    .iter()
-                    .filter(|kp| kp.kind == "semantic_tag")
-                    .map(|kp| kp.text.clone())
-                    .collect();
-                tags.sort();
-                tags.dedup();
-                tags
-            })
-            .collect();
+        let tags_per_doc: Vec<Vec<String>> =
+            ordered.iter().map(|doc| Self::semantic_tags_for(doc)).collect();
         let index = if let Some(dir) = lexical_dir {
             // Index open, schema migration, and population run through the
             // shared guarded writer entry point.
@@ -1089,6 +1265,16 @@ impl MemoryIndex {
                     for doc_id in deletes {
                         writer.delete_term(Term::from_field_text(doc_id_f, doc_id));
                     }
+                    let fields = LexicalFields {
+                        doc_id_f,
+                        content_f,
+                        headings_f,
+                        terms_f,
+                        entities_f,
+                        temporal_f,
+                        tags_f,
+                        subword_f,
+                    };
                     for (doc, tags) in ordered.iter().zip(tags_per_doc.iter()) {
                         if !rebuild
                             && lexical_delta.as_ref().is_some_and(|(delta, _)| {
@@ -1097,33 +1283,7 @@ impl MemoryIndex {
                         {
                             continue;
                         }
-                        let headings_text = doc
-                            .section_chunks
-                            .iter()
-                            .map(|c| c.heading.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let terms_text = doc
-                            .section_chunks
-                            .iter()
-                            .flat_map(|c| c.important_terms.iter().map(String::as_str))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let entities_text = doc
-                            .section_chunks
-                            .iter()
-                            .flat_map(|c| c.key_entities.iter().map(String::as_str))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        let content_text = lexical_content_text(doc);
-                        // Luyi 2026-10-11: DO NOT inject tags into content field.
-                        // Categories ("leisure", "travel") in content let
-                        // unrelated docs match. Tags stay in the tags field
-                        // only, where they chain via the category without
-                        // polluting lexical matching.
-                        let temporal_text = doc.temporal_terms.join(" ");
-                        let tags_text = tags.join(" ");
-                        writer.add_document(doc!(doc_id_f => doc.doc_id.clone(), content_f => content_text, headings_f => headings_text, terms_f => terms_text, entities_f => entities_text, temporal_f => temporal_text, tags_f => tags_text, subword_f => content_text))?;
+                        Self::add_lexical_document(writer, doc, tags, &fields)?;
                     }
                     Ok(())
                 },
@@ -1179,6 +1339,7 @@ impl MemoryIndex {
         Ok(LexicalIndex {
             index,
             reader,
+            ram_only: lexical_dir.is_none(),
             doc_id_f,
             content_f,
             headings_f,

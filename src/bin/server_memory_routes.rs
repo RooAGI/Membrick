@@ -248,6 +248,24 @@ pub(super) async fn search(
     }
     if let Some(worker) = &state.staged_writer {
         let started = Instant::now();
+        // First search after a write publishes the pending writes (light:
+        // publication only, no checkpoint) so the search sees them. Idle
+        // searches skip this entirely; the pending check is a cheap read.
+        let has_pending = state
+            .service
+            .read()
+            .map(|service| {
+                let store = service.memory_store(MemoryStore::Captured);
+                store.pending_document_count() > 0 || store.has_unpublished_writes()
+            })
+            .unwrap_or(false);
+        if has_pending {
+            if let Err(error) = worker.publish().await {
+                tracing::warn!(
+                    "search-triggered publish failed, continuing with the published snapshot: {error}"
+                );
+            }
+        }
         let result = worker
             .read_view()
             .and_then(|view| match request.filter_ast.as_ref() {
