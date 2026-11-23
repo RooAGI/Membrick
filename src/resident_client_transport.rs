@@ -164,10 +164,17 @@ pub(crate) fn request_with_transport_safe(
                         if let Some(owner) = startup_owner.as_ref() {
                             remove_startup_marker_if_owned(&owner.marker, &owner.token);
                         }
-                        return Err(ClientTransportError::BeforeDispatch(format!(
-                            "resident exited during startup: {}",
-                            startup_exit_error(status)
-                        )));
+                        // The child exits at once when another resident already
+                        // owns the workspace; use that resident if it answers.
+                        return match call() {
+                            Err(ClientTransportError::BeforeDispatch(_)) => {
+                                Err(ClientTransportError::BeforeDispatch(format!(
+                                    "resident exited during startup: {}",
+                                    startup_exit_error(status)
+                                )))
+                            }
+                            result => result,
+                        };
                     }
                     Some(Err(error)) => {
                         if let Some(owner) = startup_owner.take() {
@@ -303,10 +310,25 @@ pub(crate) async fn request_with_transport_async(
                 };
                 match child_status {
                     Some(Ok(Some(status))) => {
-                        return Err(ClientTransportError::ResidentUnavailable(format!(
-                            "resident exited during startup: {}",
-                            startup_exit_error(status)
-                        )));
+                        // The child exits at once when another resident already
+                        // owns the workspace; use that resident if it answers.
+                        return match request_for_memory_client(
+                            &root,
+                            &path,
+                            body.clone(),
+                            method.clone(),
+                            may_mutate,
+                        )
+                        .await
+                        {
+                            Err(ClientTransportError::BeforeDispatch(_)) => {
+                                Err(ClientTransportError::ResidentUnavailable(format!(
+                                    "resident exited during startup: {}",
+                                    startup_exit_error(status)
+                                )))
+                            }
+                            result => result,
+                        };
                     }
                     Some(Err(error)) => {
                         if let Some(owner) = owner.take() {
@@ -421,9 +443,11 @@ pub(crate) async fn request_for_memory_client(
             let bind = tokio::task::spawn_blocking(move || configured_http_bind(&settings_root))
                 .await
                 .map_err(|error| ClientTransportError::BeforeDispatch(error.to_string()))?;
-            let bind = bind.map_err(|error| ClientTransportError::BeforeDispatch(format!(
-                "cannot load resident HTTP settings: {error:#}"
-            )))?;
+            let bind = bind.map_err(|error| {
+                ClientTransportError::BeforeDispatch(format!(
+                    "cannot load resident HTTP settings: {error:#}"
+                ))
+            })?;
             let Some(bind) = bind else {
                 return Err(ClientTransportError::BeforeDispatch(ipc_error));
             };

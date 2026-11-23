@@ -116,6 +116,103 @@ async fn async_memory_api_covers_operations_and_keeps_request_and_session_identi
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_loading_resident_is_found_at_once_and_answers_when_loaded() {
+    let root = temp_store().join("loading-resident-ipc");
+    std::fs::create_dir_all(&root).unwrap();
+    let client = Memory::init_async(&root).await.unwrap();
+    let service = Arc::new(Mutex::new(crate::MemoryService::in_memory(
+        crate::PipelineOptions::default(),
+    )));
+    let app = Router::new()
+        .route("/v1/memories", post(add_handler))
+        .with_state(service.clone());
+    let (loaded, load) = crate::local_ipc::resident_load_channel();
+    let shutdown_root = root.clone();
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let gate = crate::local_ipc::loading_gate_router(load.clone());
+    let resident = tokio::spawn(async move {
+        crate::local_ipc::serve(
+            gate,
+            &shutdown_root,
+            async move {
+                let _ = stopped.await;
+                None
+            },
+            None,
+            false,
+            None,
+            Some(load),
+        )
+        .await
+    });
+
+    // While the stores still load, the resident has published its socket, so
+    // a client connects to it rather than starting a second resident.
+    let record_path = crate::local_ipc::resident_record_path(&root);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !record_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a loading resident should publish its IPC socket record");
+
+    let add = tokio::spawn(async move {
+        client
+            .add_async(
+                vec![message("Alice prefers tea")],
+                "alice",
+                AddOptions {
+                    request_id: Some("loading-resident-request".into()),
+                    session_id: Some("loading-resident-session".into()),
+                    ..AddOptions::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !add.is_finished(),
+        "the request waits while the stores load"
+    );
+    assert!(
+        service
+            .lock()
+            .await
+            .diagnostic_records()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "nothing is applied before loading ends"
+    );
+
+    loaded.send_replace(crate::local_ipc::ResidentLoad::Ready(app));
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(10), add)
+        .await
+        .expect("the request completes once loaded")
+        .unwrap()
+        .expect("the add succeeds over IPC");
+    assert_eq!(receipt.request_id, "loading-resident-request");
+    assert_eq!(
+        service
+            .lock()
+            .await
+            .diagnostic_records()
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "the add was applied exactly once"
+    );
+
+    shutdown.send(()).unwrap();
+    resident.await.unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn async_project_client_sends_add_over_resident_ipc() {
     let root = temp_store().join("async-project-ipc");
     std::fs::create_dir_all(&root).unwrap();
@@ -142,6 +239,7 @@ async fn async_project_client_sends_add_over_resident_ipc() {
             },
             None,
             false,
+            None,
             None,
         )
         .await
@@ -325,7 +423,10 @@ async fn workspace_tool_handler(
 async fn workspace_search_and_review_share_provider_and_workspace_context() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
-        .route("/provider-memory/mcp/tools/call", post(workspace_tool_handler))
+        .route(
+            "/provider-memory/mcp/tools/call",
+            post(workspace_tool_handler),
+        )
         .with_state(calls.clone());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -383,7 +484,10 @@ async fn workspace_search_and_review_share_provider_and_workspace_context() {
     assert_eq!(calls[0]["provider"], "codex");
     assert_eq!(calls[0]["session_id"], "codex:session-1");
     assert_eq!(calls[0]["tool"], "search");
-    assert_eq!(calls[0]["arguments"]["query"], "where is the deployment guide");
+    assert_eq!(
+        calls[0]["arguments"]["query"],
+        "where is the deployment guide"
+    );
     assert_eq!(calls[0]["arguments"]["top_k"], 7);
     assert_eq!(calls[1]["arguments"]["search_id"], "workspace:search-1");
     assert_eq!(calls[2]["arguments"]["cursor"], "next-page");
