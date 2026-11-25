@@ -142,6 +142,7 @@ async fn a_loading_resident_is_found_at_once_and_answers_when_loaded() {
             false,
             None,
             Some(load),
+            None,
         )
         .await
     });
@@ -239,6 +240,7 @@ async fn async_project_client_sends_add_over_resident_ipc() {
             },
             None,
             false,
+            None,
             None,
             None,
         )
@@ -1217,6 +1219,7 @@ async fn bare_adds_reuse_one_session_over_resident_ipc() {
             },
             None,
             false,
+            None,
             None,
             None,
         )
