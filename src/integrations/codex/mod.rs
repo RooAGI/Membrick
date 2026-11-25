@@ -301,6 +301,58 @@ pub fn install_project_config(root: &Path) -> Result<PathBuf> {
     Ok(config_path)
 }
 
+/// Install the shared Membrick skill where Codex discovers project skills.
+/// Keep an existing customized skill intact rather than overwriting user work.
+pub fn install_memory_skill(root: &Path) -> Result<PathBuf> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", root.display()))?;
+    let skill_path = root.join(".agents/skills/membrick-memory/SKILL.md");
+    if let Some(parent) = skill_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let generated = include_str!("../agy/skill.md");
+    match fs::read_to_string(&skill_path) {
+        Ok(existing) if existing == generated => return Ok(skill_path),
+        Ok(_) => anyhow::bail!(
+            "refusing to overwrite existing Codex skill {}; it appears user-modified",
+            skill_path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", skill_path.display()))
+        }
+    }
+    fs::write(&skill_path, generated)
+        .with_context(|| format!("failed to write {}", skill_path.display()))?;
+    Ok(skill_path)
+}
+
+fn remove_memory_skill(root: &Path) -> Result<()> {
+    let skill_dir = root.join(".agents/skills/membrick-memory");
+    let skill_path = skill_dir.join("SKILL.md");
+    if !skill_path.exists() {
+        return Ok(());
+    }
+    let existing = fs::read_to_string(&skill_path)
+        .with_context(|| format!("failed to read {}", skill_path.display()))?;
+    if existing != include_str!("../agy/skill.md") {
+        return Ok(());
+    }
+    fs::remove_file(&skill_path)
+        .with_context(|| format!("failed to remove {}", skill_path.display()))?;
+    match fs::remove_dir(&skill_dir) {
+        Ok(()) => {}
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to remove {}", skill_dir.display()))
+        }
+    }
+    Ok(())
+}
+
 /// Delimiters so the block can be found and replaced without touching the rest of
 /// a file the user also writes in.
 const POLICY_START: &str = "<!-- membrick:memory-policy:start -->";
@@ -380,6 +432,7 @@ pub fn uninstall(
     }
 
     remove_memory_policy(&root.join("AGENTS.md"))?;
+    remove_memory_skill(&root)?;
     Ok(())
 }
 
@@ -1479,6 +1532,30 @@ mod tests {
         });
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_memory_skill_uses_codex_discovery_path_and_preserves_edits() {
+        let dir = temp_dir("codex-memory-skill");
+        let skill = dir.join(".agents/skills/membrick-memory/SKILL.md");
+
+        assert_eq!(install_memory_skill(&dir).unwrap(), skill);
+        let generated = fs::read_to_string(&skill).unwrap();
+        assert_eq!(generated, include_str!("../agy/skill.md"));
+        assert_eq!(install_memory_skill(&dir).unwrap(), skill);
+        assert_eq!(fs::read_to_string(&skill).unwrap(), generated);
+
+        let config = dir.join("missing-config.toml");
+        let settings = dir.join("missing-settings.json");
+        uninstall(&dir, Some(&config), Some(&settings)).unwrap();
+        assert!(!skill.exists());
+
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, "user customization").unwrap();
+        assert!(install_memory_skill(&dir).is_err());
+        uninstall(&dir, Some(&config), Some(&settings)).unwrap();
+        assert_eq!(fs::read_to_string(&skill).unwrap(), "user customization");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
