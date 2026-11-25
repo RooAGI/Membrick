@@ -27,10 +27,13 @@ mod resident_client_transport;
 mod resident_file_queue;
 #[path = "resident_lifecycle.rs"]
 mod resident_lifecycle;
+#[path = "resident_loading_gate.rs"]
+mod resident_loading_gate;
 
 pub(crate) use resident_client_transport::*;
 pub(crate) use resident_file_queue::*;
 pub(crate) use resident_lifecycle::*;
+pub(crate) use resident_loading_gate::*;
 
 #[cfg(test)]
 async fn request_http(
@@ -178,6 +181,7 @@ pub(crate) async fn serve(
     http_bind: Option<&str>,
     auto_http_port: bool,
     settings_path: Option<&Path>,
+    load: Option<tokio::sync::watch::Receiver<ResidentLoad>>,
 ) -> Result<Option<fs::File>> {
     tokio::pin!(shutdown);
     let cleanup_root = root.to_owned();
@@ -344,12 +348,12 @@ pub(crate) async fn serve(
                         http_listener = None;
                     },
                 },
-                _ = queue_wakeup.notified() => if let Err(error) = process_queue_once(&router, root).await {
+                _ = queue_wakeup.notified(), if resident_load_finished(load.as_ref()) => if let Err(error) = process_queue_once(&router, root).await {
                     tracing::warn!("resident file-queue poll failed: {error:#}");
                 },
-                _ = recovery.tick() => if let Err(error) = process_queue_once(&router, root).await {
+                _ = recovery.tick() => if resident_load_finished(load.as_ref()) { if let Err(error) = process_queue_once(&router, root).await {
                     tracing::warn!("resident file-queue recovery scan failed: {error:#}");
-                },
+                } },
                 _ = queue_cleanup.tick() => {
                     let cleanup_root = root.to_owned();
                     match tokio::task::spawn_blocking(move || {
@@ -420,12 +424,12 @@ pub(crate) async fn serve(
                         http_listener = None;
                     },
                 },
-                _ = queue_wakeup.notified() => if let Err(error) = process_queue_once(&router, root).await {
+                _ = queue_wakeup.notified(), if resident_load_finished(load.as_ref()) => if let Err(error) = process_queue_once(&router, root).await {
                     tracing::warn!("resident file-queue poll failed: {error:#}");
                 },
-                _ = recovery.tick() => if let Err(error) = process_queue_once(&router, root).await {
+                _ = recovery.tick() => if resident_load_finished(load.as_ref()) { if let Err(error) = process_queue_once(&router, root).await {
                     tracing::warn!("resident file-queue recovery scan failed: {error:#}");
-                },
+                } },
                 _ = queue_cleanup.tick() => {
                     let cleanup_root = root.to_owned();
                     match tokio::task::spawn_blocking(move || {
@@ -1203,6 +1207,7 @@ mod tests {
                 Some(&server_bind),
                 false,
                 None,
+                None,
             )
             .await
         });
@@ -1392,6 +1397,7 @@ mod tests {
                 },
                 None,
                 false,
+                None,
                 None,
             )
             .await

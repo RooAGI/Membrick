@@ -536,6 +536,8 @@ pub fn run(args: crate::cli::Args) -> Result<()> {
         println!("Wrote Codex config to {}", written.display());
         let written = crate::integrations::codex::install_project_config(Path::new(&args.path))?;
         println!("Wrote Codex project config to {}", written.display());
+        let written = crate::integrations::codex::install_memory_skill(Path::new(&args.path))?;
+        println!("Wrote Codex memory skill to {}", written.display());
         let settings_path = args.codex_settings.as_deref().map(Path::new);
         let written = install_codex_hook_settings(Path::new(&args.path), settings_path)?;
         println!("Wrote Codex hook settings to {}", written.display());

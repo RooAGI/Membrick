@@ -870,233 +870,294 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         anyhow::ensure!(root.is_dir(), "workspace root is not a directory");
         allowed_workspace_roots.insert(root);
     }
-    let discovered_indexes = discover_index_paths(&project_root);
-    // behood (bekind) owns the full tag→chunk→judge pipeline (Luyi
-    // 2026-09-30): the query path sends raw texts to `bekind --serve` and
-    // gets verdicts back. No parse backend to select, no spaCy involved.
-    // Note: the structured-relations extractor (ExtractorDaemon,
-    // scripts/spacy_relations.py) is a separate spaCy component.
-    let selected_index = args.index.clone().or_else(|| {
-        discovered_indexes
-            .iter()
-            .find(|path| {
-                path.file_name().and_then(|name| name.to_str()) == Some("workspace-memory")
-            })
-            .cloned()
-            // Keep existing installations usable during their migration. New
-            // provider MCP servers create workspace-memory instead.
-            .or_else(|| {
-                discovered_indexes
-                    .iter()
-                    .find(|path| {
-                        path.file_name().and_then(|name| name.to_str()) == Some("codex-mcp-index")
-                    })
-                    .cloned()
-            })
-            .or_else(|| {
-                discovered_indexes
-                    .iter()
-                    .find(|path| {
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.ends_with("-mcp-index"))
-                    })
-                    .cloned()
-            })
-    });
-    let workspace_index_root =
-        selected_index.unwrap_or_else(|| project_root.join(".membrick").join("workspace-memory"));
-    let owner = open_workspace_owner_at(
-        &project_root,
-        &workspace_index_root,
-        options.clone(),
-        &ignore_paths,
-    )?;
-    let watcher = crate::pipeline::WorkspaceWatcher::new(&project_root, &ignore_paths)?;
-    {
-        let documents = owner
-            .memory_store(MemoryStore::Workspace)
-            .source_documents();
-        watcher.seed_baseline(
-            documents
+    let resident_server = args.resident_server;
+    let managed_resident = args.managed_resident;
+    let plain_bind = args.bind.clone();
+    let serve_root = project_root.clone();
+    // Everything that reads the memory stores. A resident runs this after it
+    // starts listening, so clients find it while a large store loads instead
+    // of starting a second resident that collides with the owner lock.
+    let load_app = async move {
+        let discovered_indexes = discover_index_paths(&project_root);
+        // behood (bekind) owns the full tag→chunk→judge pipeline (Luyi
+        // 2026-09-30): the query path sends raw texts to `bekind --serve` and
+        // gets verdicts back. No parse backend to select, no spaCy involved.
+        // Note: the structured-relations extractor (ExtractorDaemon,
+        // scripts/spacy_relations.py) is a separate spaCy component.
+        let selected_index = args.index.clone().or_else(|| {
+            discovered_indexes
                 .iter()
-                .map(|document| (document.source.as_str(), document.content.as_str())),
-        );
-    }
-    let workspace_watcher = Some(Arc::new(watcher));
-    let write_schedule = server_writer::WriteSchedule {
-        refresh_interval: Duration::from_millis(args.refresh_interval_ms),
-        batch_size: args.refresh_batch_size,
-        checkpoint_interval: Duration::from_secs(args.checkpoint_interval_seconds),
-    };
-    let workspace_registry = Arc::new(WorkspaceRegistry::new(
-        options.clone(),
-        write_schedule,
-        allowed_workspace_roots,
-        args.max_active_workspaces,
-    ));
-    let mut state = AppState {
-        service: Arc::new(RwLock::new(owner)),
-        writer_gate: Arc::new(tokio::sync::Mutex::new(())),
-        staged_writer: None,
-        token: args
-            .server_token
-            .map(|s| Arc::<str>::from(s.trim().to_owned())),
-        jwt_secret: jwt_secret.map(Arc::<str>::from),
-        tenant_id: args
-            .tenant_id
-            .map(|s| Arc::<str>::from(s.trim().to_owned())),
-        telemetry: OperationalTelemetry::new(),
-        project_root,
-        workspace_index_root,
-        workspace_watcher,
-        workspace_registry: workspace_registry.clone(),
-    };
-    // Warm the Python daemon children in the background: the first query
-    // that needs key-phrase backfill or structured relations then pays
-    // inference only (~100ms) instead of interpreter+model load (~2-3s).
-    // Best-effort — extraction/analysis falls back to one-shot subprocesses
-    // if a daemon cannot start.
-    //
-    // The NER daemon is deliberately NOT prewarmed: it starts lazily on the
-    // first NER request. Prewarming would force a third Python+spaCy child
-    // (~145MB RSS) on every server start, even when the heuristic NER
-    // provider is configured and spaCy is never used. (Luyi 2026-09-29 P2.)
-    std::thread::Builder::new()
-        .name("python-daemon-prewarm".to_string())
-        .spawn(move || {
-            crate::segments::extractor_daemon::ExtractorDaemon::global().prewarm();
-            // The judge daemon is optional and prewarms only when --bekind
-            // enabled it.
-            if bekind_enabled {
-                crate::behood_query::BekindDaemon::global().prewarm();
-            }
-        })
-        .ok();
-    let writer = StagedWriter::start_with_schedule(state.service.clone(), write_schedule)?;
-    state.staged_writer = Some(writer);
-    let owner_lock = Arc::new(owner_lock);
-    workspace_registry.register_primary(WorkspaceRuntime {
-        #[cfg(any(feature = "claude-code", feature = "codex"))]
-        transcript_captures: start_transcript_captures(
-            &state.project_root,
-            state.staged_writer.as_ref().unwrap(),
-            &owner_lock,
-        )?,
-        service: state.service.clone(),
-        staged_writer: state.staged_writer.as_ref().unwrap().clone(),
-        writer_gate: state.writer_gate.clone(),
-        _owner_lock: owner_lock,
-        project_root: state.project_root.clone(),
-        workspace_index_root: state.workspace_index_root.clone(),
-        ignore_paths: ignore_paths.clone(),
-    });
-    if let (Some(watcher), Some(workspace_writer)) = (
-        state.workspace_watcher.clone(),
-        state
-            .staged_writer
-            .as_ref()
-            .map(StagedWriter::for_workspace),
-    ) {
-        let project_root = state.project_root.clone();
-        let workspace_index_root = state.workspace_index_root.clone();
-        let ignore_paths = ignore_paths.clone();
-        tokio::spawn(async move {
-            let mut poll = tokio::time::interval(Duration::from_millis(500));
-            let mut refresh_pending = false;
-            let mut retry_after = None;
-            loop {
-                poll.tick().await;
-                if watcher
-                    .take_file_changes()
-                    .iter()
-                    .any(|change| change.affects_workspace_index(&project_root))
-                {
-                    refresh_pending = true;
-                }
-                if !refresh_pending
-                    || retry_after.is_some_and(|deadline| std::time::Instant::now() < deadline)
-                {
-                    continue;
-                }
-                let build_root = project_root.clone();
-                let build_ignores = ignore_paths.clone();
-                let documents = tokio::task::spawn_blocking(move || {
-                    let input = crate::adapters::AdapterInput {
-                        root: &build_root,
-                        max_bytes: 5_000_000,
-                        max_files: 50_000,
-                        max_depth: 20,
-                        max_total_bytes: 100_000_000,
-                    };
-                    let graph = crate::adapters::build_project_graph(&input)?;
-                    let graph = crate::adapters::apply_ignore_paths(graph, &build_ignores);
-                    Ok::<_, anyhow::Error>(crate::adapters::graph_to_source_documents(&graph))
+                .find(|path| {
+                    path.file_name().and_then(|name| name.to_str()) == Some("workspace-memory")
                 })
-                .await;
-                let result = match documents {
-                    Ok(Ok(documents)) => workspace_writer
-                        .replace_workspace_documents(documents)
-                        .await
-                        .map_err(|status| anyhow::anyhow!("workspace write returned {status}"))
-                        .and_then(|()| {
-                            crate::memory_api::workspace::persist_workspace_index_state(
-                                &project_root,
-                                &workspace_index_root,
-                                &ignore_paths,
-                            )
-                        }),
-                    Ok(Err(error)) => Err(error),
-                    Err(error) => Err(error.into()),
-                };
-                match result {
-                    Ok(()) => {
-                        refresh_pending = false;
-                        retry_after = None;
+                .cloned()
+                // Keep existing installations usable during their migration. New
+                // provider MCP servers create workspace-memory instead.
+                .or_else(|| {
+                    discovered_indexes
+                        .iter()
+                        .find(|path| {
+                            path.file_name().and_then(|name| name.to_str())
+                                == Some("codex-mcp-index")
+                        })
+                        .cloned()
+                })
+                .or_else(|| {
+                    discovered_indexes
+                        .iter()
+                        .find(|path| {
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(|name| name.ends_with("-mcp-index"))
+                        })
+                        .cloned()
+                })
+        });
+        let workspace_index_root = selected_index
+            .unwrap_or_else(|| project_root.join(".membrick").join("workspace-memory"));
+        // Loading the stores can take minutes for a large workspace; keep it off
+        // the runtime's worker threads so the listener stays responsive.
+        let owner = {
+            let root = project_root.clone();
+            let index_root = workspace_index_root.clone();
+            let options = options.clone();
+            let ignore = ignore_paths.clone();
+            tokio::task::spawn_blocking(move || {
+                open_workspace_owner_at(&root, &index_root, options, &ignore)
+            })
+            .await??
+        };
+        let watcher = crate::pipeline::WorkspaceWatcher::new(&project_root, &ignore_paths)?;
+        {
+            let documents = owner
+                .memory_store(MemoryStore::Workspace)
+                .source_documents();
+            watcher.seed_baseline(
+                documents
+                    .iter()
+                    .map(|document| (document.source.as_str(), document.content.as_str())),
+            );
+        }
+        let workspace_watcher = Some(Arc::new(watcher));
+        let write_schedule = server_writer::WriteSchedule {
+            refresh_interval: Duration::from_millis(args.refresh_interval_ms),
+            batch_size: args.refresh_batch_size,
+            checkpoint_interval: Duration::from_secs(args.checkpoint_interval_seconds),
+        };
+        let workspace_registry = Arc::new(WorkspaceRegistry::new(
+            options.clone(),
+            write_schedule,
+            allowed_workspace_roots,
+            args.max_active_workspaces,
+        ));
+        let mut state = AppState {
+            service: Arc::new(RwLock::new(owner)),
+            writer_gate: Arc::new(tokio::sync::Mutex::new(())),
+            staged_writer: None,
+            token: args
+                .server_token
+                .map(|s| Arc::<str>::from(s.trim().to_owned())),
+            jwt_secret: jwt_secret.map(Arc::<str>::from),
+            tenant_id: args
+                .tenant_id
+                .map(|s| Arc::<str>::from(s.trim().to_owned())),
+            telemetry: OperationalTelemetry::new(),
+            project_root,
+            workspace_index_root,
+            workspace_watcher,
+            workspace_registry: workspace_registry.clone(),
+        };
+        // Warm the Python daemon children in the background: the first query
+        // that needs key-phrase backfill or structured relations then pays
+        // inference only (~100ms) instead of interpreter+model load (~2-3s).
+        // Best-effort — extraction/analysis falls back to one-shot subprocesses
+        // if a daemon cannot start.
+        //
+        // The NER daemon is deliberately NOT prewarmed: it starts lazily on the
+        // first NER request. Prewarming would force a third Python+spaCy child
+        // (~145MB RSS) on every server start, even when the heuristic NER
+        // provider is configured and spaCy is never used. (Luyi 2026-09-29 P2.)
+        std::thread::Builder::new()
+            .name("python-daemon-prewarm".to_string())
+            .spawn(move || {
+                crate::segments::extractor_daemon::ExtractorDaemon::global().prewarm();
+                // The judge daemon is optional and prewarms only when --bekind
+                // enabled it.
+                if bekind_enabled {
+                    crate::behood_query::BekindDaemon::global().prewarm();
+                }
+            })
+            .ok();
+        let writer = StagedWriter::start_with_schedule(state.service.clone(), write_schedule)?;
+        state.staged_writer = Some(writer);
+        let owner_lock = Arc::new(owner_lock);
+        workspace_registry.register_primary(WorkspaceRuntime {
+            #[cfg(any(feature = "claude-code", feature = "codex"))]
+            transcript_captures: start_transcript_captures(
+                &state.project_root,
+                state.staged_writer.as_ref().unwrap(),
+                &owner_lock,
+            )?,
+            service: state.service.clone(),
+            staged_writer: state.staged_writer.as_ref().unwrap().clone(),
+            writer_gate: state.writer_gate.clone(),
+            _owner_lock: owner_lock,
+            project_root: state.project_root.clone(),
+            workspace_index_root: state.workspace_index_root.clone(),
+            ignore_paths: ignore_paths.clone(),
+        });
+        if let (Some(watcher), Some(workspace_writer)) = (
+            state.workspace_watcher.clone(),
+            state
+                .staged_writer
+                .as_ref()
+                .map(StagedWriter::for_workspace),
+        ) {
+            let project_root = state.project_root.clone();
+            let workspace_index_root = state.workspace_index_root.clone();
+            let ignore_paths = ignore_paths.clone();
+            tokio::spawn(async move {
+                let mut poll = tokio::time::interval(Duration::from_millis(500));
+                let mut refresh_pending = false;
+                let mut retry_after = None;
+                loop {
+                    poll.tick().await;
+                    if watcher
+                        .take_file_changes()
+                        .iter()
+                        .any(|change| change.affects_workspace_index(&project_root))
+                    {
+                        refresh_pending = true;
                     }
-                    Err(error) => {
-                        tracing::warn!("workspace index refresh failed: {error:#}");
-                        retry_after = Some(std::time::Instant::now() + Duration::from_secs(5));
+                    if !refresh_pending
+                        || retry_after.is_some_and(|deadline| std::time::Instant::now() < deadline)
+                    {
+                        continue;
+                    }
+                    let build_root = project_root.clone();
+                    let build_ignores = ignore_paths.clone();
+                    let documents = tokio::task::spawn_blocking(move || {
+                        let input = crate::adapters::AdapterInput {
+                            root: &build_root,
+                            max_bytes: 5_000_000,
+                            max_files: 50_000,
+                            max_depth: 20,
+                            max_total_bytes: 100_000_000,
+                        };
+                        let graph = crate::adapters::build_project_graph(&input)?;
+                        let graph = crate::adapters::apply_ignore_paths(graph, &build_ignores);
+                        Ok::<_, anyhow::Error>(crate::adapters::graph_to_source_documents(&graph))
+                    })
+                    .await;
+                    let result = match documents {
+                        Ok(Ok(documents)) => workspace_writer
+                            .replace_workspace_documents(documents)
+                            .await
+                            .map_err(|status| anyhow::anyhow!("workspace write returned {status}"))
+                            .and_then(|()| {
+                                crate::memory_api::workspace::persist_workspace_index_state(
+                                    &project_root,
+                                    &workspace_index_root,
+                                    &ignore_paths,
+                                )
+                            }),
+                        Ok(Err(error)) => Err(error),
+                        Err(error) => Err(error.into()),
+                    };
+                    match result {
+                        Ok(()) => {
+                            refresh_pending = false;
+                            retry_after = None;
+                        }
+                        Err(error) => {
+                            tracing::warn!("workspace index refresh failed: {error:#}");
+                            retry_after = Some(std::time::Instant::now() + Duration::from_secs(5));
+                        }
                     }
                 }
-            }
-        });
-    }
-    let app = app_router(state.clone());
-    if args.resident_server {
-        let root = state.project_root.clone();
-        let managed = args.managed_resident;
+            });
+        }
+        let app = app_router(state.clone());
+        Ok::<_, anyhow::Error>((app, state))
+    };
+    let state = if resident_server {
         let (log_level, log_level_source) = crate::logging::active_level()
             .map_or(("unset".to_owned(), "none"), |(level, source)| {
                 (level.to_string(), source)
             });
         tracing::info!(
             version = env!("CARGO_PKG_VERSION"),
-            managed,
-            root = %state.project_root.display(),
+            managed = managed_resident,
+            root = %serve_root.display(),
             log_level,
             log_level_source,
             "resident starting"
         );
+        let (loaded, load) = crate::local_ipc::resident_load_channel();
+        let loaded = Arc::new(loaded);
+        let loading = {
+            let loaded = loaded.clone();
+            tokio::spawn(async move {
+                match load_app.await {
+                    Ok((app, state)) => {
+                        tracing::info!("memory loaded; resident ready");
+                        loaded.send_replace(crate::local_ipc::ResidentLoad::Ready(app));
+                        Ok(state)
+                    }
+                    Err(error) => {
+                        tracing::error!("memory store failed to load: {error:#}");
+                        loaded.send_replace(crate::local_ipc::ResidentLoad::Failed(format!(
+                            "{error:#}"
+                        )));
+                        Err(error)
+                    }
+                }
+            })
+        };
+        let root = serve_root.clone();
+        let mut loading_ended = load.clone();
         let shutdown = async move {
-            crate::local_ipc::resident_shutdown(&root, managed, shutdown_signal()).await
+            // An idle managed resident never stops part-way through loading;
+            // a stop signal still ends it, after loading finishes below.
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    return crate::local_ipc::resident_shutdown(&root, false, async {}).await;
+                }
+                _ = loading_ended.wait_for(|state| {
+                    !matches!(state, crate::local_ipc::ResidentLoad::Loading)
+                }) => {}
+            }
+            if matches!(
+                *loading_ended.borrow(),
+                crate::local_ipc::ResidentLoad::Failed(_)
+            ) {
+                return None;
+            }
+            crate::local_ipc::resident_shutdown(&root, managed_resident, shutdown_signal()).await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(
-            app,
-            &state.project_root,
+            crate::local_ipc::loading_gate_router(load.clone()),
+            &serve_root,
             shutdown,
             resident_http_bind.as_deref(),
             resident_http_auto_port,
             Some(&settings_file),
+            Some(load),
         )
         .await?;
+        // Writes may happen while the stores open, so a stop during loading
+        // still waits for it to finish and then flushes as usual.
+        drop(loaded);
+        loading.await??
     } else {
-        let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-        tracing::info!("Membrick server listening on {}", args.bind);
+        let (app, state) = load_app.await?;
+        let listener = tokio::net::TcpListener::bind(&plain_bind).await?;
+        tracing::info!("Membrick server listening on {}", plain_bind);
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
-    }
+        state
+    };
     #[cfg(any(feature = "claude-code", feature = "codex"))]
     {
         let captures = state
@@ -2729,7 +2790,9 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
         let response_search_id = error["search_id"].as_str().expect("error search ID");
         assert!(response_search_id.starts_with("mcp:"));
-        assert!(error["detail"].as_str().is_some_and(|detail| !detail.is_empty()));
+        assert!(error["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()));
 
         let mut page = Value::Null;
         for _ in 0..50 {
@@ -4125,6 +4188,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4499,11 +4563,20 @@ mod tests {
             toml::from_str(raw).unwrap()
         };
         assert!(!effective_allow_non_loopback(false, &parse("")));
-        assert!(!effective_allow_non_loopback(false, &parse("allow_non_loopback = false\n")));
-        assert!(effective_allow_non_loopback(false, &parse("allow_non_loopback = true\n")));
+        assert!(!effective_allow_non_loopback(
+            false,
+            &parse("allow_non_loopback = false\n")
+        ));
+        assert!(effective_allow_non_loopback(
+            false,
+            &parse("allow_non_loopback = true\n")
+        ));
         // The flag still opts in on its own, and the file cannot turn it off.
         assert!(effective_allow_non_loopback(true, &parse("")));
-        assert!(effective_allow_non_loopback(true, &parse("allow_non_loopback = false\n")));
+        assert!(effective_allow_non_loopback(
+            true,
+            &parse("allow_non_loopback = false\n")
+        ));
     }
 
     #[test]

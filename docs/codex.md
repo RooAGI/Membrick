@@ -26,7 +26,7 @@ Open a terminal in the project folder and run:
 membrick install codex .
 ```
 
-This enables Codex to use Membrick in the project. It configures the MCP connection and hooks, adds the project memory instructions, and preserves your other Codex settings.
+This enables Codex to use Membrick in the project. It configures the MCP connection and hooks, adds the project memory instructions, installs the skill at `.agents/skills/membrick-memory/SKILL.md`, and preserves your other Codex settings.
 
 Capture hooks save a pending request and return promptly. The project resident
 drains transcript batches through MemoryService, resumes them after restart,
@@ -90,6 +90,7 @@ membrick uninstall codex .
 ```
 
 This removes the Membrick MCP entries and hook commands, plus the Membrick
-policy block from `AGENTS.md`. Other settings, `.membrick` data, and the
-executable remain. Codex's hooks feature flag is left unchanged because other
+policy block from `AGENTS.md` and the managed skill from
+`.agents/skills/membrick-memory/SKILL.md`. User-customized skills, other settings,
+`.membrick` data, and the executable remain. Codex's hooks feature flag is left unchanged because other
 Codex hooks may use it. Restart Codex to reload its settings.
