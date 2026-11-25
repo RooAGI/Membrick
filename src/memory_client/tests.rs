@@ -1218,6 +1218,7 @@ async fn bare_adds_reuse_one_session_over_resident_ipc() {
             None,
             false,
             None,
+            None,
         )
         .await
     });
