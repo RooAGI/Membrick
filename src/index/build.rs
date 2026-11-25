@@ -1,4 +1,5 @@
 use crate::ids::stable_chunk_id;
+use crate::index::lexical_reuse::{lexical_fingerprint, reuse_refusal, LexicalDocTexts};
 use crate::index::write_lock::with_guarded_index_writer;
 use crate::query_expansion::normalize_for_index;
 use anyhow::Result;
@@ -121,7 +122,7 @@ fn bekind_tags_query(index: &Index, tags_field: Field, tags: &[String]) -> Optio
 /// The chunk-content text indexed in the tantivy `content` field (and the
 /// text bekind judges for definitional semantic tags). Single helper so the
 /// indexed text and the judged text cannot drift apart.
-fn lexical_content_text(doc: &DocRecord) -> String {
+pub(super) fn lexical_content_text(doc: &DocRecord) -> String {
     doc.section_chunks
         .iter()
         .map(|c| c.content.as_str())
@@ -681,7 +682,7 @@ impl MemoryIndex {
                     }
                 }
             }
-            None => match Self::build_lexical_index(&docs, lexical_dir, lexical_delta) {
+            None => match Self::build_lexical_index(&docs, lexical_dir) {
                 Ok(index) => Some(index),
                 Err(err) => {
                     tracing::warn!("lexical BM25 index disabled: {}", err);
@@ -855,7 +856,7 @@ impl MemoryIndex {
                     });
             }
         }
-        let lexical = match Self::build_lexical_index(&docs, lexical_dir, None) {
+        let lexical = match Self::build_lexical_index(&docs, lexical_dir) {
             Ok(index) => Some(index),
             Err(err) => {
                 tracing::warn!("lexical BM25 index disabled: {}", err);
@@ -1051,40 +1052,16 @@ impl MemoryIndex {
         tags: &[String],
         fields: &LexicalFields,
     ) -> Result<()> {
-        let headings_text = doc
-            .section_chunks
-            .iter()
-            .map(|c| c.heading.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let terms_text = doc
-            .section_chunks
-            .iter()
-            .flat_map(|c| c.important_terms.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let entities_text = doc
-            .section_chunks
-            .iter()
-            .flat_map(|c| c.key_entities.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let content_text = lexical_content_text(doc);
-        // Luyi 2026-10-11: DO NOT inject tags into content field.
-        // Categories ("leisure", "travel") in content let unrelated docs
-        // match. Tags stay in the tags field only, where they chain via the
-        // category without polluting lexical matching.
-        let temporal_text = doc.temporal_terms.join(" ");
-        let tags_text = tags.join(" ");
+        let texts = LexicalDocTexts::new(doc, tags);
         writer.add_document(doc!(
-            fields.doc_id_f => doc.doc_id.clone(),
-            fields.content_f => content_text,
-            fields.headings_f => headings_text,
-            fields.terms_f => terms_text,
-            fields.entities_f => entities_text,
-            fields.temporal_f => temporal_text,
-            fields.tags_f => tags_text,
-            fields.subword_f => content_text
+            fields.doc_id_f => texts.doc_id,
+            fields.content_f => texts.content.clone(),
+            fields.headings_f => texts.headings,
+            fields.terms_f => texts.terms,
+            fields.entities_f => texts.entities,
+            fields.temporal_f => texts.temporal,
+            fields.tags_f => texts.tags,
+            fields.subword_f => texts.content
         ))?;
         Ok(())
     }
@@ -1113,13 +1090,13 @@ impl MemoryIndex {
         lexical_delta: Option<(LexicalIndexDelta, bool)>,
     ) -> Result<LexicalIndex> {
         if !previous.ram_only {
-            return Self::build_lexical_index(docs, None, None);
+            return Self::build_lexical_index(docs, None);
         }
         let Some((delta, _)) = lexical_delta else {
-            return Self::build_lexical_index(docs, None, None);
+            return Self::build_lexical_index(docs, None);
         };
         if !delta.removed_doc_ids.is_empty() {
-            return Self::build_lexical_index(docs, None, None);
+            return Self::build_lexical_index(docs, None);
         }
         // A changed doc_id already present in the index is a rewrite, not a
         // new document: its old entry would linger as a deleted doc and skew
@@ -1129,7 +1106,7 @@ impl MemoryIndex {
         for doc_id in &delta.changed_doc_ids {
             let term = Term::from_field_text(previous.doc_id_f, doc_id);
             if searcher.doc_freq(&term).unwrap_or(0) > 0 {
-                return Self::build_lexical_index(docs, None, None);
+                return Self::build_lexical_index(docs, None);
             }
         }
         let index = previous.index.clone();
@@ -1170,7 +1147,6 @@ impl MemoryIndex {
     fn build_lexical_index(
         docs: &HashMap<String, std::sync::Arc<DocRecord>>,
         lexical_dir: Option<&Path>,
-        lexical_delta: Option<(LexicalIndexDelta, bool)>,
     ) -> Result<LexicalIndex> {
         let mut schema_builder = Schema::builder();
         let doc_id_f = schema_builder.add_text_field("doc_id", STRING | STORED);
@@ -1216,10 +1192,12 @@ impl MemoryIndex {
             // Index open, schema migration, and population run through the
             // shared guarded writer entry point.
             let mut selected = Index::create_in_ram(schema.clone());
+            let fingerprint = lexical_fingerprint(&schema, &ordered, &tags_per_doc);
             with_guarded_index_writer(
                 &mut selected,
                 Some(dir),
                 50_000_000,
+                Some(&fingerprint),
                 |dir, schema| {
                     fs::create_dir_all(dir)?;
                     match Index::open_in_dir(dir) {
@@ -1231,12 +1209,14 @@ impl MemoryIndex {
                             // QueryParser resolves the field tokenizer
                             // through the index's manager.
                             crate::index::cjk_tokenizer::register_cjk_tokenizer(&existing);
-                            let should_write =
-                                lexical_delta.as_ref().is_none_or(|(delta, rebuild)| {
-                                    *rebuild
-                                        || !delta.changed_doc_ids.is_empty()
-                                        || !delta.removed_doc_ids.is_empty()
-                                });
+                            let refusal = reuse_refusal(&existing, &fingerprint, ordered.len());
+                            if let Some(reason) = &refusal {
+                                tracing::debug!(
+                                    folder = %dir.display(),
+                                    "rebuilding the stored lexical index: {reason}"
+                                );
+                            }
+                            let should_write = refusal.is_some();
                             return Ok((existing, should_write));
                         }
                         // Only a confirmed old schema authorizes replacement.
@@ -1251,20 +1231,7 @@ impl MemoryIndex {
                     Ok((new_index, true))
                 },
                 |writer| {
-                    let rebuild = lexical_delta
-                        .as_ref()
-                        .map(|(_, rebuild)| *rebuild)
-                        .unwrap_or(true);
-                    if rebuild {
-                        writer.delete_all_documents()?;
-                    }
-                    let mut deletes = std::collections::HashSet::new();
-                    if let Some((delta, _)) = lexical_delta.as_ref().filter(|_| !rebuild) {
-                        deletes.extend(delta.removed_doc_ids.iter());
-                    }
-                    for doc_id in deletes {
-                        writer.delete_term(Term::from_field_text(doc_id_f, doc_id));
-                    }
+                    writer.delete_all_documents()?;
                     let fields = LexicalFields {
                         doc_id_f,
                         content_f,
@@ -1276,13 +1243,6 @@ impl MemoryIndex {
                         subword_f,
                     };
                     for (doc, tags) in ordered.iter().zip(tags_per_doc.iter()) {
-                        if !rebuild
-                            && lexical_delta.as_ref().is_some_and(|(delta, _)| {
-                                !delta.changed_doc_ids.contains(&doc.doc_id)
-                            })
-                        {
-                            continue;
-                        }
                         Self::add_lexical_document(writer, doc, tags, &fields)?;
                     }
                     Ok(())
@@ -1378,44 +1338,20 @@ impl MemoryIndex {
             &mut index,
             None,
             writer_heap,
+            None,
             |_, schema| Ok((Index::create_in_ram(schema.clone()), true)),
             |writer| {
                 for (doc, tags) in ordered.iter().zip(tags_per_doc.iter()) {
-                    let headings_text = doc
-                        .section_chunks
-                        .iter()
-                        .map(|c| c.heading.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let terms_text = doc
-                        .section_chunks
-                        .iter()
-                        .flat_map(|c| c.important_terms.iter().map(String::as_str))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let entities_text = doc
-                        .section_chunks
-                        .iter()
-                        .flat_map(|c| c.key_entities.iter().map(String::as_str))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let content_text = lexical_content_text(doc);
-                    // Luyi 2026-10-11: DO NOT inject tags into content field.
-                    // Categories ("leisure", "travel") in content let
-                    // unrelated docs match. Tags stay in the tags field
-                    // only, where they chain via the category without
-                    // polluting lexical matching.
-                    let temporal_text = doc.temporal_terms.join(" ");
-                    let tags_text = tags.join(" ");
+                    let texts = LexicalDocTexts::new(doc, tags);
                     writer.add_document(doc!(
-                        doc_id_f => doc.doc_id.clone(),
-                        content_f => content_text,
-                        headings_f => headings_text,
-                        terms_f => terms_text,
-                        entities_f => entities_text,
-                        temporal_f => temporal_text,
-                        tags_f => tags_text,
-                        subword_f => content_text
+                        doc_id_f => texts.doc_id,
+                        content_f => texts.content.clone(),
+                        headings_f => texts.headings,
+                        terms_f => texts.terms,
+                        entities_f => texts.entities,
+                        temporal_f => texts.temporal,
+                        tags_f => texts.tags,
+                        subword_f => texts.content
                     ))?;
                 }
                 Ok(())

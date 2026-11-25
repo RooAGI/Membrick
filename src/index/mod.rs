@@ -1,6 +1,7 @@
 mod build;
 pub(crate) mod cjk_tokenizer;
 mod helpers;
+mod lexical_reuse;
 mod model;
 mod query;
 mod query_terms;
