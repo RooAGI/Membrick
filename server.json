@@ -19,7 +19,7 @@
             "transport": {
                 "type": "stdio"
             },
-            "version": "0.10.2"
+            "version": "0.10.3"
         }
     ],
     "repository": {
@@ -27,6 +27,6 @@
         "url": "https://github.com/RooAGI/Membrick"
     },
     "title": "Membrick",
-    "version": "0.10.2",
+    "version": "0.10.3",
     "websiteUrl": "https://www.rooagi.com"
 }
