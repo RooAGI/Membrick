@@ -62,10 +62,13 @@ impl PersistentIndexWriteLock {
 /// prepare callback that runs under the per-index process lock and returns
 /// the latest index plus whether this operation must write it. In-memory
 /// indexes use the same writer/commit path without a filesystem lock.
+/// `commit_payload` is saved atomically with the commit; a commit without one
+/// clears the payload of the commit before it.
 pub(crate) fn with_guarded_index_writer<T>(
     index: &mut Index,
     index_dir: Option<&Path>,
     writer_heap: usize,
+    commit_payload: Option<&str>,
     mut prepare: impl FnMut(&Path, &Schema) -> Result<(Index, bool)>,
     mut operation: impl FnMut(&mut IndexWriter) -> Result<T>,
 ) -> Result<Option<T>> {
@@ -91,7 +94,12 @@ pub(crate) fn with_guarded_index_writer<T>(
                 writer.garbage_collect_files().wait()?;
             }
             let output = operation(&mut writer)?;
-            writer.commit().map(|_| Some(output)).map_err(Into::into)
+            let mut commit = writer.prepare_commit()?;
+            if let Some(payload) = commit_payload {
+                commit.set_payload(payload);
+            }
+            commit.commit()?;
+            Ok(Some(output))
         })();
         match result {
             Ok(output) => return Ok(output),
@@ -186,6 +194,7 @@ mod tests {
                 &mut index,
                 Some(&root),
                 15_000_000,
+                None,
                 |dir, _schema| {
                     let count = prepare_count.get();
                     prepare_count.set(count + 1);

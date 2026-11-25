@@ -375,8 +375,9 @@ pub(crate) fn build_memory_index_segment_with_shared_records(
 /// The segment still holds its stable folder under `lexical_root`: the
 /// folder is the segment's on-disk home for the manifest and for load-time
 /// rebuilds, and it is created here so the "one lexical folder per live
-/// segment" invariant holds. Its content is not written on the publish path;
-/// load rebuilds it from the records, which are the truth.
+/// segment" invariant holds. Its content is not written on the publish path,
+/// so it may fall behind; load reuses it only when its fingerprint matches the
+/// records, which are the truth, and rebuilds it otherwise.
 pub(crate) fn build_memory_index_segment_with_ram_lexical(
     segment_id: String,
     mut segment_records: Vec<Arc<DocRecord>>,
