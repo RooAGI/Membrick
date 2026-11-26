@@ -182,6 +182,7 @@ pub(crate) async fn serve(
     auto_http_port: bool,
     settings_path: Option<&Path>,
     load: Option<tokio::sync::watch::Receiver<ResidentLoad>>,
+    service_registration: Option<ServiceRegistration>,
 ) -> Result<Option<fs::File>> {
     tokio::pin!(shutdown);
     let cleanup_root = root.to_owned();
@@ -218,6 +219,28 @@ pub(crate) async fn serve(
     } else {
         None
     };
+    let (http_addr_tx, http_addr_rx) = tokio::sync::watch::channel(
+        http_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok()),
+    );
+    let registration_task = service_registration.map(|registration| {
+        let load = load.clone();
+        let root_id = workspace_identity(root);
+        tokio::spawn(async move {
+            if let Some(mut load) = load {
+                if load
+                    .wait_for(|state| !matches!(state, ResidentLoad::Loading))
+                    .await
+                    .is_err()
+                    || matches!(*load.borrow(), ResidentLoad::Failed(_))
+                {
+                    return;
+                }
+            }
+            resident_registration_loop(registration, http_addr_rx, root_id).await;
+        })
+    });
     let queue_wakeup = std::sync::Arc::new(tokio::sync::Notify::new());
     let _queue_watcher = match queue_dirs(root) {
         Ok((pending, _, _)) => match watch_directory(&pending, queue_wakeup.clone()) {
@@ -320,6 +343,8 @@ pub(crate) async fn serve(
             tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60),
             std::time::Duration::from_secs(15 * 60),
         );
+        let mut http_retry = tokio::time::interval(std::time::Duration::from_secs(2));
+        http_retry.tick().await;
         let shutdown_gate = loop {
             tokio::select! {
                 accepted = async {
@@ -346,7 +371,21 @@ pub(crate) async fn serve(
                     Err(error) => {
                         tracing::warn!("resident HTTP listener stopped: {error}");
                         http_listener = None;
+                        http_addr_tx.send_replace(None);
                     },
+                },
+                _ = http_retry.tick(), if http_listener.is_none() && http_bind.is_some() => {
+                    match bind_resident_http(http_bind.unwrap(), auto_http_port, settings_path).await {
+                        Ok(listener) => match listener.local_addr() {
+                            Ok(addr) => {
+                                tracing::info!("Membrick resident HTTP listening on {addr}");
+                                http_addr_tx.send_replace(Some(addr));
+                                http_listener = Some(listener);
+                            }
+                            Err(error) => tracing::warn!("could not read resident HTTP listener address: {error}"),
+                        },
+                        Err(error) => tracing::warn!("resident HTTP listener retry failed: {error}"),
+                    }
                 },
                 _ = queue_wakeup.notified(), if resident_load_finished(load.as_ref()) => if let Err(error) = process_queue_once(&router, root).await {
                     tracing::warn!("resident file-queue poll failed: {error:#}");
@@ -375,6 +414,9 @@ pub(crate) async fn serve(
         };
         drop(http_listener);
         drop(listener);
+        if let Some(task) = registration_task {
+            task.abort();
+        }
         connections.shutdown().await;
         if bound_inode.is_some()
             && std::fs::metadata(&endpoint)
@@ -401,6 +443,8 @@ pub(crate) async fn serve(
             tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60),
             std::time::Duration::from_secs(15 * 60),
         );
+        let mut http_retry = tokio::time::interval(std::time::Duration::from_secs(2));
+        http_retry.tick().await;
         let shutdown_gate = loop {
             let server = ServerOptions::new().create(&endpoint)?;
             let _ = std::fs::remove_file(starting_path(root)?);
@@ -422,7 +466,21 @@ pub(crate) async fn serve(
                     Err(error) => {
                         tracing::warn!("resident HTTP listener stopped: {error}");
                         http_listener = None;
+                        http_addr_tx.send_replace(None);
                     },
+                },
+                _ = http_retry.tick(), if http_listener.is_none() && http_bind.is_some() => {
+                    match bind_resident_http(http_bind.unwrap(), auto_http_port, settings_path).await {
+                        Ok(listener) => match listener.local_addr() {
+                            Ok(addr) => {
+                                tracing::info!("Membrick resident HTTP listening on {addr}");
+                                http_addr_tx.send_replace(Some(addr));
+                                http_listener = Some(listener);
+                            }
+                            Err(error) => tracing::warn!("could not read resident HTTP listener address: {error}"),
+                        },
+                        Err(error) => tracing::warn!("resident HTTP listener retry failed: {error}"),
+                    }
                 },
                 _ = queue_wakeup.notified(), if resident_load_finished(load.as_ref()) => if let Err(error) = process_queue_once(&router, root).await {
                     tracing::warn!("resident file-queue poll failed: {error:#}");
@@ -450,8 +508,164 @@ pub(crate) async fn serve(
             }
         };
         drop(http_listener);
+        if let Some(task) = registration_task {
+            task.abort();
+        }
         connections.shutdown().await;
         Ok(shutdown_gate)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ServiceRegistration {
+    pub(crate) dispatcher_url: String,
+    pub(crate) token: String,
+    pub(crate) heartbeat_interval_ms: u64,
+}
+
+pub(crate) fn managed_resident_stops_when_idle(
+    managed: bool,
+    registration_configured: bool,
+) -> bool {
+    managed && !registration_configured
+}
+
+pub(crate) fn valid_heartbeat_interval_ms(interval_ms: u64) -> bool {
+    (1_000..=10_000).contains(&interval_ms)
+}
+
+async fn resident_url_for_dispatcher(
+    bind_addr: std::net::SocketAddr,
+    dispatcher_url: &str,
+) -> Result<String> {
+    let dispatcher = reqwest::Url::parse(dispatcher_url)?;
+    let dispatcher_port = dispatcher
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("dispatcher URL has no port"))?;
+    let host = dispatcher
+        .host_str()
+        .map(|host| host.trim_matches(['[', ']']).to_owned())
+        .ok_or_else(|| anyhow::anyhow!("dispatcher URL has no host"))?;
+    let addresses = tokio::net::lookup_host((host.as_str(), dispatcher_port))
+        .await?
+        .collect::<Vec<_>>();
+    let remote = addresses
+        .into_iter()
+        .find(|address| address.is_ipv4() == bind_addr.is_ipv4())
+        .ok_or_else(|| {
+            anyhow::anyhow!("dispatcher host has no address matching the resident listener family")
+        })?;
+    let route_ip = if bind_addr.ip().is_unspecified() || bind_addr.ip().is_loopback() {
+        let socket = tokio::net::UdpSocket::bind(if bind_addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .await?;
+        socket.connect(remote).await?;
+        socket.local_addr()?.ip()
+    } else {
+        bind_addr.ip()
+    };
+    if bind_addr.ip().is_loopback() && !route_ip.is_loopback() {
+        anyhow::bail!(
+            "resident_http_bind is loopback-only but the dispatcher is remote; bind the resident to a private network interface"
+        );
+    }
+    let ip = route_ip;
+    anyhow::ensure!(
+        !ip.is_unspecified(),
+        "could not determine a routable resident address"
+    );
+    Ok(format!(
+        "http://{}",
+        std::net::SocketAddr::new(ip, bind_addr.port())
+    ))
+}
+
+async fn resident_registration_loop(
+    registration: ServiceRegistration,
+    mut http_addr: tokio::sync::watch::Receiver<Option<std::net::SocketAddr>>,
+    worker_id: String,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!("could not create membrick-service registration client: {error}");
+            return;
+        }
+    };
+    let endpoint = format!("{}/api/worker/heartbeat", registration.dispatcher_url);
+    let mut failures = 0u64;
+    loop {
+        let current_http_addr = { *http_addr.borrow() };
+        if let Some(bind_addr) = current_http_addr {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                resident_url_for_dispatcher(bind_addr, &registration.dispatcher_url),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("dispatcher DNS/address selection timed out"))
+            .and_then(|result| result);
+            match result {
+                Ok(resident_url) => {
+                    let payload = serde_json::json!({
+                        "worker_id": worker_id,
+                        "addr": resident_url,
+                        "base_path": "",
+                    });
+                    match client
+                        .post(&endpoint)
+                        .header("x-service-token", &registration.token)
+                        .json(&payload)
+                        .send()
+                        .await
+                        .and_then(reqwest::Response::error_for_status)
+                    {
+                        Ok(_) if failures > 0 => {
+                            tracing::info!(
+                                "membrick-service registration recovered after {failures} failures"
+                            );
+                            failures = 0;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            failures += 1;
+                            log_registration_failure(failures, &error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    failures += 1;
+                    log_registration_failure(failures, &error);
+                }
+            }
+        } else {
+            failures += 1;
+            if failures == 1 || failures.is_multiple_of(12) {
+                tracing::warn!(
+                    attempt = failures,
+                    "membrick-service registration waiting for the resident HTTP listener"
+                );
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(registration.heartbeat_interval_ms)) => {}
+            changed = http_addr.changed() => if changed.is_err() { return; },
+        }
+    }
+}
+
+fn log_registration_failure(failures: u64, error: &impl std::fmt::Display) {
+    if failures == 1 || failures.is_multiple_of(12) {
+        tracing::warn!(
+            attempt = failures,
+            "membrick-service registration failed: {error}"
+        );
     }
 }
 
@@ -1208,6 +1422,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -1399,6 +1614,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1433,9 +1649,15 @@ mod tests {
 
 #[cfg(test)]
 mod resident_http_port_tests {
-    use super::bind_resident_http;
+    use super::{
+        bind_resident_http, managed_resident_stops_when_idle, resident_record_path,
+        resident_url_for_dispatcher, serve, valid_heartbeat_interval_ms, ServiceRegistration,
+    };
+    use axum::http::StatusCode;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     struct TempDir(PathBuf);
 
@@ -1519,5 +1741,177 @@ mod resident_http_port_tests {
             super::workspace_identity(first),
             super::workspace_identity(second)
         );
+    }
+
+    #[tokio::test]
+    async fn ipv6_dispatcher_url_preserves_listener_family_and_brackets() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let advertised = resident_url_for_dispatcher(address, "http://[::1]:8080")
+            .await
+            .unwrap();
+        assert_eq!(advertised, format!("http://[::1]:{}", address.port()));
+    }
+
+    #[tokio::test]
+    async fn loopback_listener_cannot_register_to_a_remote_dispatcher() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error =
+            resident_url_for_dispatcher(listener.local_addr().unwrap(), "http://192.0.2.1:8080")
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("loopback-only"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_interval_bounds_and_managed_registration_lifetime_are_explicit() {
+        assert!(!valid_heartbeat_interval_ms(999));
+        assert!(valid_heartbeat_interval_ms(1_000));
+        assert!(valid_heartbeat_interval_ms(10_000));
+        assert!(!valid_heartbeat_interval_ms(10_001));
+
+        assert!(managed_resident_stops_when_idle(true, false));
+        assert!(!managed_resident_stops_when_idle(true, true));
+        assert!(!managed_resident_stops_when_idle(false, false));
+    }
+
+    #[tokio::test]
+    async fn address_selection_refreshes_when_dispatcher_route_changes() {
+        let bind_addr = "0.0.0.0:8465".parse().unwrap();
+        let local = resident_url_for_dispatcher(bind_addr, "http://127.0.0.1:8080")
+            .await
+            .unwrap();
+        let remote = resident_url_for_dispatcher(bind_addr, "http://192.0.2.1:8080")
+            .await
+            .unwrap();
+        assert_ne!(local, remote);
+        assert!(local.starts_with("http://127.0.0.1:"));
+        assert!(remote.starts_with("http://"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dns_failure_does_not_prevent_resident_ipc_startup() {
+        let root = TempDir::new();
+        let app = axum::Router::new();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let resident_root = root.0.clone();
+        let resident = tokio::spawn(async move {
+            serve(
+                app,
+                &resident_root,
+                async move {
+                    let _ = stopped.await;
+                    None
+                },
+                Some("127.0.0.1:0"),
+                false,
+                None,
+                None,
+                Some(ServiceRegistration {
+                    dispatcher_url: "http://missing-dispatcher.invalid:8080".into(),
+                    token: "shared-secret".into(),
+                    heartbeat_interval_ms: 1_000,
+                }),
+            )
+            .await
+        });
+
+        let record_path = resident_record_path(&root.0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !record_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local IPC should start while dispatcher DNS fails");
+        stop.send(()).unwrap();
+        resident.await.unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resident_ipc_starts_while_http_port_is_occupied_and_registers_after_recovery() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = TempDir::new();
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let resident_bind = blocker.local_addr().unwrap().to_string();
+        let dispatcher_blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dispatcher_addr = dispatcher_blocker.local_addr().unwrap();
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let resident_root = root.0.clone();
+        let resident = tokio::spawn(async move {
+            serve(
+                Router::new(),
+                &resident_root,
+                async move {
+                    let _ = stopped.await;
+                    None
+                },
+                Some(&resident_bind),
+                false,
+                None,
+                None,
+                Some(ServiceRegistration {
+                    dispatcher_url: format!("http://{dispatcher_addr}"),
+                    token: "shared-secret".into(),
+                    heartbeat_interval_ms: 1_000,
+                }),
+            )
+            .await
+        });
+
+        let record_path = resident_record_path(&root.0);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !record_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local IPC should start while HTTP binding fails");
+        drop((blocker, dispatcher_blocker));
+        let dispatcher_listener = tokio::net::TcpListener::bind(dispatcher_addr)
+            .await
+            .unwrap();
+        let heartbeat_count = heartbeats.clone();
+        let dispatcher = tokio::spawn(async move {
+            axum::serve(
+                dispatcher_listener,
+                Router::new().route(
+                    "/api/worker/heartbeat",
+                    post(move |headers: axum::http::HeaderMap| {
+                        let heartbeat_count = heartbeat_count.clone();
+                        async move {
+                            assert_eq!(
+                                headers
+                                    .get("x-service-token")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("shared-secret")
+                            );
+                            heartbeat_count.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while heartbeats.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("registration should recover and heartbeat again without local clients");
+
+        stop.send(()).unwrap();
+        resident.await.unwrap().unwrap();
+        dispatcher.abort();
     }
 }

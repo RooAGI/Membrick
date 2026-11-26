@@ -752,6 +752,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let settings = crate::server_configuration::ServerConfiguration::load(&settings_file)?;
     crate::logging::init_with_settings(crate::logging::Role::Server, &settings);
     let ignore_paths = settings.effective_ignore_paths();
+    let service_registration = settings.service_registration.clone();
     let resident_http_bind = settings.resident_http_bind.clone();
     let resident_http_auto_port = settings.resident_http_auto_port.unwrap_or(false);
     args.allow_non_loopback = effective_allow_non_loopback(args.allow_non_loopback, &settings);
@@ -802,6 +803,54 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         args.server_token.is_some() || jwt_secret.is_some(),
         args.allow_unauthenticated,
     )?;
+    let service_registration = if args.resident_server {
+        match service_registration {
+            Some(registration) => {
+                let dispatcher_url = registration.dispatcher_url.ok_or_else(|| {
+                    anyhow::anyhow!("service_registration.dispatcher_url is required when service_registration is configured")
+                })?;
+                let dispatcher_url = validate_dispatcher_url(&dispatcher_url)?;
+                let token = args.server_token.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "service registration requires server_token or server_token_file to match the dispatcher token"
+                    )
+                })?;
+                anyhow::ensure!(
+                    resident_http_bind.is_some(),
+                    "service registration requires resident_http_bind"
+                );
+                let heartbeat_interval_ms = registration.heartbeat_interval_ms.unwrap_or(5_000);
+                anyhow::ensure!(
+                    crate::local_ipc::valid_heartbeat_interval_ms(heartbeat_interval_ms),
+                    "service_registration.heartbeat_interval_ms must be between 1000 and 10000"
+                );
+                let dispatcher_host = dispatcher_url
+                    .host_str()
+                    .unwrap_or_default()
+                    .trim_matches(['[', ']']);
+                let dispatcher_is_remote = dispatcher_host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| !ip.is_loopback())
+                    .unwrap_or_else(|_| {
+                        !dispatcher_host.eq_ignore_ascii_case("localhost")
+                            && !dispatcher_host.to_ascii_lowercase().ends_with(".localhost")
+                    });
+                if dispatcher_url.scheme() == "http" && dispatcher_is_remote {
+                    tracing::warn!(
+                        "service_registration.dispatcher_url uses plain HTTP to a remote host; registration token is sent without transport encryption"
+                    );
+                }
+                Some(crate::local_ipc::ServiceRegistration {
+                    dispatcher_url: dispatcher_url.to_string().trim_end_matches('/').to_owned(),
+                    token,
+                    heartbeat_interval_ms,
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     if args.resident_server {
         if let Some(bind) = &resident_http_bind {
             ensure_bind_allowed(
@@ -1115,6 +1164,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             })
         };
         let root = serve_root.clone();
+        let registration_keeps_managed_alive = service_registration.is_some();
         let mut loading_ended = load.clone();
         let shutdown = async move {
             // An idle managed resident never stops part-way through loading;
@@ -1133,7 +1183,15 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             ) {
                 return None;
             }
-            crate::local_ipc::resident_shutdown(&root, managed_resident, shutdown_signal()).await
+            crate::local_ipc::resident_shutdown(
+                &root,
+                crate::local_ipc::managed_resident_stops_when_idle(
+                    managed_resident,
+                    registration_keeps_managed_alive,
+                ),
+                shutdown_signal(),
+            )
+            .await
         };
         _resident_shutdown_gate = crate::local_ipc::serve(
             crate::local_ipc::loading_gate_router(load.clone()),
@@ -1143,6 +1201,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
             resident_http_auto_port,
             Some(&settings_file),
             Some(load),
+            service_registration,
         )
         .await?;
         // Writes may happen while the stores open, so a stop during loading
@@ -1535,6 +1594,21 @@ fn memory_pipeline_options(
 
         ..default_production_pipeline_options()
     }
+}
+
+fn validate_dispatcher_url(value: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value)
+        .context("service_registration.dispatcher_url must be an absolute HTTP(S) URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "service_registration.dispatcher_url must be an absolute HTTP(S) base URL"
+    );
+    Ok(url)
 }
 
 fn normalize_secret(value: Option<String>) -> Option<String> {
@@ -3575,6 +3649,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn dispatcher_url_validation_accepts_bracketed_ipv6_and_rejects_non_base_urls() {
+        let parsed = validate_dispatcher_url("https://[::1]:8443").unwrap();
+        assert_eq!(parsed.host_str(), Some("[::1]"));
+        assert!(validate_dispatcher_url("ftp://dispatcher.example").is_err());
+        assert!(validate_dispatcher_url("http://dispatcher.example?token=secret").is_err());
+        assert!(validate_dispatcher_url("http://user:pass@dispatcher.example").is_err());
+    }
+
+    #[tokio::test]
+    async fn jwt_protected_remote_memory_search_accepts_bearer_jwt() {
+        let root = security_test_root();
+        let app = app_router(security_test_state(&root));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let token = security_test_token(json!({"sub":"alice", "exp":4_102_444_800u64}));
+        let client = crate::Memory::remote(
+            format!("http://{address}"),
+            crate::MemoryOptions {
+                api_key: Some(token),
+                ..crate::MemoryOptions::default()
+            },
+        )
+        .unwrap();
+        let result = client
+            .search_async(
+                "resident JWT search",
+                "alice",
+                crate::SearchOptions::default(),
+            )
+            .await
+            .expect("remote search should authenticate with the configured JWT secret");
+        assert!(!result.search_id.is_empty());
+
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn jwt_search_scope_is_bound_to_subject() {
         use tower::ServiceExt;
@@ -4187,6 +4309,7 @@ mod tests {
                 std::future::pending::<Option<std::fs::File>>(),
                 None,
                 false,
+                None,
                 None,
                 None,
             )

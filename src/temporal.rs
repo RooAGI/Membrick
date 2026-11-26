@@ -16,18 +16,13 @@ pub struct TemporalTarget {
 pub const DEFAULT_RECENCY_HALF_LIFE_DAYS: f32 = 30.0;
 pub const DEFAULT_RECENCY_MAX_BOOST: f32 = 0.25;
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessMode {
+    #[default]
     Relative,
     Legacy,
     Disabled,
-}
-
-impl Default for FreshnessMode {
-    fn default() -> Self {
-        Self::Relative
-    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
@@ -2005,6 +2000,7 @@ mod tests {
 
     #[test]
     fn freshness_policy_varies_by_query_intent_and_validates_configuration() {
+        assert_eq!(FreshnessMode::default(), FreshnessMode::Relative);
         let policy = FreshnessPolicy::default();
         assert_eq!(policy.weight_for_intent(QueryIntent::CurrentState), 0.25);
         assert_eq!(policy.weight_for_intent(QueryIntent::Lookup), 0.0);

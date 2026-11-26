@@ -36,6 +36,16 @@ pub(crate) struct ServerConfiguration {
     pub(crate) adaptive_segment_max_n: Option<usize>,
     pub(crate) freshness: Option<crate::temporal::FreshnessPolicy>,
     pub(crate) logging: Option<LoggingConfiguration>,
+    pub(crate) service_registration: Option<ServiceRegistrationConfiguration>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct ServiceRegistrationConfiguration {
+    /// HTTP base URL of the membrick-service dispatcher.
+    pub(crate) dispatcher_url: Option<String>,
+    /// Heartbeat interval. The dispatcher expires local registrations after 20s.
+    pub(crate) heartbeat_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

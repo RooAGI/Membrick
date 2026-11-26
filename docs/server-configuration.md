@@ -24,6 +24,33 @@ options, logging, and the primary project's scan exclusions. When serving
 additional allowed workspaces, each workspace uses its own
 `.membrick/server.toml` for `ignore_paths`.
 
+## Register a resident with membrick-service
+
+A project resident can register itself with one `membrick-service` dispatcher.
+This replaces the separate `lint-client` process for that resident. The
+dispatcher must use local discovery, and the resident's API listener must be
+reachable from it on the private network. The resident uses the same shared
+token for its API and registration heartbeat:
+
+```toml
+resident_http_bind = "0.0.0.0:8465"
+server_token_file = "/run/secrets/membrick-service-token"
+allow_non_loopback = true
+
+[service_registration]
+dispatcher_url = "http://membrick-service:8080"
+heartbeat_interval_ms = 5000
+```
+
+The resident derives its advertised address from the listener and the network
+route to the dispatcher, then registers on startup and refreshes its heartbeat.
+A managed resident stays alive and keeps heartbeating even when no local client
+is connected. Each running resident registers independently. If the resident
+stops, its registration expires from the dispatcher's local registry after 20 seconds.
+The service URL still needs to be configured; this does not scan the network
+for dispatchers. Keep the resident API private and give it the same token as
+`membrick-service`.
+
 ## Dashboard URL and route
 
 There is no separate dashboard listener or enable/disable setting. The
@@ -92,6 +119,8 @@ login flow; the proxy must also provide a bearer token accepted by the server.
 | `index` | Explicit backing index directory. | If omitted, Membrick discovers the project indexes under `.membrick`; use this when the server needs a specific store path. |
 | `resident_http_bind` | Optional HTTP listener for the managed project resident. | If omitted, the resident exposes no HTTP listener. Project installation selects a loopback address. It is separate from the standalone server's `bind`. |
 | `resident_http_auto_port` | If the resident's configured port is occupied, allow it to select and save another port. | Project installation sets this to `true`; otherwise it defaults to `false`. Automatic selection tries the resident port range `8465`–`9999` and updates `resident_http_bind` and `dashboard_url`. |
+| `[service_registration].dispatcher_url` | HTTP(S) base URL for the dispatcher to receive this resident's heartbeat. | Unset. When configured for a project resident, self-registration starts with the resident. Requires `resident_http_bind` and a shared `server_token` or `server_token_file`. |
+| `[service_registration].heartbeat_interval_ms` | Interval between registration heartbeats. | `5000` ms. |
 
 The project installer writes `dashboard_url` so users can find the local
 dashboard. If automatic port selection chooses another port, the resident
